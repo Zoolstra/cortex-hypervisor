@@ -46,7 +46,10 @@ class BQCapture:
 @pytest.fixture
 def capture(monkeypatch):
     cap = BQCapture()
-    monkeypatch.setattr("api.voice_agent.blueprint.bq_client", cap)
+    # BQ now flows through the BlueprintAdapter — patch the adapter module's
+    # bq_client symbol, not the router's. (The router no longer imports
+    # bq_client at all after the step-1 PMS-adapter refactor.)
+    monkeypatch.setattr("api.voice_agent.pms.blueprint.bq_client", cap)
     app.dependency_overrides[verify_vapi_secret] = lambda: None
     yield cap
     app.dependency_overrides.clear()

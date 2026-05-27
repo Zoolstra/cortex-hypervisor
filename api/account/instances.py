@@ -1,6 +1,6 @@
 """Instance lifecycle endpoints — backed by Cloud SQL."""
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from api.deps import (
@@ -8,7 +8,7 @@ from api.deps import (
 )
 from api.models import InstanceUpdate, ProvisionRequest
 from api.core.db import get_session
-from api.core.orm import Clinic, Instance
+from api.core.orm import Clinic, ClinicAdmin, Instance
 from api.account.provisioning import provision_full_account
 
 
@@ -74,6 +74,87 @@ def provision_account(
         "instance_id": result["instance_id"],
         "clinic_ids": result["clinic_id_map"],
     }
+
+
+@router.get("/instances")
+def list_instances(
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """List instances visible to the caller, with clinic_count per row.
+
+    - ``super_admin`` sees every instance.
+    - ``admin`` / ``viewer`` see instances they own (primary_contact_uid)
+      OR are granted access to via the ``clinic_admins`` table.
+
+    Result is sorted by ``instance_name`` ascending. Always returns a list
+    (possibly empty) so the frontend can render a dropdown without special
+    cases.
+    """
+    role = caller.get("role")
+    if role not in ("admin", "super_admin", "viewer"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    q = (
+        select(Instance, func.count(Clinic.clinic_id).label("clinic_count"))
+        .outerjoin(
+            Clinic,
+            (Clinic.instance_id == Instance.instance_id)
+            & (Clinic.deleted_at.is_(None)),
+        )
+        .group_by(Instance.instance_id)
+        .order_by(Instance.instance_name.asc())
+    )
+
+    if role != "super_admin":
+        granted = db.scalars(
+            select(ClinicAdmin.instance_id).where(ClinicAdmin.uid == caller["uid"])
+        ).all()
+        q = q.where(
+            (Instance.primary_contact_uid == caller["uid"])
+            | (Instance.instance_id.in_(granted) if granted else False)
+        )
+
+    rows = db.execute(q).all()
+    return [
+        {**_instance_dict(inst), "clinic_count": int(count)}
+        for inst, count in rows
+    ]
+
+
+@router.get("/instances/{instance_id}")
+def get_instance_by_id(
+    instance_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Single instance by ``instance_id``. Returns the instance row directly.
+
+    Distinct from ``GET /instance/{uid}`` (which expects a Firebase uid and
+    returns the wrapper shape used by the auth bootstrap). This is the
+    endpoint front-end management views should call.
+    """
+    role = caller.get("role")
+    if role not in ("admin", "super_admin", "viewer"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    instance = db.get(Instance, instance_id)
+    if not instance:
+        raise HTTPException(status_code=404, detail=f"Instance {instance_id} not found")
+
+    # Non-super-admins must own the instance or be granted via clinic_admins.
+    if role != "super_admin":
+        if instance.primary_contact_uid != caller["uid"]:
+            granted = db.scalar(
+                select(ClinicAdmin.id).where(
+                    ClinicAdmin.uid == caller["uid"],
+                    ClinicAdmin.instance_id == instance_id,
+                )
+            )
+            if not granted:
+                raise HTTPException(status_code=403, detail="Access denied")
+
+    return _instance_dict(instance)
 
 
 @router.get("/instance/{uid}")

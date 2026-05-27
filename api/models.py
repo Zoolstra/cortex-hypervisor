@@ -111,6 +111,7 @@ class ClinicUpdate(BaseModel):
     time_zone: Optional[str] = None
     country: Optional[str] = None
     gbp_location_id: Optional[str] = None
+    etl_enabled: Optional[bool] = None
 
     @field_validator(
         "address", "phone", "email", "place_id", "about_us",

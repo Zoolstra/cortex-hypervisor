@@ -13,10 +13,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api.deps import require_read_access, require_write_access, verify_token
+from api.deps import bq_client, require_read_access, require_write_access, verify_token
 from api.models import ClinicCreate, ClinicUpdate
 from api.core.db import get_session
-from api.core.orm import Clinic, ClinicLocationDetails
+from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, InvocaCampaign
 from api.account.provisioning import provision_clinic
 
 
@@ -24,7 +24,7 @@ router = APIRouter()
 
 
 # Field → owning table for PATCH dispatch.
-_CLINIC_FIELDS = {"address", "place_id", "country", "gbp_location_id"}
+_CLINIC_FIELDS = {"address", "place_id", "country", "gbp_location_id", "etl_enabled"}
 _LOCATION_FIELDS = {
     "hours_monday", "hours_tuesday", "hours_wednesday", "hours_thursday",
     "hours_friday", "hours_saturday", "hours_sunday",
@@ -83,6 +83,167 @@ def get_clinics(
         )
     ))
     return [_merged_dict(c, c.location) for c in clinics]
+
+
+# ── ETL status (per clinic) ──────────────────────────────────────────────────
+# IMPORTANT: This route must be declared BEFORE the wildcard
+# /clinics/{instance_id}/{clinic_id} route below — FastAPI matches routes in
+# declaration order, and both have the same shape /clinics/X/Y for GET. If
+# this one is declared after, the wildcard catches the request and a 404 is
+# raised because "etl_status" is treated as a clinic_id lookup.
+
+@router.get("/clinics/{clinic_id}/etl_status")
+def get_etl_status(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Snapshot of what the ETL has produced for this clinic.
+
+    Returns:
+        {
+          "etl_enabled": bool,
+          "google_ads_campaign_ids": [str],
+          "invoca_campaign_ids":     [str],
+          "ad_clicks":    {"last_24h": int, "last_7d": int, "max_timestamp": iso|None},
+          "transactions": {"last_24h": int, "last_7d": int, "max_timestamp": iso|None},
+          "transcripts": {
+              "total_calls": int,         # transactions for this clinic's campaigns w/ a complete_call_id
+              "unavailable": int,         # marked .skip — no transcript from Invoca
+              "callscoring_done": int,
+              "faq_done": int,
+              "non_conversion_done": int,
+          },
+        }
+
+    Counts are scoped via the clinic's currently-active Invoca / Google Ads
+    campaign IDs (from Cloud SQL). Clinics with no campaigns return zeros.
+    """
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
+
+    invoca_ids = [str(c) for c in db.scalars(
+        select(InvocaCampaign.invoca_campaign_id).where(
+            InvocaCampaign.clinic_id == clinic_id,
+            InvocaCampaign.active.is_(True),
+        )
+    )]
+    ga_ids = [str(c) for c in db.scalars(
+        select(GoogleAdsCampaign.google_ads_campaign_id).where(
+            GoogleAdsCampaign.clinic_id == clinic_id,
+            GoogleAdsCampaign.active.is_(True),
+        )
+    )]
+
+    out: dict = {
+        "etl_enabled":            bool(clinic.etl_enabled),
+        "google_ads_campaign_ids": ga_ids,
+        "invoca_campaign_ids":     invoca_ids,
+        "ad_clicks":    {"last_24h": 0, "last_7d": 0, "max_timestamp": None},
+        "transactions": {"last_24h": 0, "last_7d": 0, "max_timestamp": None},
+        "transcripts": {
+            "total_calls":          0,
+            "unavailable":          0,
+            "callscoring_done":     0,
+            "faq_done":             0,
+            "non_conversion_done":  0,
+        },
+    }
+
+    project = bq_client.project
+    clinic_data = f"`{project}.ClinicData`"
+
+    def _to_iso(ts) -> str | None:
+        return ts.isoformat() if ts is not None else None
+
+    # Google Ads clicks — scoped by campaign id.
+    if ga_ids:
+        in_ga = "(" + ", ".join(f"'{c}'" for c in ga_ids) + ")"
+        sql = f"""
+            SELECT
+              COUNTIF(timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)) AS last_24h,
+              COUNTIF(timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)) AS last_7d,
+              MAX(timestamp) AS max_ts
+            FROM {clinic_data}.ad_clicks_v2
+            WHERE google_ads_campaign_id IN {in_ga}
+        """
+        try:
+            r = next(iter(bq_client.query(sql).result()), None)
+            if r:
+                out["ad_clicks"] = {
+                    "last_24h": int(r.last_24h or 0),
+                    "last_7d":  int(r.last_7d or 0),
+                    "max_timestamp": _to_iso(r.max_ts),
+                }
+        except Exception as e:  # noqa: BLE001
+            out["ad_clicks"]["error"] = f"{type(e).__name__}: {e}"
+
+    # Invoca transactions — scoped by invoca_campaign_id.
+    if invoca_ids:
+        in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_ids) + ")"
+        sql = f"""
+            SELECT
+              COUNTIF(timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)) AS last_24h,
+              COUNTIF(timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)) AS last_7d,
+              COUNTIF(complete_call_id IS NOT NULL AND complete_call_id != '') AS total_calls,
+              MAX(timestamp) AS max_ts
+            FROM {clinic_data}.transactions
+            WHERE CAST(invoca_campaign_id AS STRING) IN {in_iv}
+        """
+        try:
+            r = next(iter(bq_client.query(sql).result()), None)
+            if r:
+                out["transactions"] = {
+                    "last_24h": int(r.last_24h or 0),
+                    "last_7d":  int(r.last_7d or 0),
+                    "max_timestamp": _to_iso(r.max_ts),
+                }
+                out["transcripts"]["total_calls"] = int(r.total_calls or 0)
+        except Exception as e:  # noqa: BLE001
+            out["transactions"]["error"] = f"{type(e).__name__}: {e}"
+
+    # Transcript analysis coverage. Scoped by complete_call_id ∈ this clinic's
+    # transactions. transcript_analysis_log is keyed only by complete_call_id +
+    # analysis_name (no clinic_id column), so we have to scope via the IN list.
+    if invoca_ids:
+        in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_ids) + ")"
+        sql = f"""
+            WITH clinic_ccids AS (
+              SELECT DISTINCT complete_call_id
+              FROM {clinic_data}.transactions
+              WHERE CAST(invoca_campaign_id AS STRING) IN {in_iv}
+                AND complete_call_id IS NOT NULL AND complete_call_id != ''
+            )
+            SELECT
+              (SELECT COUNT(*) FROM {clinic_data}.transcripts_unavailable u
+                 WHERE u.complete_call_id IN (SELECT complete_call_id FROM clinic_ccids))
+                AS unavailable,
+              (SELECT COUNT(DISTINCT l.complete_call_id) FROM {clinic_data}.transcript_analysis_log l
+                 WHERE l.analysis_name = 'transcript_analysis.callscoring'
+                   AND l.complete_call_id IN (SELECT complete_call_id FROM clinic_ccids))
+                AS callscoring_done,
+              (SELECT COUNT(DISTINCT l.complete_call_id) FROM {clinic_data}.transcript_analysis_log l
+                 WHERE l.analysis_name = 'transcript_analysis.faq_analysis'
+                   AND l.complete_call_id IN (SELECT complete_call_id FROM clinic_ccids))
+                AS faq_done,
+              (SELECT COUNT(DISTINCT l.complete_call_id) FROM {clinic_data}.transcript_analysis_log l
+                 WHERE l.analysis_name = 'transcript_analysis.non_conversion_analysis'
+                   AND l.complete_call_id IN (SELECT complete_call_id FROM clinic_ccids))
+                AS non_conversion_done
+        """
+        try:
+            r = next(iter(bq_client.query(sql).result()), None)
+            if r:
+                out["transcripts"].update({
+                    "unavailable":          int(r.unavailable or 0),
+                    "callscoring_done":     int(r.callscoring_done or 0),
+                    "faq_done":             int(r.faq_done or 0),
+                    "non_conversion_done":  int(r.non_conversion_done or 0),
+                })
+        except Exception as e:  # noqa: BLE001
+            out["transcripts"]["error"] = f"{type(e).__name__}: {e}"
+
+    return out
 
 
 @router.get("/clinics/{instance_id}/{clinic_id}")

@@ -16,9 +16,12 @@ TODO (Round 3): wire activate/deactivate/verify_caller_id to Twilio + VAPI via
 services/twilio_client.py and services/vapi_provisioner.py.
 """
 import json
+import logging
 import uuid
 from datetime import datetime
 from typing import Literal
+
+log = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException
 from google.cloud import bigquery
@@ -26,15 +29,21 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api.deps import bq_client, bq_table, require_write_access, verify_token
+from api.deps import bq_client, bq_table, require_read_access, require_write_access, verify_token
+from api.voice_agent import vapi as vapi_client
 from api.voice_agent.blueprint import verify_vapi_secret
 from api.core.db import get_session
-from api.core.orm import Clinic, ClinicVoiceAgentConfiguration, VoiceAgentCapability
-from api.voice_agent.capabilities import (
-    CAPABILITY_METADATA,
-    CAPABILITY_METADATA_BY_ID,
+from api.core.orm import (
+    Clinic, ClinicProtocol, ClinicVoiceAgentCallerBucket,
+    ClinicVoiceAgentConfiguration, ClinicVoiceAgentPersona,
+    ClinicVoiceAgentScript, VoiceAgentCapability,
+)
+from api.voice_agent.protocols import (
+    PROTOCOL_METADATA as CAPABILITY_METADATA,
+    PROTOCOL_METADATA_BY_ID as CAPABILITY_METADATA_BY_ID,
     is_pms_compatible,
 )
+from api.voice_agent.factory import build_agent_config
 
 
 router = APIRouter()
@@ -57,6 +66,61 @@ def _get_voice_agent_or_create(db: Session, clinic_id: str) -> ClinicVoiceAgentC
     return va
 
 
+def _sync_assistant_if_provisioned(db: Session, clinic: Clinic) -> dict:
+    """If the clinic has a live VAPI assistant, rebuild its config from
+    Cloud SQL and push the update. No-op when the agent hasn't been
+    provisioned yet. VAPI errors are caught and logged so they cannot fail
+    the caller's primary DB write.
+
+    Returns one of:
+      ``{"synced": True}``
+      ``{"synced": False, "reason": "voice_agent_not_provisioned"}``
+      ``{"synced": False, "error": "<ClassName>: <message>"}``
+    """
+    va = db.get(ClinicVoiceAgentConfiguration, clinic.clinic_id)
+    if va is None or not va.vapi_assistant_id:
+        return {"synced": False, "reason": "voice_agent_not_provisioned"}
+    try:
+        config = build_agent_config(db, clinic)
+        vapi_client.update_assistant(va.vapi_assistant_id, config)
+        return {"synced": True}
+    except Exception as e:  # noqa: BLE001
+        log.exception(
+            "VAPI sync failed for clinic_id=%s assistant_id=%s",
+            clinic.clinic_id, va.vapi_assistant_id,
+        )
+        return {"synced": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@router.get("/clinics/{clinic_id}/voice_agent")
+def get_voice_agent(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Read-only snapshot of the voice-agent state for one clinic.
+
+    Returns ``voice_agent_status``, Twilio + VAPI identifiers, and the
+    clinic's ``pms_type`` so the dashboard can render the status panel and
+    PMS-gate the capability toggles in a single fetch. Idempotent — no row
+    is created on read.
+    """
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
+
+    va = db.get(ClinicVoiceAgentConfiguration, clinic_id)
+    return {
+        "clinic_id": clinic_id,
+        "pms_type": clinic.pms_type or "none",
+        "voice_agent_status": (va.voice_agent_status if va else "inactive"),
+        "twilio_phone_number": (va.twilio_phone_number if va else None),
+        "twilio_verified_caller_id": bool(va.twilio_verified_caller_id) if va else False,
+        "vapi_assistant_id": (va.vapi_assistant_id if va else None),
+        "vapi_phone_number_id": (va.vapi_phone_number_id if va else None),
+        "updated_at": _isoformat(va.updated_at) if va else None,
+    }
+
+
 @router.post("/clinics/{clinic_id}/voice_agent/activate")
 def activate_voice_agent(
     clinic_id: str,
@@ -64,28 +128,90 @@ def activate_voice_agent(
     db: Session = Depends(get_session),
 ):
     """
-    Opt a clinic into Cortex Intercept (AI call handling).
+    Provision (or re-provision) the clinic's VAPI assistant.
 
-    TODO (Round 3): Replace the placeholder with actual Twilio number purchase
-    + VAPI assistant creation via services/twilio_client.py + services/vapi_provisioner.py.
+    Destructive-recreate semantics: if a VAPI assistant already exists for
+    this clinic, it is deleted first; a fresh assistant is then created from
+    the current factory config and its id is stored. Twilio number purchase
+    is out of scope here — numbers are attached separately in the VAPI
+    dashboard.
     """
     clinic = _get_clinic_or_404(db, clinic_id)
     require_write_access(clinic.instance_id, caller)
 
     va = _get_voice_agent_or_create(db, clinic_id)
-    if va.voice_agent_status == "active":
-        raise HTTPException(status_code=409, detail="Voice agent is already active for this clinic")
 
-    va.voice_agent_status = "provisioning"
+    deleted_assistant_id: str | None = None
+    if va.vapi_assistant_id:
+        deleted_assistant_id = va.vapi_assistant_id
+        try:
+            vapi_client.delete_assistant(va.vapi_assistant_id)
+        except Exception:
+            log.exception(
+                "Failed to delete existing VAPI assistant %s for clinic %s; proceeding with create",
+                va.vapi_assistant_id, clinic_id,
+            )
+        va.vapi_assistant_id = None
+
+    try:
+        config = build_agent_config(db, clinic)
+        new_assistant_id = vapi_client.create_assistant(config)
+    except Exception as e:
+        va.voice_agent_status = "error"
+        log.exception("VAPI create_assistant failed for clinic %s", clinic_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"VAPI create_assistant failed: {type(e).__name__}: {e}",
+        )
+
+    va.vapi_assistant_id = new_assistant_id
+    va.voice_agent_status = "active"
 
     return {
-        "status": "provisioning",
+        "status": "active",
         "clinic_id": clinic_id,
+        "vapi_assistant_id": new_assistant_id,
+        "deleted_assistant_id": deleted_assistant_id,
         "message": (
-            "Voice agent provisioning initiated. "
-            "Twilio number purchase and VAPI assistant creation will be completed in the next deployment. "
-            "Once active, configure your phone system to forward unanswered calls to the provisioned number."
+            f"Re-provisioned VAPI assistant (new id: {new_assistant_id})."
+            if deleted_assistant_id
+            else f"Provisioned new VAPI assistant (id: {new_assistant_id})."
         ),
+    }
+
+
+@router.post("/clinics/{clinic_id}/voice_agent/assistant")
+def upsert_voice_agent_assistant(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """
+    Create or update the VAPI assistant for this clinic from the current
+    factory config (system prompt, tools, voice, transcriber).
+
+    Idempotent: first call creates the assistant and stores `vapi_assistant_id`;
+    subsequent calls update the existing assistant in place. Independent of
+    `voice_agent_status` — used to iterate on the prompt without touching
+    Twilio provisioning.
+    """
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    va = _get_voice_agent_or_create(db, clinic_id)
+    config = build_agent_config(db, clinic)
+
+    if va.vapi_assistant_id:
+        vapi_client.update_assistant(va.vapi_assistant_id, config)
+        action = "updated"
+    else:
+        va.vapi_assistant_id = vapi_client.create_assistant(config)
+        action = "created"
+
+    return {
+        "action": action,
+        "clinic_id": clinic_id,
+        "vapi_assistant_id": va.vapi_assistant_id,
     }
 
 
@@ -98,7 +224,9 @@ def deactivate_voice_agent(
     """
     Deactivate and deprovision the voice agent for this clinic.
 
-    TODO (Round 3): release Twilio number + delete VAPI assistant before clearing fields.
+    Deletes the live VAPI assistant (best-effort — 404 from VAPI is treated
+    as already-gone) and clears the DB pointers. Twilio number release is
+    still out of scope.
     """
     clinic = _get_clinic_or_404(db, clinic_id)
     require_write_access(clinic.instance_id, caller)
@@ -107,6 +235,17 @@ def deactivate_voice_agent(
     if va.voice_agent_status == "inactive":
         raise HTTPException(status_code=409, detail="Voice agent is not active for this clinic")
 
+    deleted_assistant_id: str | None = None
+    if va.vapi_assistant_id:
+        deleted_assistant_id = va.vapi_assistant_id
+        try:
+            vapi_client.delete_assistant(va.vapi_assistant_id)
+        except Exception:
+            log.exception(
+                "Failed to delete VAPI assistant %s for clinic %s during deactivate",
+                va.vapi_assistant_id, clinic_id,
+            )
+
     va.voice_agent_status = "inactive"
     va.twilio_phone_number = None
     va.twilio_phone_sid = None
@@ -114,7 +253,12 @@ def deactivate_voice_agent(
     va.vapi_assistant_id = None
     va.vapi_phone_number_id = None
 
-    return {"status": "success", "clinic_id": clinic_id, "voice_agent_status": "inactive"}
+    return {
+        "status": "success",
+        "clinic_id": clinic_id,
+        "voice_agent_status": "inactive",
+        "deleted_assistant_id": deleted_assistant_id,
+    }
 
 
 @router.post("/clinics/{clinic_id}/voice_agent/verify_caller_id")
@@ -233,6 +377,9 @@ class CapabilityItem(BaseModel):
     enabled: bool
     updated_at: str | None = None
     updated_by: str | None = None
+    # Populated only on write operations (toggle). Indicates whether the
+    # change propagated to the live VAPI assistant. Absent on list reads.
+    vapi_sync: dict | None = None
 
 
 class CapabilitiesListResponse(BaseModel):
@@ -270,10 +417,14 @@ def list_capabilities(
 
     pms_type = clinic.pms_type or "none"
 
+    # Read from clinic_protocols — the new source of truth as of step 3 of the
+    # Protocol migration. The legacy `voice_agent_capabilities` table is still
+    # dual-written so a rollback to old code stays consistent, but no read
+    # paths consult it from this revision on.
     rows = list(db.scalars(
-        select(VoiceAgentCapability).where(VoiceAgentCapability.clinic_id == clinic_id)
+        select(ClinicProtocol).where(ClinicProtocol.clinic_id == clinic_id)
     ))
-    state = {r.capability_id: r for r in rows}
+    state = {r.protocol_id: r for r in rows}
 
     items: list[CapabilityItem] = []
     for cap in CAPABILITY_METADATA:
@@ -332,11 +483,30 @@ def toggle_capability(
 
     updater = caller.get("email") or caller.get("uid") or "unknown"
 
-    row = db.get(VoiceAgentCapability, (clinic_id, capability_id))
-    if row is None:
-        row = VoiceAgentCapability(
+    # Dual-write during the Protocol migration (step 3): the legacy
+    # `voice_agent_capabilities` table receives the same write so a code
+    # rollback stays consistent. Reads only consult `clinic_protocols`.
+    # `capability_id` and `protocol_id` are the same string by design.
+    legacy = db.get(VoiceAgentCapability, (clinic_id, capability_id))
+    if legacy is None:
+        legacy = VoiceAgentCapability(
             clinic_id=clinic_id,
             capability_id=capability_id,
+            enabled=body.enabled,
+            config=body.config,
+            updated_by=updater,
+        )
+        db.add(legacy)
+    else:
+        legacy.enabled = body.enabled
+        legacy.config = body.config
+        legacy.updated_by = updater
+
+    row = db.get(ClinicProtocol, (clinic_id, capability_id))
+    if row is None:
+        row = ClinicProtocol(
+            clinic_id=clinic_id,
+            protocol_id=capability_id,
             enabled=body.enabled,
             config=body.config,
             updated_by=updater,
@@ -350,6 +520,9 @@ def toggle_capability(
     db.flush()  # ensure updated_at gets populated for the response
     db.refresh(row)
 
+    # Propagate the change to the live VAPI assistant if one's provisioned.
+    sync = _sync_assistant_if_provisioned(db, clinic)
+
     return CapabilityItem(
         id=cap.id,
         display_name=cap.display_name,
@@ -359,4 +532,420 @@ def toggle_capability(
         enabled=bool(row.enabled),
         updated_at=_isoformat(row.updated_at),
         updated_by=row.updated_by,
+        vapi_sync=sync,
+    )
+
+
+# ── Voice agent script (scope of practice) ───────────────────────────────────
+
+class _VoiceAgentScriptResponse(BaseModel):
+    clinic_id: str
+    scope_of_practice:         str | None = None
+    services_offered:          str | None = None
+    services_not_offered:      str | None = None
+    caller_needs:              str | None = None
+    additional_notes:          str | None = None
+    opening_overrides:         str | None = None
+    new_patient_intake_prompt: str | None = None
+    existing_patient_intro:    str | None = None
+    updated_at:                str | None = None
+    # Populated only on PUT — indicates whether the change propagated to
+    # the live VAPI assistant. Absent on GET.
+    vapi_sync:                 dict | None = None
+
+
+class _VoiceAgentScriptUpdate(BaseModel):
+    """Partial update — only fields explicitly set in the payload are
+    written. ``None`` clears a column; absent keys leave it alone."""
+    scope_of_practice:         str | None = None
+    services_offered:          str | None = None
+    services_not_offered:      str | None = None
+    caller_needs:              str | None = None
+    additional_notes:          str | None = None
+    opening_overrides:         str | None = None
+    new_patient_intake_prompt: str | None = None
+    existing_patient_intro:    str | None = None
+
+
+_SCRIPT_FIELDS = (
+    "scope_of_practice",
+    "services_offered",
+    "services_not_offered",
+    "caller_needs",
+    "additional_notes",
+    "opening_overrides",
+    "new_patient_intake_prompt",
+    "existing_patient_intro",
+)
+
+
+def _script_to_response(clinic_id: str, row: ClinicVoiceAgentScript | None) -> _VoiceAgentScriptResponse:
+    if row is None:
+        return _VoiceAgentScriptResponse(clinic_id=clinic_id)
+    return _VoiceAgentScriptResponse(
+        clinic_id=clinic_id,
+        scope_of_practice=row.scope_of_practice,
+        services_offered=row.services_offered,
+        services_not_offered=row.services_not_offered,
+        caller_needs=row.caller_needs,
+        additional_notes=row.additional_notes,
+        opening_overrides=row.opening_overrides,
+        new_patient_intake_prompt=row.new_patient_intake_prompt,
+        existing_patient_intro=row.existing_patient_intro,
+        updated_at=_isoformat(row.updated_at),
+    )
+
+
+@router.get(
+    "/clinics/{clinic_id}/voice_agent/script",
+    response_model=_VoiceAgentScriptResponse,
+)
+def get_voice_agent_script(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Return the editable script content for this clinic's voice agent.
+
+    Returns null fields when no row has been created yet — the UI renders
+    empty textareas and PUT-creates on first save.
+    """
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentScript, clinic_id)
+    return _script_to_response(clinic_id, row)
+
+
+@router.put(
+    "/clinics/{clinic_id}/voice_agent/script",
+    response_model=_VoiceAgentScriptResponse,
+)
+def put_voice_agent_script(
+    clinic_id: str,
+    body: _VoiceAgentScriptUpdate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Upsert the script content. Partial — only keys present in the body
+    are written. Sending ``null`` clears the column; omitting the key leaves
+    it unchanged. The dashboard editor sends all five fields at every save
+    (including empty strings → null), so a one-shot save round-trip from
+    the UI replaces the row contents wholesale.
+    """
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentScript, clinic_id)
+    if row is None:
+        row = ClinicVoiceAgentScript(clinic_id=clinic_id)
+        db.add(row)
+
+    payload = body.model_dump(exclude_unset=True)
+    for field in _SCRIPT_FIELDS:
+        if field in payload:
+            value = payload[field]
+            # Treat empty string as null so the column clears cleanly.
+            if isinstance(value, str) and value.strip() == "":
+                value = None
+            setattr(row, field, value)
+
+    db.flush()
+
+    # Propagate the change to the live VAPI assistant if one's provisioned.
+    sync = _sync_assistant_if_provisioned(db, clinic)
+
+    response = _script_to_response(clinic_id, row)
+    response.vapi_sync = sync
+    return response
+
+
+# ── Voice agent persona ──────────────────────────────────────────────────────
+
+class _PersonaResponse(BaseModel):
+    clinic_id:     str
+    agent_name:    str = "Emma"
+    agent_title:   str = "virtual hearing assistant"
+    voice_id:      str = "Emma"
+    first_message: str | None = None
+    ai_model:      str = "gpt-4o"
+    updated_at:    str | None = None
+    vapi_sync:     dict | None = None
+
+
+class _PersonaUpdate(BaseModel):
+    agent_name:    str | None = None
+    agent_title:   str | None = None
+    voice_id:      str | None = None
+    first_message: str | None = None
+    ai_model:      str | None = None
+
+
+_PERSONA_FIELDS = ("agent_name", "agent_title", "voice_id", "first_message", "ai_model")
+
+
+def _persona_to_response(clinic_id: str, row: ClinicVoiceAgentPersona | None) -> _PersonaResponse:
+    if row is None:
+        return _PersonaResponse(clinic_id=clinic_id)
+    return _PersonaResponse(
+        clinic_id=clinic_id,
+        agent_name=row.agent_name,
+        agent_title=row.agent_title,
+        voice_id=row.voice_id,
+        first_message=row.first_message,
+        ai_model=row.ai_model,
+        updated_at=_isoformat(row.updated_at),
+    )
+
+
+@router.get(
+    "/clinics/{clinic_id}/voice_agent/persona",
+    response_model=_PersonaResponse,
+)
+def get_voice_agent_persona(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Return the agent's presentation config (name, title, voice, model)."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
+    row = db.get(ClinicVoiceAgentPersona, clinic_id)
+    return _persona_to_response(clinic_id, row)
+
+
+@router.put(
+    "/clinics/{clinic_id}/voice_agent/persona",
+    response_model=_PersonaResponse,
+)
+def put_voice_agent_persona(
+    clinic_id: str,
+    body: _PersonaUpdate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Upsert the persona row. Partial: only keys present in the payload
+    are written. Empty strings on the four required fields (agent_name,
+    agent_title, voice_id, ai_model) revert to the column's server default
+    on next read since those columns are NOT NULL; the editor should send
+    null or omit those keys to "reset to default" semantics.
+    """
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentPersona, clinic_id)
+    if row is None:
+        row = ClinicVoiceAgentPersona(clinic_id=clinic_id)
+        db.add(row)
+
+    payload = body.model_dump(exclude_unset=True)
+    for field in _PERSONA_FIELDS:
+        if field not in payload:
+            continue
+        value = payload[field]
+        # first_message is the only nullable persona field; clear with empty.
+        if field == "first_message":
+            if isinstance(value, str) and value.strip() == "":
+                value = None
+            setattr(row, field, value)
+        else:
+            # Required fields — ignore null / empty so we don't violate NOT NULL.
+            if value is None:
+                continue
+            if isinstance(value, str) and value.strip() == "":
+                continue
+            setattr(row, field, value.strip() if isinstance(value, str) else value)
+
+    db.flush()
+    sync = _sync_assistant_if_provisioned(db, clinic)
+    response = _persona_to_response(clinic_id, row)
+    response.vapi_sync = sync
+    return response
+
+
+# ── Voice agent caller buckets ───────────────────────────────────────────────
+
+class _CallerBucketItem(BaseModel):
+    id:              int | None = None
+    clinic_id:       str
+    ordinal:         int = 0
+    label:           str
+    example_phrases: str | None = None
+    canned_response: str | None = None
+    active:          bool = True
+    updated_at:      str | None = None
+
+
+class _CallerBucketCreate(BaseModel):
+    label:           str
+    ordinal:         int | None = None
+    example_phrases: str | None = None
+    canned_response: str | None = None
+    active:          bool = True
+
+
+class _CallerBucketUpdate(BaseModel):
+    label:           str | None = None
+    ordinal:         int | None = None
+    example_phrases: str | None = None
+    canned_response: str | None = None
+    active:          bool | None = None
+
+
+class _CallerBucketsResponse(BaseModel):
+    clinic_id: str
+    buckets:   list[_CallerBucketItem]
+    vapi_sync: dict | None = None
+
+
+def _bucket_to_item(row: ClinicVoiceAgentCallerBucket) -> _CallerBucketItem:
+    return _CallerBucketItem(
+        id=row.id,
+        clinic_id=row.clinic_id,
+        ordinal=row.ordinal,
+        label=row.label,
+        example_phrases=row.example_phrases,
+        canned_response=row.canned_response,
+        active=bool(row.active),
+        updated_at=_isoformat(row.updated_at),
+    )
+
+
+def _all_buckets_for_clinic(db: Session, clinic_id: str) -> list[ClinicVoiceAgentCallerBucket]:
+    return list(db.scalars(
+        select(ClinicVoiceAgentCallerBucket)
+        .where(ClinicVoiceAgentCallerBucket.clinic_id == clinic_id)
+        .order_by(ClinicVoiceAgentCallerBucket.ordinal.asc(),
+                  ClinicVoiceAgentCallerBucket.id.asc())
+    ))
+
+
+@router.get(
+    "/clinics/{clinic_id}/voice_agent/caller_buckets",
+    response_model=_CallerBucketsResponse,
+)
+def list_voice_agent_caller_buckets(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """List the clinic's caller-intent buckets, ordered by ``ordinal``."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
+    rows = _all_buckets_for_clinic(db, clinic_id)
+    return _CallerBucketsResponse(
+        clinic_id=clinic_id,
+        buckets=[_bucket_to_item(r) for r in rows],
+    )
+
+
+@router.post(
+    "/clinics/{clinic_id}/voice_agent/caller_buckets",
+    response_model=_CallerBucketsResponse,
+)
+def create_voice_agent_caller_bucket(
+    clinic_id: str,
+    body: _CallerBucketCreate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Append a new caller bucket. If ``ordinal`` is null, places it at
+    the end (max existing + 1)."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    if body.ordinal is None:
+        existing = _all_buckets_for_clinic(db, clinic_id)
+        next_ordinal = (max((b.ordinal for b in existing), default=-1) + 1)
+    else:
+        next_ordinal = body.ordinal
+
+    row = ClinicVoiceAgentCallerBucket(
+        clinic_id=clinic_id,
+        ordinal=next_ordinal,
+        label=body.label.strip(),
+        example_phrases=body.example_phrases,
+        canned_response=body.canned_response,
+        active=body.active,
+    )
+    db.add(row)
+    db.flush()
+    sync = _sync_assistant_if_provisioned(db, clinic)
+
+    rows = _all_buckets_for_clinic(db, clinic_id)
+    return _CallerBucketsResponse(
+        clinic_id=clinic_id,
+        buckets=[_bucket_to_item(r) for r in rows],
+        vapi_sync=sync,
+    )
+
+
+@router.put(
+    "/clinics/{clinic_id}/voice_agent/caller_buckets/{bucket_id}",
+    response_model=_CallerBucketsResponse,
+)
+def update_voice_agent_caller_bucket(
+    clinic_id: str,
+    bucket_id: int,
+    body: _CallerBucketUpdate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Update one caller bucket. Partial: only present fields are written."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentCallerBucket, bucket_id)
+    if row is None or row.clinic_id != clinic_id:
+        raise HTTPException(status_code=404, detail="Caller bucket not found")
+
+    payload = body.model_dump(exclude_unset=True)
+    for field in ("label", "ordinal", "example_phrases", "canned_response", "active"):
+        if field not in payload:
+            continue
+        value = payload[field]
+        if field == "label":
+            if value is None or (isinstance(value, str) and not value.strip()):
+                raise HTTPException(status_code=400, detail="label cannot be empty")
+            value = value.strip()
+        setattr(row, field, value)
+
+    db.flush()
+    sync = _sync_assistant_if_provisioned(db, clinic)
+
+    rows = _all_buckets_for_clinic(db, clinic_id)
+    return _CallerBucketsResponse(
+        clinic_id=clinic_id,
+        buckets=[_bucket_to_item(r) for r in rows],
+        vapi_sync=sync,
+    )
+
+
+@router.delete(
+    "/clinics/{clinic_id}/voice_agent/caller_buckets/{bucket_id}",
+    response_model=_CallerBucketsResponse,
+)
+def delete_voice_agent_caller_bucket(
+    clinic_id: str,
+    bucket_id: int,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Delete one caller bucket. Returns the post-delete list."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentCallerBucket, bucket_id)
+    if row is None or row.clinic_id != clinic_id:
+        raise HTTPException(status_code=404, detail="Caller bucket not found")
+
+    db.delete(row)
+    db.flush()
+    sync = _sync_assistant_if_provisioned(db, clinic)
+
+    rows = _all_buckets_for_clinic(db, clinic_id)
+    return _CallerBucketsResponse(
+        clinic_id=clinic_id,
+        buckets=[_bucket_to_item(r) for r in rows],
+        vapi_sync=sync,
     )

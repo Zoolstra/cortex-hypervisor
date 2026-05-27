@@ -3,7 +3,10 @@ Build a VAPI assistant configuration for a clinic.
 
 Reads from Cloud SQL ORM:
   - Clinic + ClinicLocationDetails — name, address, hours, time_zone, country
-  - VoiceAgentCapability rows                — which toggleable capabilities are enabled
+  - ClinicProtocol rows             — which toggleable protocols are enabled
+    (replaces the legacy ``voice_agent_capabilities`` table; the legacy
+    table is still dual-written by the toggle endpoint, but reads here
+    come from ``clinic_protocols`` only)
 
 The assembled config is a dict shaped for ``vapi.client.Vapi.assistants.create()``
 (snake_case kwargs). Voice settings, model, and transcriber model are hardcoded
@@ -16,13 +19,24 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api.core.orm import Clinic, VoiceAgentCapability
+from api.core.orm import (
+    Clinic, ClinicProtocol, ClinicVoiceAgentCallerBucket,
+    ClinicVoiceAgentPersona, ClinicVoiceAgentScript,
+)
 from api.core.secrets import get_secret
-from api.voice_agent.capabilities import (
-    CAPABILITY_REGISTRY,
-    Capability,
-    PatientMatch,
-    SubmitTicket,
+from api.voice_agent.protocols import (
+    PROTOCOL_REGISTRY,
+    Protocol,
+    SubmitTicketProtocol,
+    VerifyCallerIdentificationProtocol,
+)
+from api.voice_agent.defaults import (
+    DEFAULT_AGENT_NAME as _DEFAULT_AGENT_NAME,
+    DEFAULT_AGENT_TITLE as _DEFAULT_AGENT_TITLE,
+    DEFAULT_AI_MODEL as _DEFAULT_AI_MODEL,
+    DEFAULT_CALLER_BUCKETS as _DEFAULT_CALLER_BUCKETS,
+    DEFAULT_VOICE_ID as _DEFAULT_VOICE_ID,
+    interpolate as _interpolate,
 )
 from api.voice_agent.locale import resolve as resolve_locale
 
@@ -30,10 +44,38 @@ from api.voice_agent.locale import resolve as resolve_locale
 log = logging.getLogger(__name__)
 
 
-def build_first_message(clinic_name: str) -> str:
+def _persona_or_defaults(persona: ClinicVoiceAgentPersona | None) -> tuple[str, str, str, str | None, str]:
+    """Return ``(agent_name, agent_title, voice_id, first_message, ai_model)``
+    falling back to system defaults when the persona row is missing or
+    individual fields are blank/null. ``first_message`` stays None when not
+    overridden so the caller can render a templated default.
+    """
+    if persona is None:
+        return (_DEFAULT_AGENT_NAME, _DEFAULT_AGENT_TITLE, _DEFAULT_VOICE_ID,
+                None, _DEFAULT_AI_MODEL)
     return (
-        f"Thank you for calling {clinic_name}. My name is Emma, "
-        "your virtual hearing assistant. How can I help you today?"
+        (persona.agent_name or _DEFAULT_AGENT_NAME).strip(),
+        (persona.agent_title or _DEFAULT_AGENT_TITLE).strip(),
+        (persona.voice_id or _DEFAULT_VOICE_ID).strip(),
+        (persona.first_message.strip() if persona.first_message and persona.first_message.strip() else None),
+        (persona.ai_model or _DEFAULT_AI_MODEL).strip(),
+    )
+
+
+def build_first_message(
+    clinic_name: str,
+    persona: ClinicVoiceAgentPersona | None = None,
+) -> str:
+    """Greeting played at call start. Honors ``persona.first_message`` when
+    set (with placeholder interpolation); otherwise renders the templated
+    default with persona overrides for agent name + title.
+    """
+    name, title, _voice, override, _model = _persona_or_defaults(persona)
+    if override:
+        return _interpolate(override, clinic_name=clinic_name, agent_name=name, agent_title=title)
+    return (
+        f"Thank you for calling {clinic_name}. My name is {name}, "
+        f"your {title}. How can I help you today?"
     )
 
 
@@ -48,21 +90,21 @@ def _instantiate_capabilities(
     clinic: Clinic,
     enabled_capability_ids: list[str],
     credential_id: str,
-) -> list[Capability]:
+) -> list[Protocol]:
     """
-    Build the ordered list of Capability instances for this clinic.
+    Build the ordered list of Protocol instances for this clinic.
 
     Order:
-      1. Toggleable capabilities (in CAPABILITY_REGISTRY declaration order) —
+      1. Toggleable capabilities (in PROTOCOL_REGISTRY declaration order) —
          only those whose ID is in enabled_capability_ids AND whose
          supported_pms includes this clinic's pms_type.
-      2. Always-on capabilities (e.g. SubmitTicket) appended last so the
+      2. Always-on capabilities (e.g. SubmitTicketProtocol) appended last so the
          "closing & ticket submission" block is at the end of the prompt.
     """
     enabled = set(enabled_capability_ids)
-    instantiated: list[Capability] = []
+    instantiated: list[Protocol] = []
 
-    def make(cls: type[Capability]) -> Capability:
+    def make(cls: type[Protocol]) -> Protocol:
         return cls(
             clinic_id=clinic.clinic_id,
             clinic_name=clinic.clinic_name,
@@ -71,7 +113,7 @@ def _instantiate_capabilities(
         )
 
     # Toggleable first, in registry order
-    for cap_id, cls in CAPABILITY_REGISTRY.items():
+    for cap_id, cls in PROTOCOL_REGISTRY.items():
         if cls.always_on:
             continue
         if cap_id not in enabled:
@@ -85,7 +127,7 @@ def _instantiate_capabilities(
             )
 
     # Always-on last
-    for cls in CAPABILITY_REGISTRY.values():
+    for cls in PROTOCOL_REGISTRY.values():
         if not cls.always_on:
             continue
         try:
@@ -96,9 +138,9 @@ def _instantiate_capabilities(
                 f"Always-on capability {cls.__name__} refused clinic: {e}"
             ) from e
 
-    if not any(isinstance(c, SubmitTicket) for c in instantiated):
+    if not any(isinstance(c, SubmitTicketProtocol) for c in instantiated):
         raise RuntimeError(
-            "No SubmitTicket capability instantiated — assistant cannot persist call outcomes."
+            "No SubmitTicketProtocol capability instantiated — assistant cannot persist call outcomes."
         )
 
     return instantiated
@@ -121,7 +163,7 @@ def _hours_block(clinic: Clinic) -> str:
     return f"## Hours of Operation\n{rendered}"
 
 
-def _capability_by_id(caps: list[Capability], capability_id: str) -> Capability | None:
+def _capability_by_id(caps: list[Protocol], capability_id: str) -> Protocol | None:
     for c in caps:
         if c.id == capability_id:
             return c
@@ -140,81 +182,244 @@ def _identity_section(clinic: Clinic) -> str:
 def _task_overview_section() -> str:
     return (
         "## Task Overview\n"
-        "- Your job is to follow the steps listed below and in order to assess "
-        "the caller's needs, answer questions and make bookings.\n"
-        "- In addition you must collect information in order for clinic staff "
-        "to have the sufficient context about the caller. The sections/bullets "
-        "marked with [info collection point] indicate where you need to keep "
-        "track of info.\n"
-        "- The intended conversation follows the flow detailed below. Everything "
-        "in quotation marks are phrases that you can say; anything else is instructions."
+        "- The call proceeds through a sequence of stages. Each stage has explicit "
+        "goals and rules. Your job is to achieve the goals of the current stage, "
+        "then move on — not to recite a script line-by-line.\n"
+        "- Quoted phrases below are *examples* you may use; phrase them in your "
+        "own words when the conversation calls for it. Unquoted text is instruction.\n"
+        "- Items marked **[info collection point]** must end up in the ticket. "
+        "If the caller volunteers the value, read it back to confirm rather than "
+        "asking the question again."
     )
 
 
-def _opening_section(clinic: Clinic) -> str:
+def _behavior_rules_section() -> str:
+    """Cross-cutting rules that apply to every stage. Placed early in the
+    prompt so the model carries them into every response.
+    """
     return (
-        "## Opening\n"
-        "- Opening messages\n"
-        f'  - "Thank you for calling {clinic.clinic_name}. My name is Emma, '
-        'your virtual hearing assistant. How can I help you today?" '
-        "<wait for user response>\n"
-        '  - "Who am I speaking with?" <wait for user response>\n'
-        f'  - "Nice to meet you [name]. I\'m really happy you called {clinic.clinic_name} '
-        'and I\'ll do my best to help." <wait for user response>\n'
-        '  - "I see you\'re calling from [number]. If I need to call you back '
-        'is this the best number for you?" <wait for user response>'
+        "## Conversational behavior (applies to every stage)\n"
+        "- **Never re-ask information the caller has already volunteered.** "
+        "Listen to what they said and use it. If they opened with their name "
+        "and reason, do not then ask \"who am I speaking with?\" or \"how can "
+        "I help you?\"\n"
+        "- **For data collection points (name, callback number, email, dates, "
+        "appointment times), confirm by reading the value back — do not ask "
+        "again.** Examples:\n"
+        "  - Caller: \"Hi, this is John.\" → You: \"Hi John, did I get that right?\"\n"
+        "  - Caller: \"Call me at 5 5 5 1 2 3 4.\" → You: \"Just to confirm — "
+        "five-five-five, one-two-three-four — correct?\"\n"
+        "- **For names, always spell them back letter-by-letter for confirmation.** "
+        "Voice transcription frequently mangles names, and downstream lookups "
+        "are exact-match — a single wrong letter breaks everything. Example:\n"
+        "  - Caller: \"This is Jonathan Smyth.\" → You: \"Got it. Let me spell "
+        "that back — first name J-O-N-A-T-H-A-N, last name S-M-Y-T-H. Did I "
+        "get every letter right?\" If they correct you, spell it back again "
+        "with the correction until they confirm every letter.\n"
+        "- **For free-form context (reason for calling, motivation, what's been "
+        "happening), confirm by brief paraphrase.** Example:\n"
+        "  - Caller: \"I've been having trouble at family dinners.\" → You: "
+        "\"So it's been hard to follow conversations in groups — did I get that?\"\n"
+        "- **Ask one focused question per turn.** No multi-part interrogations.\n"
+        "- **Briefly acknowledge what the caller said before moving on.** They "
+        "should always feel heard.\n"
+        "- **Tool calls (patient lookup, ticket submission) happen quietly.** "
+        "You may say once \"let me find you in our system\" before a lookup, "
+        "but do not narrate every tool call."
     )
 
 
-def _caller_classification_section(caps: list[Capability]) -> str:
-    patient_match = _capability_by_id(caps, PatientMatch.id)
+def _stage_1_greeting_and_reason(
+    clinic: Clinic,
+    persona: ClinicVoiceAgentPersona | None,
+    script: ClinicVoiceAgentScript | None,
+) -> str:
+    """Stage 1 — Greeting & Reason.
+
+    Hardcoded goals + rules. The clinic-editable ``opening_overrides`` field
+    is injected as *style guidance*, not as a verbatim script. The agent
+    decides how to phrase the actual opener based on what the caller says.
+    """
+    agent_name, agent_title, _voice, _first, _model = _persona_or_defaults(persona)
+    style_notes = (script.opening_overrides or "").strip() if script else ""
+
+    out = [
+        "## Stage 1 — Greeting & Reason",
+        "**Goals**",
+        "1. Warmly greet the caller. Identify yourself by name and role.",
+        "2. Learn the caller's name **[info collection point]** "
+        "(or capture it if volunteered, then read it back to confirm).",
+        "3. Learn the reason for the call (or capture it if volunteered, "
+        "then briefly paraphrase to confirm).",
+        "",
+        "**Rules**",
+        "- Open with a brief thanks (\"Thank you for calling\") then identify "
+        f"yourself: **{agent_name}**, the **{agent_title}** at "
+        f"**{clinic.clinic_name}**. Do not repeat the clinic name in the "
+        "thanking phrase — the caller already knows who they called.",
+        "- Pick the single most natural next question based on what the caller "
+        "has said so far. Do not run through a fixed list.",
+        "- If the caller has already given their name and/or reason, skip "
+        "those questions and read/paraphrase back instead.",
+    ]
+    if style_notes:
+        rendered = _interpolate(
+            style_notes,
+            clinic_name=clinic.clinic_name,
+            agent_name=agent_name,
+            agent_title=agent_title,
+        )
+        out.extend([
+            "",
+            "**Greeting style notes from the clinic** (use these to shape tone "
+            "and signature phrasing — do not recite verbatim):",
+            rendered,
+        ])
+    return "\n".join(out)
+
+
+def _stage_2_identity(caps: list[Protocol]) -> str:
+    """Stage 2 — Identity (new vs existing + lookup + callback number)."""
+    verify = _capability_by_id(caps, VerifyCallerIdentificationProtocol.id)
     existing_lookup_block = (
-        patient_match.prompt_fragment if patient_match
-        else "_(Lookup Patient capability not enabled for this clinic.)_"
+        verify.prompt_fragment if verify
+        else "_(Verify Caller Identification protocol not enabled for this clinic.)_"
     )
     return (
-        "## Caller Classification\n"
-        "- Determine whether the caller is new to the clinic or an existing "
-        "patient, determine if they are calling on behalf of someone else.\n"
-        '  - "Have you visited our office before?" [info collection point] '
-        "<wait for user response>\n"
-        "- New Caller\n"
-        '  - "How did you hear about us?" [info collection point] '
-        "<wait for user response>\n"
-        '  - "Have you ever worn or tried hearing aids before?" '
-        "<wait for user response>\n"
-        '  - "Have you had a hearing test in the last 6 months?" '
-        "<wait for user response>\n"
-        "  - Proceed to the New Patient Flow.\n"
-        "- Existing Patient\n"
-        '  - "Let me find you in our system." → Use the Lookup Patient capability.\n'
-        f"\n{existing_lookup_block}\n"
-        "  - Proceed to the Existing Patient Flow."
+        "## Stage 2 — Identity\n"
+        "**Goals**\n"
+        "1. Determine whether the caller is **new** or **existing** "
+        "**[info collection point]**.\n"
+        "2. If existing → silently call the Lookup Patient capability "
+        "(see the capability block below). Confirm the match by name.\n"
+        "3. Confirm the **callback number** **[info collection point]**. "
+        "The caller-ID number is a hint, not gospel — read it back.\n"
+        "\n"
+        "**Rules**\n"
+        "- If the caller already volunteered new-vs-existing in Stage 1, do "
+        "not ask again — just acknowledge (\"got it, you're an existing patient\").\n"
+        "- Existing-patient lookups happen quietly. You may say once "
+        "\"let me find you in our system.\"\n"
+        "- A failed or ambiguous lookup is fine — proceed and let the staff "
+        "resolve identity later. Don't quiz the caller.\n"
+        "\n"
+        f"{existing_lookup_block}"
     )
 
 
-def _new_patient_flow_section() -> str:
-    # TODO: extend once the full New Patient Flow is provided.
+def _render_caller_buckets(buckets: list[ClinicVoiceAgentCallerBucket]) -> str:
+    """Render either the clinic's own active buckets (sorted by ordinal) or
+    the hardcoded defaults when no DB rows exist. Output is the numbered
+    block consumed by the New Patient Flow section.
+    """
+    active = [b for b in buckets if b.active] if buckets else []
+    if active:
+        active.sort(key=lambda b: (b.ordinal, b.id))
+        items = [(b.label, b.example_phrases or "", b.canned_response or "") for b in active]
+    else:
+        items = list(_DEFAULT_CALLER_BUCKETS)
+
+    blocks: list[str] = []
+    for i, (label, phrases, response) in enumerate(items, start=1):
+        phrases_block = (phrases or "").strip()
+        response_block = (response or "").strip()
+        block = f"{i}) {label}:"
+        if phrases_block:
+            block += "\nExample phrases:\n" + phrases_block
+        if response_block:
+            block += "\nResponse:\n" + response_block
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+def _stage_3a_new_patient(
+    script: ClinicVoiceAgentScript | None,
+    buckets: list[ClinicVoiceAgentCallerBucket],
+) -> str:
+    """Stage 3a — New Patient Discovery (only runs if Stage 2 = new)."""
+    intake = (script.new_patient_intake_prompt or "").strip() if script else ""
+    rendered_buckets = _render_caller_buckets(buckets)
+    out = [
+        "## Stage 3a — New Patient Discovery (only if new)",
+        "**Goals**",
+        "1. Understand the caller's motivation **[info collection point]**.",
+        "2. Categorize the motivation into one of the configured caller buckets.",
+        "3. Deliver the bucket's response in your own warm voice — not as a recital.",
+        "",
+        "**Rules**",
+        "- Open the discovery with the intake prompt below, unless the caller "
+        "has already given you enough motivation context to skip straight to "
+        "categorization.",
+        "- Categorization is internal — never name the bucket out loud "
+        "(\"I'll categorize you as a price shopper\" is wrong).",
+        "- The bucket response is *guidance for what to convey*. Adapt phrasing "
+        "to fit the conversation; do not read it verbatim.",
+    ]
+    if intake:
+        out.extend(["", "**Intake prompt (suggested):**", intake])
+    out.extend([
+        "",
+        "**Caller buckets — categorize then respond:**",
+        "",
+        rendered_buckets,
+    ])
+    return "\n".join(out)
+
+
+def _stage_3b_existing_patient(script: ClinicVoiceAgentScript | None) -> str:
+    """Stage 3b — Existing Patient Service (only runs if Stage 2 = existing)."""
+    extra = (script.existing_patient_intro or "").strip() if script else ""
+    out = [
+        "## Stage 3b — Existing Patient Service (only if existing)",
+        "**Goals**",
+        "1. Surface the specific need (booking, troubleshooting, billing, supplies, etc.) "
+        "**[info collection point]**.",
+        "2. Capture the details staff will need: aid model if known, urgency, "
+        "preferred time window. **[info collection point]**",
+        "",
+        "**Rules**",
+        "- If the caller already named their need in Stage 1, do not ask "
+        "\"what can I help you with?\" — go straight to capturing details.",
+        "- One focused follow-up at a time. Confirm dates/times by reading back.",
+    ]
+    if extra:
+        out.extend([
+            "",
+            "**Clinic-specific guidance for existing patients:**",
+            extra,
+        ])
+    return "\n".join(out)
+
+
+def _stage_4_capture_and_close() -> str:
+    """Stage 4 — Capture & Close. Fully hardcoded for v1; a dedicated
+    ``closing_notes`` column can be added later if clinics need to customize.
+    """
     return (
-        "## New Patient Flow\n"
-        '- "Can I ask what\'s been prompting you to look into your hearing '
-        'health right now?" <wait for user response>'
+        "## Stage 4 — Capture & Close\n"
+        "**Goals**\n"
+        "1. Confirm the best callback number (read it back).\n"
+        "2. Briefly summarize what you understood — give the caller a chance "
+        "to correct anything.\n"
+        "3. Submit the ticket via the ``submit_ticket`` capability.\n"
+        "4. Warm close. Thank them for calling.\n"
+        "\n"
+        "**Rules**\n"
+        "- The summary should be 1–2 sentences. Don't read back every field.\n"
+        "- ``submit_ticket`` is called silently after the summary is confirmed.\n"
+        "- Never end the call without calling ``submit_ticket`` if there is any "
+        "actionable information to record."
     )
-
-
-def _existing_patient_flow_section() -> str:
-    # TODO: populate once the full Existing Patient Flow is provided.
-    return ""
 
 
 def _trailing_capability_blocks(
-    caps: list[Capability],
+    caps: list[Protocol],
     inlined_ids: set[str],
 ) -> list[str]:
-    """Capability fragments not already inlined upstream.
+    """Protocol fragments not already inlined upstream.
 
     Toggleable fragments first (in registry order), always-on last so
-    SubmitTicket's closing instructions sit at the very end of the prompt.
+    SubmitTicketProtocol's closing instructions sit at the very end of the prompt.
     """
     toggleable = [
         c.prompt_fragment for c in caps
@@ -227,30 +432,75 @@ def _trailing_capability_blocks(
     return toggleable + always_on
 
 
-def build_system_prompt(clinic: Clinic, caps: list[Capability], locale: dict) -> str:
-    inlined_ids = {PatientMatch.id}
+def _script_section(script: ClinicVoiceAgentScript | None) -> str:
+    """Render the clinic-editable scope-of-practice script into a prompt block.
+
+    Empty / null row → empty string (the block is dropped from the prompt).
+    Only populated fields are emitted, each as a sub-heading. Order is
+    deliberate: scope first (the broadest bound), then explicit
+    offered/not-offered lists, then caller-need categories, then misc notes.
+    """
+    if script is None:
+        return ""
+    fields = [
+        ("Scope of practice",    script.scope_of_practice),
+        ("Services offered",     script.services_offered),
+        ("Services NOT offered", script.services_not_offered),
+        ("Caller needs",         script.caller_needs),
+        ("Additional notes",     script.additional_notes),
+    ]
+    blocks = []
+    for label, value in fields:
+        v = (value or "").strip()
+        if v:
+            blocks.append(f"### {label}\n{v}")
+    if not blocks:
+        return ""
+    return "## Scope of practice\n\n" + "\n\n".join(blocks)
+
+
+def build_system_prompt(
+    clinic: Clinic,
+    caps: list[Protocol],
+    locale: dict,
+    script: ClinicVoiceAgentScript | None = None,
+    persona: ClinicVoiceAgentPersona | None = None,
+    caller_buckets: list[ClinicVoiceAgentCallerBucket] | None = None,
+) -> str:
+    inlined_ids = {VerifyCallerIdentificationProtocol.id}
+    buckets = caller_buckets or []
     parts = [
         locale["prompt_block"],
         _identity_section(clinic),
         _task_overview_section(),
+        _behavior_rules_section(),
+        _script_section(script),
         _hours_block(clinic),
-        _opening_section(clinic),
-        _caller_classification_section(caps),
-        _new_patient_flow_section(),
-        _existing_patient_flow_section(),
+        _stage_1_greeting_and_reason(clinic, persona, script),
+        _stage_2_identity(caps),
+        _stage_3a_new_patient(script, buckets),
+        _stage_3b_existing_patient(script),
+        _stage_4_capture_and_close(),
         *_trailing_capability_blocks(caps, inlined_ids),
     ]
     return "\n\n".join(p for p in parts if p)
 
 
 def _enabled_capability_ids(db: Session, clinic_id: str) -> list[str]:
+    """Enabled protocol IDs for a clinic.
+
+    Reads from ``clinic_protocols`` (the post-step-3 source of truth).
+    The legacy table is still dual-written by the toggle endpoint, but
+    this query intentionally does not consult it — if rollback is needed,
+    revert the code; the data stays consistent because of dual-write.
+    """
     rows = db.scalars(
-        select(VoiceAgentCapability).where(
-            VoiceAgentCapability.clinic_id == clinic_id,
-            VoiceAgentCapability.enabled.is_(True),
+        select(ClinicProtocol).where(
+            ClinicProtocol.clinic_id == clinic_id,
+            ClinicProtocol.enabled.is_(True),
         )
     ).all()
-    return [r.capability_id for r in rows]
+    return [r.protocol_id for r in rows]
 
 
 def build_agent_config(db: Session, clinic: Clinic) -> dict:
@@ -267,22 +517,36 @@ def build_agent_config(db: Session, clinic: Clinic) -> dict:
     credential_id = _vapi_credential_id()
     enabled_ids = _enabled_capability_ids(db, clinic.clinic_id)
     caps = _instantiate_capabilities(clinic, enabled_ids, credential_id)
+    script = db.get(ClinicVoiceAgentScript, clinic.clinic_id)
+    persona = db.get(ClinicVoiceAgentPersona, clinic.clinic_id)
+    caller_buckets = list(db.scalars(
+        select(ClinicVoiceAgentCallerBucket)
+        .where(ClinicVoiceAgentCallerBucket.clinic_id == clinic.clinic_id)
+        .order_by(ClinicVoiceAgentCallerBucket.ordinal.asc(),
+                  ClinicVoiceAgentCallerBucket.id.asc())
+    ))
 
-    system_prompt = build_system_prompt(clinic, caps, locale)
-    tools = [c.to_vapi_tool() for c in caps]
+    system_prompt = build_system_prompt(
+        clinic, caps, locale, script,
+        persona=persona, caller_buckets=caller_buckets,
+    )
+    # Flatten: each protocol contributes 1+ VAPI tools. Single-tool ports
+    # return a 1-element list; future multi-tool protocols return several.
+    tools = [t for c in caps for t in c.tools()]
+
+    _name, _title, voice_id, _override, ai_model = _persona_or_defaults(persona)
 
     return {
         "name": clinic.clinic_name,
-        "first_message": build_first_message(clinic.clinic_name),
+        "first_message": build_first_message(clinic.clinic_name, persona),
         "first_message_interruptions_enabled": True,
         "model": {
             "provider": "openai",
-            "model": "gpt-4o",
+            "model": ai_model,
             "messages": [{"role": "system", "content": system_prompt}],
             "tools": tools,
         },
-        # Hardcoded for v1; revisit if a clinic asks for variation.
-        "voice": {"speed": 0.9, "provider": "vapi", "voiceId": "Emma"},
+        "voice": {"speed": 0.9, "provider": "vapi", "voiceId": voice_id},
         "transcriber": {
             "provider": "deepgram",
             "model": "nova-2",

@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY api ./api
-COPY main.py .
+COPY intelligence_report ./intelligence_report
 COPY alembic ./alembic
 COPY alembic.ini .
 

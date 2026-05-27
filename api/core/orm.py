@@ -11,7 +11,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger, Boolean, CHAR, Column, DateTime, Enum, ForeignKey,
-    Integer, String, Text, UniqueConstraint, func,
+    Integer, SmallInteger, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -102,7 +102,19 @@ class Clinic(Base):
     blueprint_config: Mapped["ClinicBlueprintConfig"] = relationship(
         back_populates="clinic", uselist=False, cascade="all, delete-orphan"
     )
+    voice_agent_script: Mapped["ClinicVoiceAgentScript"] = relationship(
+        back_populates="clinic", uselist=False, cascade="all, delete-orphan"
+    )
+    voice_agent_persona: Mapped["ClinicVoiceAgentPersona"] = relationship(
+        back_populates="clinic", uselist=False, cascade="all, delete-orphan"
+    )
+    voice_agent_caller_buckets: Mapped[list["ClinicVoiceAgentCallerBucket"]] = relationship(
+        back_populates="clinic", cascade="all, delete-orphan"
+    )
     capabilities: Mapped[list["VoiceAgentCapability"]] = relationship(
+        back_populates="clinic", cascade="all, delete-orphan"
+    )
+    protocols: Mapped[list["ClinicProtocol"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
     )
     google_ads_campaigns: Mapped[list["GoogleAdsCampaign"]] = relationship(
@@ -207,7 +219,123 @@ class ClinicBlueprintConfig(Base):
     clinic: Mapped["Clinic"] = relationship(back_populates="blueprint_config")
 
 
+# ──────────────────── clinic_voice_agent_script (1:1) ────────────────────
+
+class ClinicVoiceAgentScript(Base):
+    """Editable scope-of-practice content used by the voice agent.
+
+    All columns are free-form text — they're injected into the agent's system
+    prompt at provision time. The dashboard's Voice Agent Script section
+    surfaces them as labelled textareas so clinic admins can tune what the
+    agent will and won't engage with.
+    """
+    __tablename__ = "clinic_voice_agent_script"
+
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    scope_of_practice:         Mapped[str | None] = mapped_column(Text)
+    services_offered:          Mapped[str | None] = mapped_column(Text)
+    services_not_offered:      Mapped[str | None] = mapped_column(Text)
+    caller_needs:              Mapped[str | None] = mapped_column(Text)
+    additional_notes:          Mapped[str | None] = mapped_column(Text)
+    # 0003 — added when the prompt builder learned to render an editable
+    # opening + new-patient intake + existing-patient transition.
+    opening_overrides:         Mapped[str | None] = mapped_column(Text)
+    new_patient_intake_prompt: Mapped[str | None] = mapped_column(Text)
+    existing_patient_intro:    Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="voice_agent_script")
+
+
+# ──────────────────── clinic_voice_agent_persona (1:1) ────────────────────
+
+class ClinicVoiceAgentPersona(Base):
+    """Customisable presentation layer for the voice agent.
+
+    Defaults to ``Emma`` / ``virtual hearing assistant`` so clinics that
+    never touch this row get the same behaviour they had before the model
+    was introduced. ``first_message`` is null by default — the factory
+    falls back to a templated greeting using ``agent_name`` + clinic name.
+    """
+    __tablename__ = "clinic_voice_agent_persona"
+
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    agent_name:    Mapped[str] = mapped_column(String(64),  nullable=False, server_default="Emma")
+    agent_title:   Mapped[str] = mapped_column(
+        String(128), nullable=False, server_default="virtual hearing assistant",
+    )
+    voice_id:      Mapped[str] = mapped_column(String(64),  nullable=False, server_default="Emma")
+    first_message: Mapped[str | None] = mapped_column(Text)
+    ai_model:      Mapped[str] = mapped_column(String(64),  nullable=False, server_default="gpt-4o")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="voice_agent_persona")
+
+
+# ──────────────────── clinic_voice_agent_caller_bucket (N) ────────────────────
+
+class ClinicVoiceAgentCallerBucket(Base):
+    """Per-clinic caller-intent categories with example phrases and canned
+    responses, replacing the hardcoded Motivated / Price Shopper / Test-Only
+    buckets. Ordered by ``ordinal`` ASC in the prompt; inactive rows hidden.
+    Unseeded clinics fall back to a hardcoded default set in factory.py.
+    """
+    __tablename__ = "clinic_voice_agent_caller_bucket"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    ordinal:         Mapped[int]  = mapped_column(SmallInteger, nullable=False, server_default="0")
+    label:           Mapped[str]  = mapped_column(String(128), nullable=False)
+    example_phrases: Mapped[str | None] = mapped_column(Text)
+    canned_response: Mapped[str | None] = mapped_column(Text)
+    active:          Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="voice_agent_caller_buckets")
+
+
 # ──────────────────── voice_agent_capabilities (N) ────────────────────
+#
+# Legacy table — replaced by ``clinic_protocols`` (below) as part of the
+# Protocol migration. The hypervisor dual-writes both tables for the
+# transition window so a rollback to old code sees fresh data. Reads
+# come from ``clinic_protocols`` only. Step 6 drops this table.
 
 class VoiceAgentCapability(Base):
     __tablename__ = "voice_agent_capabilities"
@@ -232,6 +360,39 @@ class VoiceAgentCapability(Base):
     )
 
     clinic: Mapped["Clinic"] = relationship(back_populates="capabilities")
+
+
+# ──────────────────── clinic_protocols (N) ────────────────────
+#
+# Source of truth for per-clinic protocol toggles. Identical shape to
+# ``voice_agent_capabilities`` (which it replaces); ``protocol_id``
+# corresponds to ``Protocol.id``. The ``config`` JSON is validated against
+# the protocol's ``config_model`` at write time once the first non-empty
+# config_model lands (step 5 of the Protocol migration).
+
+class ClinicProtocol(Base):
+    __tablename__ = "clinic_protocols"
+
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    protocol_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="0")
+    config: Mapped[dict | None] = mapped_column(JSON)
+    updated_by: Mapped[str | None] = mapped_column(String(255))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="protocols")
 
 
 # ──────────────────── google_ads_campaigns (N) ────────────────────

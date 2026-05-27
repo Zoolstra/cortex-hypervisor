@@ -56,7 +56,12 @@ DB_NAME = "clients"
 
 # Final fallback when neither CLOUD_SQL_IAM_USER is set nor ADC resolves to a
 # service account. Matches the prod Cloud Run service identity.
-_DEFAULT_IAM_USER = "cortex-accounts-cloudsql-sa@project-demo-2-482101.iam"
+_DEFAULT_IAM_USER = "cortex-hypervisor-sa@project-demo-2-482101.iam"
+
+_METADATA_SA_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/instance/"
+    "service-accounts/default/email"
+)
 
 # IPType: PUBLIC for local dev (the only path that works without a VPC connector);
 # PRIVATE in Cloud Run once private IP is wired. Toggle via env var.
@@ -70,13 +75,31 @@ def _resolve_iam_user() -> str:
     the username to match the calling identity exactly:
 
       1. CLOUD_SQL_IAM_USER env override (local dev / explicit override)
-      2. ADC service-account email (Cloud Run, gcloud SA impersonation) —
-         Cloud SQL MySQL strips ``.gserviceaccount.com``
-      3. Hardcoded default (the prod SA)
+      2. GCE/Cloud Run metadata server — authoritative when running on GCP
+      3. ADC service-account email (gcloud SA impersonation on dev boxes)
+      4. Hardcoded default (the prod SA)
+
+    The metadata server is checked before ADC because google.auth's
+    `compute_engine.Credentials.service_account_email` returns the literal
+    string ``"default"`` until the credentials refresh, which silently sends
+    the wrong username on Cloud Run cold starts.
     """
     override = os.environ.get("CLOUD_SQL_IAM_USER")
     if override:
         return override
+
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            _METADATA_SA_URL, headers={"Metadata-Flavor": "Google"}
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            email = resp.read().decode().strip()
+        if email and "@" in email:
+            return email.removesuffix(".gserviceaccount.com")
+    except Exception:
+        pass
+
     try:
         from google.auth import default as ga_default
         creds, _ = ga_default()
@@ -85,6 +108,7 @@ def _resolve_iam_user() -> str:
             return sa_email.removesuffix(".gserviceaccount.com")
     except Exception:
         pass
+
     return _DEFAULT_IAM_USER
 
 

@@ -21,6 +21,7 @@ from api.core.orm import (
     ClinicVoiceAgentConfiguration,
     Instance,
 )
+from api.voice_agent.defaults import seed_voice_agent_defaults
 
 
 def provision_instance(
@@ -85,6 +86,12 @@ def provision_clinic(
         time_zone=clinic_data.get("time_zone"),
     ))
     db.add(ClinicVoiceAgentConfiguration(clinic_id=clinic_id))
+
+    # Seed the editable voice-agent defaults (persona, script extension
+    # fields, three caller buckets) so admins land in the dashboard with
+    # visible, editable content instead of empty sections.
+    seed_voice_agent_defaults(db, clinic_id, only_if_missing=True)
+
     return clinic_id, ref_id
 
 
