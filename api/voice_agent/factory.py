@@ -29,6 +29,7 @@ from api.voice_agent.protocols import (
     Protocol,
     SubmitTicketProtocol,
     VerifyCallerIdentificationProtocol,
+    unmet_dependencies,
 )
 from api.voice_agent.defaults import (
     DEFAULT_AGENT_NAME as _DEFAULT_AGENT_NAME,
@@ -97,9 +98,16 @@ def _instantiate_capabilities(
     Order:
       1. Toggleable capabilities (in PROTOCOL_REGISTRY declaration order) —
          only those whose ID is in enabled_capability_ids AND whose
-         supported_pms includes this clinic's pms_type.
+         supported_pms includes this clinic's pms_type AND whose
+         ``depends_on`` set is fully covered by other enabled ids.
       2. Always-on capabilities (e.g. SubmitTicketProtocol) appended last so the
          "closing & ticket submission" block is at the end of the prompt.
+
+    A protocol whose deps aren't met is **skipped with a warning** rather
+    than included with broken references. The toggle row stays "on" — the
+    operator's intent is preserved; the agent just doesn't get a tool +
+    prompt fragment that would crash on use. The admin UI surfaces the
+    same unmet-deps list from the GET /capabilities endpoint.
     """
     enabled = set(enabled_capability_ids)
     instantiated: list[Protocol] = []
@@ -117,6 +125,13 @@ def _instantiate_capabilities(
         if cls.always_on:
             continue
         if cap_id not in enabled:
+            continue
+        unmet = unmet_dependencies(cap_id, enabled)
+        if unmet:
+            log.warning(
+                "Skipping protocol %s for clinic_id=%s — unmet deps: %s",
+                cap_id, clinic.clinic_id, unmet,
+            )
             continue
         try:
             instantiated.append(make(cls))
@@ -188,8 +203,9 @@ def _task_overview_section() -> str:
         "- Quoted phrases below are *examples* you may use; phrase them in your "
         "own words when the conversation calls for it. Unquoted text is instruction.\n"
         "- Items marked **[info collection point]** must end up in the ticket. "
-        "If the caller volunteers the value, read it back to confirm rather than "
-        "asking the question again."
+        "Capture the value when the caller says it — acknowledge naturally so they "
+        "feel heard. Verbatim readback isn't required at the capture moment; it's "
+        "required at the use moment (see Conversational behavior below)."
     )
 
 
@@ -203,29 +219,35 @@ def _behavior_rules_section() -> str:
         "Listen to what they said and use it. If they opened with their name "
         "and reason, do not then ask \"who am I speaking with?\" or \"how can "
         "I help you?\"\n"
-        "- **For data collection points (name, callback number, email, dates, "
-        "appointment times), confirm by reading the value back — do not ask "
-        "again.** Examples:\n"
-        "  - Caller: \"Hi, this is John.\" → You: \"Hi John, did I get that right?\"\n"
-        "  - Caller: \"Call me at 5 5 5 1 2 3 4.\" → You: \"Just to confirm — "
-        "five-five-five, one-two-three-four — correct?\"\n"
-        "- **For names, always spell them back letter-by-letter for confirmation.** "
-        "Voice transcription frequently mangles names, and downstream lookups "
-        "are exact-match — a single wrong letter breaks everything. Example:\n"
-        "  - Caller: \"This is Jonathan Smyth.\" → You: \"Got it. Let me spell "
-        "that back — first name J-O-N-A-T-H-A-N, last name S-M-Y-T-H. Did I "
-        "get every letter right?\" If they correct you, spell it back again "
-        "with the correction until they confirm every letter.\n"
-        "- **For free-form context (reason for calling, motivation, what's been "
-        "happening), confirm by brief paraphrase.** Example:\n"
+        "- **Acknowledge briefly so the caller feels heard — do NOT read back "
+        "every piece of information verbatim.** A natural \"got it\" or a "
+        "one-sentence paraphrase is enough most of the time. Overusing verbatim "
+        "readback makes the call feel slow and robotic. Examples of the right "
+        "default acknowledgement:\n"
+        "  - Caller: \"Hi, this is John.\" → You: \"Hi John — what can I help "
+        "you with today?\" (not: \"John, did I get that right?\")\n"
         "  - Caller: \"I've been having trouble at family dinners.\" → You: "
-        "\"So it's been hard to follow conversations in groups — did I get that?\"\n"
+        "\"So it's been tough following conversations in groups — got it.\" "
+        "(paraphrase, not verbatim readback)\n"
+        "- **Verbatim readback IS required when a value is about to be passed "
+        "to a tool — a patient lookup, a booking, a cancel, or a reschedule.** "
+        "The act-on protocols' prompts (Verify Caller Identification, Book "
+        "Appointment, Cancel Appointment, Reschedule Appointment) tell you "
+        "exactly when. In summary:\n"
+        "  - Before `verify_caller_identification`: spell back first + last "
+        "name letter-by-letter; read back the last 4 phone digits.\n"
+        "  - Before `book_appointment` / `reschedule_appointment`: read back "
+        "the appointment type, day, and time. For new-patient bookings, "
+        "spell-back the name (it's about to be used to create a patient "
+        "record).\n"
+        "  - Before `cancel_appointment`: read back which appointment will be "
+        "cancelled.\n"
+        "  At the capture moment (Stage 1, Stage 3) you are NOT yet using the "
+        "value — acknowledge naturally and move on; readback happens later if "
+        "and when a tool needs the value.\n"
         "- **Ask one focused question per turn.** No multi-part interrogations.\n"
-        "- **Briefly acknowledge what the caller said before moving on.** They "
-        "should always feel heard.\n"
-        "- **Tool calls (patient lookup, ticket submission) happen quietly.** "
-        "You may say once \"let me find you in our system\" before a lookup, "
-        "but do not narrate every tool call."
+        "- **Tool calls happen quietly.** You may say once \"let me find you "
+        "in our system\" before a lookup, but do not narrate every tool call."
     )
 
 
@@ -248,7 +270,9 @@ def _stage_1_greeting_and_reason(
         "**Goals**",
         "1. Warmly greet the caller. Identify yourself by name and role.",
         "2. Learn the caller's name **[info collection point]** "
-        "(or capture it if volunteered, then read it back to confirm).",
+        "(or capture it if volunteered). Acknowledge it naturally — "
+        "verbatim spell-back is deferred to the Verify Caller "
+        "Identification step where the name is actually used for a lookup.",
         "3. Learn the reason for the call (or capture it if volunteered, "
         "then briefly paraphrase to confirm).",
         "",
@@ -260,7 +284,8 @@ def _stage_1_greeting_and_reason(
         "- Pick the single most natural next question based on what the caller "
         "has said so far. Do not run through a fixed list.",
         "- If the caller has already given their name and/or reason, skip "
-        "those questions and read/paraphrase back instead.",
+        "those questions — a natural acknowledgement or short paraphrase is "
+        "enough; do not read their name back verbatim at this stage.",
     ]
     if style_notes:
         rendered = _interpolate(
@@ -292,8 +317,12 @@ def _stage_2_identity(caps: list[Protocol]) -> str:
         "**[info collection point]**.\n"
         "2. If existing → silently call the Lookup Patient capability "
         "(see the capability block below). Confirm the match by name.\n"
-        "3. Confirm the **callback number** **[info collection point]**. "
-        "The caller-ID number is a hint, not gospel — read it back.\n"
+        "3. Collect the **callback number** **[info collection point]**. "
+        "The caller-ID number is a hint, not gospel — ask if it's the "
+        "best number to reach them. Acknowledge naturally; do not read it "
+        "back digit-by-digit at this stage. (If the number is later used "
+        "as input to a tool — none of the current protocols do — readback "
+        "would apply then.)\n"
         "\n"
         "**Rules**\n"
         "- If the caller already volunteered new-vs-existing in Stage 1, do "
@@ -380,7 +409,9 @@ def _stage_3b_existing_patient(script: ClinicVoiceAgentScript | None) -> str:
         "**Rules**",
         "- If the caller already named their need in Stage 1, do not ask "
         "\"what can I help you with?\" — go straight to capturing details.",
-        "- One focused follow-up at a time. Confirm dates/times by reading back.",
+        "- One focused follow-up at a time. Acknowledge details as the "
+        "caller mentions them; verbatim readback of dates/times waits "
+        "until you're about to pass them to a booking or reschedule tool.",
     ]
     if extra:
         out.extend([
@@ -398,7 +429,8 @@ def _stage_4_capture_and_close() -> str:
     return (
         "## Stage 4 — Capture & Close\n"
         "**Goals**\n"
-        "1. Confirm the best callback number (read it back).\n"
+        "1. Make sure you have the best callback number for them. Ask if "
+        "it's the right number rather than reciting digits back.\n"
         "2. Briefly summarize what you understood — give the caller a chance "
         "to correct anything.\n"
         "3. Submit the ticket via the ``submit_ticket`` capability.\n"

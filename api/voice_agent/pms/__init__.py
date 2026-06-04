@@ -77,12 +77,16 @@ class AvailabilityFilters:
     """Per-clinic policy filters forwarded to the adapter.
 
     Adapters translate the fields they support into PMS-specific query
-    parameters and ignore the rest. New fields appear here as protocols
-    need them — e.g. `online_booking_only` lands when the
-    `BookAppointmentProtocol` config grows that knob in step 5.
+    parameters and ignore the rest.
+
+    ``online_booking_only``: when True, only return slots whose underlying
+    provider availability block is flagged
+    ``availableForOnlineBookingOnly = true`` in the PMS. Originated as
+    ACNA's request and surfaced as a per-clinic toggle on
+    ``SearchAppointmentAvailabilityProtocol.config_model``.
     """
 
-    pass
+    online_booking_only: bool = False
 
 
 @dataclass(frozen=True)

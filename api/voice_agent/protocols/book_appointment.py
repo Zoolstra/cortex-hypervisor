@@ -28,6 +28,7 @@ class BookAppointmentProtocol(Protocol):
     )
     agent_tool_name = "book_appointment"
     supported_pms = ("blueprint",)
+    depends_on = ("search_appointment_availability",)
 
     def _tool_url(self) -> str:
         if self.pms_type == "blueprint":
@@ -122,7 +123,8 @@ Use this protocol to actually create a booking in the PMS. It's the step AFTER t
 1. **Slot is real.** You called `find_available_slots` (Search Appointment Availability) and the `start_time` you'll pass is one of the times returned for the chosen `start_date`. Do not pick a "close" time that wasn't in the list — the PMS will reject it.
 2. **Patient is identified.** Either:
    - Existing patient: `verify_caller_identification` returned `matched` and you have a `patient_id`, OR
-   - New patient: you have collected and spelling-confirmed their first name, last name, and callback phone number.
+   - New patient: you have the first name, last name, and callback phone number — AND you have spell-confirmed both names letter-by-letter before this step (the booking creates a new patient record from these fields, and a wrong letter is permanent). Example:
+     > "Before I book this, let me spell your name back — first name J-O-H-N, last name S-M-Y-T-H-E. Got every letter right?"
 3. **Caller has explicitly agreed to the booking.** Read back the appointment type, day, and time, and get a "yes, book it" before the tool call. Example:
    > "So that's a Hearing Test on Tuesday May 30 at 10 AM with Dr. Vader. Should I go ahead and book that?"
 

@@ -30,6 +30,7 @@ class LocateAppointmentProtocol(Protocol):
     )
     agent_tool_name = "locate_appointment"
     supported_pms = ("blueprint",)
+    depends_on = ("verify_caller_identification",)
 
     def _tool_url(self) -> str:
         if self.pms_type == "blueprint":

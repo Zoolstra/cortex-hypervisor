@@ -15,7 +15,34 @@ from __future__ import annotations
 
 import os
 
+from pydantic import BaseModel, Field
+
 from api.voice_agent.protocols.base import Protocol
+
+
+class SearchAppointmentAvailabilityConfig(BaseModel):
+    """Per-clinic configuration for the availability search.
+
+    First instance of the design doc's §5 typed protocol config. Stored
+    in ``clinic_protocols.config`` for this protocol id; validated on
+    write and on agent build. Adding a field here automatically surfaces
+    it in the dashboard's Configure form (the frontend renders from the
+    JSON Schema this model emits).
+    """
+
+    online_booking_only: bool = Field(
+        default=False,
+        title="Online booking only",
+        description=(
+            "When enabled, the agent only quotes time slots whose provider "
+            "blocks are flagged ``availableForOnlineBookingOnly = true`` in "
+            "Blueprint. Use this for clinics whose staff curate which "
+            "availability is reachable through the agent vs. reserved for "
+            "phone-only / staff-managed bookings."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
 
 
 _CORTEX_BASE = os.environ.get("CORTEX_API_BASE_URL", "http://localhost:8000")
@@ -33,6 +60,7 @@ class SearchAppointmentAvailabilityProtocol(Protocol):
     # `agent_tool_name` — the dashboard surfaces the protocol-level
     # display_name; the two tool names live on the tools themselves.
     supported_pms = ("blueprint", "audit_data")
+    config_model = SearchAppointmentAvailabilityConfig
 
     def _types_url(self) -> str:
         if self.pms_type == "blueprint":

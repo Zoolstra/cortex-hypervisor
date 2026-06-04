@@ -1,11 +1,35 @@
+import logging
 import os
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.account import routers as account_routers
-from api.voice_agent import routers as voice_agent_routers
-from api.intelligence import router as intelligence_router
+# Application logging — configured before any router imports so
+# module-level ``log = logging.getLogger(__name__)`` calls pick up the
+# root handler this installs. uvicorn manages its own ``uvicorn.*``
+# loggers separately; this only governs our ``api.*`` loggers.
+#
+# Pinned to ``sys.stdout`` so app logs land in the same Cloud Logging
+# stream as uvicorn's access log (run.googleapis.com/stdout). Python's
+# default for basicConfig is ``sys.stderr``, which splits app logs
+# into a separate stream from the access log — annoying for debugging.
+#
+# Override level per-environment with the ``LOG_LEVEL`` env var (e.g.
+# ``LOG_LEVEL=DEBUG`` for noisier local runs).
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logging.getLogger(__name__).info(
+    "cortex-hypervisor logging configured (level=%s)",
+    logging.getLogger().level,
+)
+
+from api.account import routers as account_routers  # noqa: E402 — after basicConfig
+from api.voice_agent import routers as voice_agent_routers  # noqa: E402
+from api.intelligence import router as intelligence_router  # noqa: E402
 
 app = FastAPI()
 

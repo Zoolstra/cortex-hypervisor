@@ -33,12 +33,14 @@ from sqlalchemy.orm import Session
 from api.deps import require_read_access, verify_token
 from api.core.db import get_session
 from api.core.secrets import get_secret
+from api.voice_agent.pms import AvailabilityFilters
 from api.voice_agent.pms.blueprint import (
     BlueprintAdapter,
     _blueprint_base,
     _get_blueprint_config,
     _int_field,
 )
+from api.voice_agent.protocols import load_protocol_config
 
 router = APIRouter(prefix="/blueprint")
 
@@ -349,7 +351,13 @@ def find_available_slots(
 
     Response is aggressively stripped — only date + bookable times reach the
     agent. The PMS call (and the strip) live in `BlueprintAdapter`.
+
+    Per-clinic policy comes from ``clinic_protocols.config`` for
+    ``search_appointment_availability``. Today the only knob is
+    ``online_booking_only`` (ACNA's request) — when set, the adapter
+    restricts slots to providers Blueprint reports as online-bookable.
     """
+    cfg = load_protocol_config(db, clinic_id, "search_appointment_availability")
     adapter = BlueprintAdapter(clinic_id=clinic_id)
     adapter.load_http_config(db)
     result = adapter.find_available_slots(
@@ -358,6 +366,7 @@ def find_available_slots(
         end_date=body.end_date,
         providers=body.providers,
         locations=body.locations,
+        filters=AvailabilityFilters(online_booking_only=cfg.online_booking_only),
     )
     return {
         "days": [

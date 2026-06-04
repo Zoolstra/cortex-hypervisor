@@ -12,6 +12,7 @@ data is fully isolated by ``_clinic_id``.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 from typing import Any
 
@@ -32,6 +33,40 @@ def _params(clinic_id: str, **extra) -> list[bigquery.ScalarQueryParameter]:
     for k, v in extra.items():
         out.append(bigquery.ScalarQueryParameter(k, "STRING", v))
     return out
+
+
+# ── Window boundary (snapped to the UTC day) ─────────────────────────────────
+#
+# Every reader filters to "the last ``days`` days". Historically that bound was
+# expressed inline as ``TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL N DAY)`` /
+# ``DATE_SUB(CURRENT_DATE(), INTERVAL N DAY)``. Those are *non-deterministic*
+# functions, and BigQuery disables its free 24h query-results cache for any
+# query that references one — so identical report requests re-scanned raw data
+# every single time, even seconds apart.
+#
+# Instead we compute the boundary once in Python, snapped to midnight UTC, and
+# embed it as a constant literal. The query text is then byte-identical for a
+# given ``days`` for the whole UTC day, so BigQuery serves repeats from cache
+# (0 bytes billed) until the next ETL load touches the underlying table — which
+# is exactly the freshness we want (analytics ETL is hourly, Blueprint daily).
+#
+# Snapping to the day boundary is what makes the cache actually hit: a
+# microsecond-precise "now" would make every request a unique query. The cost
+# is a slightly wider window for TIMESTAMP comparisons ("since N midnights ago"
+# rather than a rolling N×24h) — the DATE-granularity bounds are unchanged.
+
+
+def _window_start_date(days: int) -> str:
+    """``YYYY-MM-DD`` for midnight UTC, ``days`` days ago. Matches the old
+    ``DATE_SUB(CURRENT_DATE(), INTERVAL days DAY)`` exactly."""
+    start = _dt.datetime.now(_dt.timezone.utc).date() - _dt.timedelta(days=int(days))
+    return start.isoformat()
+
+
+def _window_start_ts(days: int) -> str:
+    """UTC timestamp literal (midnight, ``days`` days ago) for embedding in a
+    ``TIMESTAMP('…')`` constructor."""
+    return f"{_window_start_date(days)} 00:00:00+00:00"
 
 
 # ── Clinic metadata ──────────────────────────────────────────────────────────
@@ -83,7 +118,7 @@ def appointment_outcomes(clinic_id: str, days: int = 365) -> dict[str, Any]:
             FROM `{_BP}.Appointments`
             WHERE _clinic_id = @clinic_id
               AND SAFE_CAST(start_time AS TIMESTAMP)
-                  >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+                  >= TIMESTAMP('{_window_start_ts(days)}')
             GROUP BY label
             ORDER BY n DESC
         """,
@@ -121,7 +156,7 @@ def invoice_revenue(clinic_id: str, days: int = 365) -> dict[str, Any]:
             WHERE _clinic_id = @clinic_id
               AND SAFE_CAST(order_total_with_tax AS NUMERIC) > 0
               AND SAFE.PARSE_DATE('%Y-%m-%d', invoice_date)
-                  >= DATE_SUB(CURRENT_DATE(), INTERVAL {int(days)} DAY)
+                  >= DATE '{_window_start_date(days)}'
         """,
         job_config=bigquery.QueryJobConfig(query_parameters=_params(clinic_id)),
     ).result())
@@ -162,7 +197,7 @@ def referral_breakdown(clinic_id: str, days: int = 365, top_n: int = 10) -> list
                 WHERE im._clinic_id = @clinic_id
                   AND SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
                   AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)
-                      >= DATE_SUB(CURRENT_DATE(), INTERVAL {int(days)} DAY)
+                      >= DATE '{_window_start_date(days)}'
             )
             SELECT
               source_name,
@@ -228,7 +263,7 @@ def line_item_mix(clinic_id: str, days: int = 365) -> list[dict]:
             FROM `{_BP}.InvoiceLineItems`
             WHERE _clinic_id = @clinic_id
               AND SAFE.PARSE_DATE('%Y-%m-%d', invoice_date)
-                  >= DATE_SUB(CURRENT_DATE(), INTERVAL {int(days)} DAY)
+                  >= DATE '{_window_start_date(days)}'
             GROUP BY item_type
             ORDER BY revenue DESC NULLS LAST
         """,
@@ -273,7 +308,7 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str], days: int = 90) -
               COUNT(*) AS clicks
             FROM `{_CLINIC_DATA}.ad_clicks_v2`
             WHERE google_ads_campaign_id IN {in_list}
-              AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+              AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
             GROUP BY google_ads_campaign_id
         ),
         spend AS (
@@ -300,7 +335,7 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str], days: int = 90) -
              AND ac.google_ads_campaign_id IN {in_list}
             LEFT JOIN `{_CLINIC_DATA}.callscoring` cs
               ON cs.complete_call_id = t.complete_call_id
-            WHERE t.timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+            WHERE t.timestamp >= TIMESTAMP('{_window_start_ts(days)}')
               AND t.gclid IS NOT NULL AND t.gclid != ''
         ),
         gads_calls AS (
@@ -343,7 +378,7 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str], days: int = 90) -
              AND im.client_id = cc.client_id
             WHERE SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
               AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)
-                  >= DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY))
+                  >= DATE '{_window_start_date(days)}'
             GROUP BY cc.google_ads_campaign_id
         )
         SELECT
@@ -427,7 +462,7 @@ def marketing_funnel(
             SELECT COUNT(*) AS n
             FROM `{_CLINIC_DATA}.ad_clicks_v2`
             WHERE google_ads_campaign_id IN {in_ga}
-              AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+              AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         """).result())
         out["clicks"] = int(rows[0].n or 0)
 
@@ -444,7 +479,7 @@ def marketing_funnel(
                       OR IFNULL(AI_Appointment_Booked, 0) >= 1)                 AS booked
             FROM `{_CLINIC_DATA}.transactions`
             WHERE CAST(invoca_campaign_id AS STRING) IN {in_iv}
-              AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+              AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         """).result())
         r = rows[0]
         out["calls"]     = int(r.calls or 0)
@@ -487,7 +522,7 @@ def inbound_calls(clinic_id: str, campaign_ids: list[str], days: int = 90) -> di
                       OR IFNULL(AI_Appointment_Booked, 0) >= 1)                 AS booked
             FROM `{_CLINIC_DATA}.transactions`
             WHERE CAST(invoca_campaign_id AS STRING) IN {in_clause}
-              AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+              AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         """,
     ).result())
     r = rows[0]
@@ -595,7 +630,7 @@ def revenue_funnel(
             SELECT COUNT(*) AS n
             FROM `{_CLINIC_DATA}.ad_clicks_v2`
             WHERE google_ads_campaign_id IN {in_ga}
-              AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+              AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         """).result())
         out["clicks"] = int(rows[0].n or 0)
 
@@ -604,7 +639,6 @@ def revenue_funnel(
 
     in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
     hrs = int(booking_window_hours)
-    d = int(days)
     sql = f"""
         WITH calls AS (
             -- Per-call bucket derivation. Spam = callscoring.spam_or_solicitor
@@ -627,7 +661,7 @@ def revenue_funnel(
             LEFT JOIN `{_CLINIC_DATA}.callscoring` cs
               ON cs.complete_call_id = t.complete_call_id
             WHERE CAST(t.invoca_campaign_id AS STRING) IN {in_iv}
-              AND t.timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+              AND t.timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         ),
         spam_summary AS (
             -- Spam count is reported separately as an "upstream filter" stat;
@@ -746,7 +780,7 @@ def revenue_funnel(
                 WHERE im._clinic_id = @clinic_id
                   AND SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
                   AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)
-                      >= DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY))
+                      >= DATE '{_window_start_date(days)}'
                   AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)
                       >= DATE(pfc.first_call_ts)
                 GROUP BY im.client_id
@@ -824,7 +858,6 @@ def non_booked_journey(
     client = _client()
     in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
     hrs = int(booking_window_hours)
-    d = int(days)
     sql = f"""
         WITH calls AS (
             SELECT
@@ -833,7 +866,7 @@ def non_booked_journey(
               SAFE_CAST(timestamp AS TIMESTAMP) AS call_ts
             FROM `{_CLINIC_DATA}.transactions`
             WHERE CAST(invoca_campaign_id AS STRING) IN {in_iv}
-              AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+              AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
               AND IFNULL(AI_Opportunity, 0) < 1
               AND IFNULL(AI_Appointment_Booked, 0) < 1
         ),
@@ -934,7 +967,6 @@ def attributed_invoice_detail(
     client = _client()
     in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
     hrs = int(booking_window_hours)
-    d = int(days)
     limit_clause = f"LIMIT {int(limit)}" if limit and limit > 0 else ""
     sql = f"""
         WITH calls AS (
@@ -947,7 +979,7 @@ def attributed_invoice_detail(
               utm_source, utm_medium, marketing_channel
             FROM `{_CLINIC_DATA}.transactions`
             WHERE CAST(invoca_campaign_id AS STRING) IN {in_iv}
-              AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+              AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         ),
         patients AS (
             SELECT DISTINCT
@@ -1033,7 +1065,7 @@ def attributed_invoice_detail(
          AND im.client_id  = fc.client_id
         WHERE SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
           AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)
-              >= DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY))
+              >= DATE '{_window_start_date(days)}'
           -- Only invoices on or after the patient's first tracked call:
           -- pre-call invoices can't be marketing-attributed.
           AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date) >= DATE(fc.call_ts)
@@ -1084,7 +1116,6 @@ def attributed_invoice_count(
     client = _client()
     in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
     hrs = int(booking_window_hours)
-    d = int(days)
     # Mirror the same JOIN chain as attributed_invoice_detail but project only
     # the count. first_appt isn't needed for the count itself but is left in
     # so behaviour matches the detail query exactly.
@@ -1095,7 +1126,7 @@ def attributed_invoice_count(
               SAFE_CAST(timestamp AS TIMESTAMP) AS call_ts
             FROM `{_CLINIC_DATA}.transactions`
             WHERE CAST(invoca_campaign_id AS STRING) IN {in_iv}
-              AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+              AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         ),
         patients AS (
             SELECT DISTINCT
@@ -1124,7 +1155,7 @@ def attributed_invoice_count(
          AND im.client_id  = fc.client_id
         WHERE SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
           AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)
-              >= DATE(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY))
+              >= DATE '{_window_start_date(days)}'
           AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date) >= DATE(fc.call_ts)
     """
     rows = list(client.query(
@@ -1170,7 +1201,7 @@ def acquisition_call_traffic(
           COUNTIF(gclid IS NOT NULL AND gclid != '')               AS ad_driven_calls
         FROM `{_CLINIC_DATA}.transactions`
         WHERE CAST(invoca_campaign_id AS STRING) IN {in_iv}
-          AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+          AND timestamp >= TIMESTAMP('{_window_start_ts(days)}')
     """).result())
     r = rows[0]
     total = int(r.total_calls or 0)
@@ -1215,7 +1246,7 @@ def top_calling_regions(
            AND ac.google_ads_campaign_id IN {in_ga}
           WHERE CAST(t.invoca_campaign_id AS STRING) IN {in_iv}
             AND t.gclid IS NOT NULL AND t.gclid != ''
-            AND t.timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+            AND t.timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         )
         SELECT
           CASE
@@ -1270,7 +1301,7 @@ def top_keywords(
          AND ac.google_ads_campaign_id IN {in_ga}
         WHERE CAST(t.invoca_campaign_id AS STRING) IN {in_iv}
           AND t.gclid IS NOT NULL AND t.gclid != ''
-          AND t.timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+          AND t.timestamp >= TIMESTAMP('{_window_start_ts(days)}')
         GROUP BY keyword
         ORDER BY calls DESC
         LIMIT {int(top_n)}
@@ -1298,7 +1329,7 @@ def _spam_scope_clause(invoca_campaign_ids: list[str], days: int, t_alias: str =
     in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
     return (
         f"CAST({t_alias}.invoca_campaign_id AS STRING) IN {in_iv} "
-        f"AND {t_alias}.timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)"
+        f"AND {t_alias}.timestamp >= TIMESTAMP('{_window_start_ts(days)}')"
     )
 
 

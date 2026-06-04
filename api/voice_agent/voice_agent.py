@@ -42,6 +42,7 @@ from api.voice_agent.protocols import (
     PROTOCOL_METADATA as CAPABILITY_METADATA,
     PROTOCOL_METADATA_BY_ID as CAPABILITY_METADATA_BY_ID,
     is_pms_compatible,
+    unmet_dependencies,
 )
 from api.voice_agent.factory import build_agent_config
 
@@ -377,6 +378,23 @@ class CapabilityItem(BaseModel):
     enabled: bool
     updated_at: str | None = None
     updated_by: str | None = None
+    # Other protocol ids this protocol depends on (informational — same
+    # list on every clinic; the field is here so the frontend doesn't
+    # need to ship a parallel dep table).
+    depends_on: list[str] = []
+    # Subset of ``depends_on`` whose corresponding protocol is NOT
+    # currently enabled for THIS clinic. Empty when satisfied. The agent
+    # sync drops a protocol with unmet deps, so a non-empty list means
+    # the toggle is "on but not effective" — the admin UI should flag it.
+    unmet_dependencies: list[str] = []
+    # JSON Schema (Pydantic .model_json_schema()) for this protocol's
+    # config_model. The frontend renders an editor from this; an empty
+    # ``properties`` map means the protocol has no per-clinic knobs and
+    # the Configure UI is hidden.
+    config_schema: dict = {}
+    # Current per-clinic config (validated against config_schema on
+    # write). Defaults from the model when no row / null column.
+    config: dict = {}
     # Populated only on write operations (toggle). Indicates whether the
     # change propagated to the live VAPI assistant. Absent on list reads.
     vapi_sync: dict | None = None
@@ -426,11 +444,25 @@ def list_capabilities(
     ))
     state = {r.protocol_id: r for r in rows}
 
+    # Snapshot of enabled ids for the clinic — used to compute each
+    # protocol's unmet_dependencies as we render the response.
+    enabled_ids = {r.protocol_id for r in rows if r.enabled}
+
     items: list[CapabilityItem] = []
     for cap in CAPABILITY_METADATA:
         if cap.always_on:
             continue
         row = state.get(cap.id)
+        # Effective config = persisted row (if any) merged through the
+        # protocol's defaults via Pydantic. ``model_dump()`` gives the
+        # canonical shape the frontend renders against the schema.
+        try:
+            cfg_obj = cap.config_model(**(row.config or {})) if row and row.config else cap.config_model()
+        except Exception:
+            # Stored config no longer parses (schema tightened since write).
+            # Fall back to defaults so the UI still loads; the operator can
+            # re-save through the form.
+            cfg_obj = cap.config_model()
         items.append(CapabilityItem(
             id=cap.id,
             display_name=cap.display_name,
@@ -440,6 +472,10 @@ def list_capabilities(
             enabled=bool(row.enabled) if row else False,
             updated_at=_isoformat(row.updated_at) if row else None,
             updated_by=row.updated_by if row else None,
+            depends_on=list(cap.depends_on),
+            unmet_dependencies=unmet_dependencies(cap.id, enabled_ids),
+            config_schema=cap.config_model.model_json_schema(),
+            config=cfg_obj.model_dump(),
         ))
 
     return CapabilitiesListResponse(clinic_id=clinic_id, pms_type=pms_type, capabilities=items)
@@ -483,6 +519,21 @@ def toggle_capability(
 
     updater = caller.get("email") or caller.get("uid") or "unknown"
 
+    # Validate incoming config against the protocol's config_model. A
+    # ``None`` body.config is interpreted as "no change" → keep whatever's
+    # stored (or fall back to defaults on first write). A non-None dict
+    # must parse cleanly; bad input → 422 from Pydantic, surfaced as 400.
+    if body.config is not None:
+        try:
+            validated_cfg = cap.config_model(**body.config).model_dump()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid config for {capability_id}: {e}",
+            )
+    else:
+        validated_cfg = None  # leave row.config unchanged below
+
     # Dual-write during the Protocol migration (step 3): the legacy
     # `voice_agent_capabilities` table receives the same write so a code
     # rollback stays consistent. Reads only consult `clinic_protocols`.
@@ -493,13 +544,14 @@ def toggle_capability(
             clinic_id=clinic_id,
             capability_id=capability_id,
             enabled=body.enabled,
-            config=body.config,
+            config=validated_cfg,
             updated_by=updater,
         )
         db.add(legacy)
     else:
         legacy.enabled = body.enabled
-        legacy.config = body.config
+        if validated_cfg is not None:
+            legacy.config = validated_cfg
         legacy.updated_by = updater
 
     row = db.get(ClinicProtocol, (clinic_id, capability_id))
@@ -508,13 +560,14 @@ def toggle_capability(
             clinic_id=clinic_id,
             protocol_id=capability_id,
             enabled=body.enabled,
-            config=body.config,
+            config=validated_cfg,
             updated_by=updater,
         )
         db.add(row)
     else:
         row.enabled = body.enabled
-        row.config = body.config
+        if validated_cfg is not None:
+            row.config = validated_cfg
         row.updated_by = updater
 
     db.flush()  # ensure updated_at gets populated for the response
@@ -523,6 +576,21 @@ def toggle_capability(
     # Propagate the change to the live VAPI assistant if one's provisioned.
     sync = _sync_assistant_if_provisioned(db, clinic)
 
+    # Recompute the post-write enabled-id set so unmet_dependencies on the
+    # response reflects the state the caller just produced (rather than
+    # the state at the start of the request).
+    post_rows = list(db.scalars(
+        select(ClinicProtocol).where(
+            ClinicProtocol.clinic_id == clinic_id,
+            ClinicProtocol.enabled.is_(True),
+        )
+    ))
+    post_enabled_ids = {r.protocol_id for r in post_rows}
+
+    try:
+        post_cfg = cap.config_model(**(row.config or {})) if row.config else cap.config_model()
+    except Exception:
+        post_cfg = cap.config_model()
     return CapabilityItem(
         id=cap.id,
         display_name=cap.display_name,
@@ -532,6 +600,10 @@ def toggle_capability(
         enabled=bool(row.enabled),
         updated_at=_isoformat(row.updated_at),
         updated_by=row.updated_by,
+        depends_on=list(cap.depends_on),
+        unmet_dependencies=unmet_dependencies(cap.id, post_enabled_ids),
+        config_schema=cap.config_model.model_json_schema(),
+        config=post_cfg.model_dump(),
         vapi_sync=sync,
     )
 

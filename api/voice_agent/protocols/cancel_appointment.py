@@ -26,6 +26,7 @@ class CancelAppointmentProtocol(Protocol):
     )
     agent_tool_name = "cancel_appointment"
     supported_pms = ("blueprint",)
+    depends_on = ("verify_caller_identification", "locate_appointment")
 
     def _tool_url(self) -> str:
         if self.pms_type == "blueprint":

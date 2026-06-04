@@ -100,6 +100,61 @@ def toggleable_protocols() -> list[type[Protocol]]:
     return [cls for cls in PROTOCOL_REGISTRY.values() if not cls.always_on]
 
 
+def load_protocol_config(
+    db,
+    clinic_id: str,
+    protocol_id: str,
+):
+    """Load + validate a clinic's per-protocol config row.
+
+    Returns an instance of the protocol's ``config_model`` populated
+    from ``clinic_protocols.config`` for this (clinic, protocol). Falls
+    back to the model's defaults when:
+      - no row exists for this clinic,
+      - the row's ``config`` column is null,
+      - the persisted JSON parses but is empty.
+
+    Re-validates the stored JSON against the current schema. If the
+    schema has tightened since the row was written and the data no
+    longer parses, raises ``pydantic.ValidationError`` so the caller
+    can decide how to surface it (the toggle endpoint maps to 422; the
+    factory logs + falls back to defaults).
+
+    Local import of ``ClinicProtocol`` avoids a circular dep at module
+    load — protocols/__init__ shouldn't pull the ORM.
+    """
+    from api.core.orm import ClinicProtocol  # noqa: PLC0415 — see docstring
+
+    cls = PROTOCOL_REGISTRY.get(protocol_id)
+    if cls is None:
+        raise KeyError(f"Unknown protocol_id: {protocol_id!r}")
+    row = db.get(ClinicProtocol, (clinic_id, protocol_id))
+    raw = (row.config if row and row.config else {}) or {}
+    return cls.config_model(**raw)
+
+
+def unmet_dependencies(
+    protocol_id: str,
+    enabled_ids: set[str] | frozenset[str] | list[str] | tuple[str, ...],
+) -> list[str]:
+    """Return the protocol's ``depends_on`` ids that aren't in ``enabled_ids``.
+
+    Order matches the protocol's declaration so error messages list deps
+    in a stable, meaningful sequence. Always-on protocols are treated as
+    implicitly enabled — they're guaranteed present in the sync.
+
+    Returns ``[]`` when the protocol id is unknown (defensive — unknown
+    ids surface elsewhere, this isn't the right place to raise).
+    """
+    cls = PROTOCOL_REGISTRY.get(protocol_id)
+    if cls is None:
+        return []
+    enabled = set(enabled_ids)
+    # Always-on protocols are de-facto enabled.
+    enabled.update(c.id for c in PROTOCOL_REGISTRY.values() if c.always_on)
+    return [d for d in cls.depends_on if d not in enabled]
+
+
 __all__ = [
     "EmptyConfig",
     "Protocol",
@@ -114,5 +169,7 @@ __all__ = [
     "PROTOCOL_METADATA",
     "PROTOCOL_METADATA_BY_ID",
     "is_pms_compatible",
+    "load_protocol_config",
     "toggleable_protocols",
+    "unmet_dependencies",
 ]

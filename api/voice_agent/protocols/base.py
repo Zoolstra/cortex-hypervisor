@@ -77,6 +77,15 @@ class Protocol:
     # runtime in step 2.
     requires: ClassVar[type[PMSAdapter] | None] = None
 
+    # Other protocol ids this protocol's prompt + tools depend on. The
+    # framework treats a protocol as effective (included in the sync) only
+    # when its row is enabled AND every dependency is also enabled.
+    # Example: Cancel Appointment depends on Verify Caller Identification
+    # and Locate Appointment — its prompt instructs the agent to look up
+    # the patient + the appointment before calling cancel_appointment, so
+    # enabling Cancel without those is a guaranteed runtime failure.
+    depends_on: ClassVar[tuple[str, ...]] = ()
+
     # True = instantiated on every sync regardless of toggle state.
     # Used for foundational protocols (e.g. submit_ticket).
     always_on: ClassVar[bool] = False
