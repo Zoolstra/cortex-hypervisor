@@ -10,12 +10,6 @@ Usage (from cortex-hypervisor/):
     venv/bin/python -m scripts.backfill_voice_agent_defaults                 # all clinics
     venv/bin/python -m scripts.backfill_voice_agent_defaults --clinic <uuid> # one clinic
     venv/bin/python -m scripts.backfill_voice_agent_defaults --dry-run       # report what would change
-
-    # Wipe the literal 4-line opening text from all clinics' opening_overrides
-    # so the new stage-based prompt's "style notes" slot stays empty (or
-    # clinic-authored only). Idempotent — clinics with empty opening_overrides
-    # are skipped.
-    venv/bin/python -m scripts.backfill_voice_agent_defaults --clear-opening-overrides
 """
 from __future__ import annotations
 
@@ -25,7 +19,7 @@ import sys
 from sqlalchemy import select
 
 from api.core.db import _session_factory
-from api.core.orm import Clinic, ClinicVoiceAgentScript
+from api.core.orm import Clinic
 from api.voice_agent.defaults import seed_voice_agent_defaults
 
 
@@ -33,13 +27,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clinic", help="UUID of a single clinic to backfill")
     parser.add_argument("--dry-run", action="store_true", help="Roll back instead of committing")
-    parser.add_argument(
-        "--clear-opening-overrides", action="store_true",
-        help=("Wipe opening_overrides on every matching clinic. Use after the "
-              "prompt rework that treats opening_overrides as Stage 1 style "
-              "notes rather than a literal opening script. Skips clinics whose "
-              "field is already empty."),
-    )
     args = parser.parse_args()
 
     Session = _session_factory()
@@ -52,26 +39,6 @@ def main() -> int:
         if not clinics:
             print("No clinics matched.", file=sys.stderr)
             return 1
-
-        # ── Wipe path ──────────────────────────────────────────────────────
-        if args.clear_opening_overrides:
-            cleared = 0
-            for c in clinics:
-                row = db.get(ClinicVoiceAgentScript, c.clinic_id)
-                if row is None or not (row.opening_overrides or "").strip():
-                    continue
-                preview = row.opening_overrides.splitlines()[0][:60]
-                print(f"  clearing  {c.clinic_id}  {c.clinic_name}  "
-                      f"(was: {preview!r}…)")
-                row.opening_overrides = None
-                cleared += 1
-            if args.dry_run:
-                db.rollback()
-                print(f"\n[dry-run] would clear opening_overrides on {cleared} clinic(s)")
-            else:
-                db.commit()
-                print(f"\nCleared opening_overrides on {cleared} clinic(s).")
-            return 0
 
         # ── Backfill path (default) ────────────────────────────────────────
         totals = {"persona": 0, "script": 0, "buckets": 0}

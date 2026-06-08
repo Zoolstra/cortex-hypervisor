@@ -17,9 +17,6 @@ This module exports:
 - Result dataclasses (`PatientMatchResult`, `AppointmentType`,
   `AvailabilityDay`, `AvailabilityResult`) — the PMS-agnostic shapes
   protocols see.
-- `AvailabilityFilters` — per-clinic policy fields forwarded to adapters
-  when relevant (e.g. Blueprint's `availableForOnlineBookingOnly`). Empty
-  in step 1; protocols add fields as they need them.
 - `adapter_for(clinic)` — picks the right adapter for a clinic's pms_type.
 
 An adapter that doesn't implement a method should raise `NotImplementedError`
@@ -29,7 +26,7 @@ support this operation."
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 
@@ -60,6 +57,15 @@ class AppointmentType:
 
 
 @dataclass(frozen=True)
+class Location:
+    """A bookable clinic location from the PMS."""
+
+    id: int
+    name: str | None
+    address: str | None = None
+
+
+@dataclass(frozen=True)
 class AvailabilityDay:
     """One day of bookable slots in a search result."""
 
@@ -70,23 +76,6 @@ class AvailabilityDay:
 @dataclass(frozen=True)
 class AvailabilityResult:
     days: list[AvailabilityDay]
-
-
-@dataclass(frozen=True)
-class AvailabilityFilters:
-    """Per-clinic policy filters forwarded to the adapter.
-
-    Adapters translate the fields they support into PMS-specific query
-    parameters and ignore the rest.
-
-    ``online_booking_only``: when True, only return slots whose underlying
-    provider availability block is flagged
-    ``availableForOnlineBookingOnly = true`` in the PMS. Originated as
-    ACNA's request and surfaced as a per-clinic toggle on
-    ``SearchAppointmentAvailabilityProtocol.config_model``.
-    """
-
-    online_booking_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -167,6 +156,16 @@ class PMSAdapter(ABC):
         """Return the clinic's bookable appointment types."""
 
     @abstractmethod
+    def list_locations(self) -> list[Location]:
+        """Return the clinic's bookable locations.
+
+        Used when a clinic opts into asking the caller which location to
+        book into before searching availability. Single-location clinics
+        still expose their one location here so callers can resolve it
+        without separate config.
+        """
+
+    @abstractmethod
     def find_available_slots(
         self,
         *,
@@ -175,7 +174,6 @@ class PMSAdapter(ABC):
         end_date: str,
         providers: list[int] | None = None,
         locations: list[int] | None = None,
-        filters: AvailabilityFilters | None = None,
     ) -> AvailabilityResult:
         """Concrete bookable slots in a date range for one appointment type."""
 
@@ -204,6 +202,7 @@ class PMSAdapter(ABC):
         event_type_id: int,
         start_date: str,
         start_time: str,
+        location_id: int | None = None,
         patient_id: str | None = None,
         first_name: str | None = None,
         last_name: str | None = None,
@@ -214,6 +213,11 @@ class PMSAdapter(ABC):
 
         ``end_time`` is derived server-side from the appointment type's
         configured duration — the agent doesn't do time math.
+
+        ``location_id`` is the caller-chosen location (when the clinic
+        prompts for it). When omitted, the adapter resolves the clinic's
+        sole location; a multi-location clinic with no ``location_id``
+        is an error.
 
         Pass ``patient_id`` for an existing patient; otherwise pass
         ``first_name`` + ``last_name`` + ``phone`` and the adapter will

@@ -33,14 +33,12 @@ from sqlalchemy.orm import Session
 from api.deps import require_read_access, verify_token
 from api.core.db import get_session
 from api.core.secrets import get_secret
-from api.voice_agent.pms import AvailabilityFilters
 from api.voice_agent.pms.blueprint import (
     BlueprintAdapter,
     _blueprint_base,
     _get_blueprint_config,
     _int_field,
 )
-from api.voice_agent.protocols import load_protocol_config
 
 router = APIRouter(prefix="/blueprint")
 
@@ -115,6 +113,7 @@ class BookAppointmentRequest(BaseModel):
     event_type_id: int
     start_date: str          # YYYY-MM-DD (clinic-local)
     start_time: str          # HH:MM (end_time derived from event type duration)
+    location_id: int | None = None  # caller-chosen; omit for single-location clinics
     patient_id: str | None = None
     first_name: str | None = None
     last_name: str | None = None
@@ -338,6 +337,43 @@ def list_appointment_types(
     }
 
 
+class LocationItem(BaseModel):
+    id: int
+    name: str | None = None
+    address: str | None = None
+
+
+class ListLocationsResponse(BaseModel):
+    locations: list[LocationItem]
+    prompt_for_location: bool   # whether the agent should ask the caller to choose
+
+
+@router.post("/{clinic_id}/locations", response_model=ListLocationsResponse)
+def list_locations(
+    clinic_id: str,
+    _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
+):
+    """
+    Voice-agent capability: list the clinic's bookable locations.
+
+    ``prompt_for_location`` tells the agent whether this clinic wants the
+    caller asked which location to book into before searching availability.
+    Single-location clinics still return their one location so the agent
+    can resolve it silently.
+    """
+    config = _get_blueprint_config(db, clinic_id)
+    adapter = BlueprintAdapter(clinic_id=clinic_id, http_config=config)
+    locations = adapter.list_locations()
+    return ListLocationsResponse(
+        locations=[
+            LocationItem(id=loc.id, name=loc.name, address=loc.address)
+            for loc in locations
+        ],
+        prompt_for_location=bool(config.get("prompt_for_location")),
+    )
+
+
 @router.post("/{clinic_id}/availability/find")
 def find_available_slots(
     clinic_id: str,
@@ -352,12 +388,10 @@ def find_available_slots(
     Response is aggressively stripped — only date + bookable times reach the
     agent. The PMS call (and the strip) live in `BlueprintAdapter`.
 
-    Per-clinic policy comes from ``clinic_protocols.config`` for
-    ``search_appointment_availability``. Today the only knob is
-    ``online_booking_only`` (ACNA's request) — when set, the adapter
-    restricts slots to providers Blueprint reports as online-bookable.
+    Every provider's scheduled availability is directly bookable; the slot
+    search hits Blueprint's GET ``/rest/availability/`` over the requested
+    window with no online-booking pre-filter.
     """
-    cfg = load_protocol_config(db, clinic_id, "search_appointment_availability")
     adapter = BlueprintAdapter(clinic_id=clinic_id)
     adapter.load_http_config(db)
     result = adapter.find_available_slots(
@@ -366,7 +400,6 @@ def find_available_slots(
         end_date=body.end_date,
         providers=body.providers,
         locations=body.locations,
-        filters=AvailabilityFilters(online_booking_only=cfg.online_booking_only),
     )
     return {
         "days": [
@@ -434,6 +467,7 @@ def book_appointment(
         event_type_id=body.event_type_id,
         start_date=body.start_date,
         start_time=body.start_time,
+        location_id=body.location_id,
         patient_id=body.patient_id,
         first_name=body.first_name,
         last_name=body.last_name,

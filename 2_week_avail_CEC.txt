@@ -1,0 +1,908 @@
+2026-06-08 13:04:07,169 INFO api: cortex-hypervisor logging configured (level=20)
+========================================================================
+  Calgary Ear Center  (5e256c93-1369-4f6b-9106-456ab08a1b55)
+========================================================================
+
+  --- GET /clinicConfiguration/ (appointment types) ---
+2026-06-08 13:04:12,972 INFO httpx: HTTP Request: GET https://ca-alb1.aws.bp-solutions.net:8443/ca_mst2/AB/cec/rest/clinicConfiguration/?apiKey=59ad18a6-74f3-44aa-8065-42e5d3d6b291 "HTTP/1.1 200 OK"
+  payload: [
+          {
+                    "id": 192,
+                    "name": "CONSULT",
+                    "duration": 60
+          },
+          {
+                    "id": 3,
+                    "name": "HEARING TEST",
+                    "duration": 60
+          },
+          {
+                    "id": 169,
+                    "name": "TINNITUS/SOUND SENSITIVITY ASSESSMENT",
+                    "duration": 60
+          }
+]
+
+  --- GET /availability/ (eventTypeId=3) ---
+2026-06-08 13:04:13,569 INFO httpx: HTTP Request: GET https://ca-alb1.aws.bp-solutions.net:8443/ca_mst2/AB/cec/rest/availability/?apiKey=59ad18a6-74f3-44aa-8065-42e5d3d6b291&startTime=1780898400&endTime=1782194400&eventTypeId=3&bookingTimeSlotInterval=DURATION&minimumAdvanceBookingTime=30 "HTTP/1.1 200 OK"
+  RESULT  : 200 OK (8835 bytes) — 11 days, 10 with available=true
+  payload: [
+          {
+                    "date": "2026-06-08",
+                    "available": false,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-09",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-10",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-11",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-12",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-15",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-16",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-17",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-18",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-19",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          },
+          {
+                    "date": "2026-06-22",
+                    "available": true,
+                    "availabilityTimes": [
+                              {
+                                        "time": "08:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "09:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "10:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "11:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "12:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "13:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              },
+                              {
+                                        "time": "14:00:00-0600",
+                                        "available": [
+                                                  {
+                                                            "providerId": 526,
+                                                            "locationId": 1
+                                                  }
+                                        ],
+                                        "resources": [],
+                                        "appointmentId": null
+                              }
+                    ]
+          }
+]

@@ -21,7 +21,8 @@ from sqlalchemy.orm import Session
 
 from api.core.orm import (
     Clinic, ClinicProtocol, ClinicVoiceAgentCallerBucket,
-    ClinicVoiceAgentPersona, ClinicVoiceAgentScript,
+    ClinicVoiceAgentPersona, ClinicVoiceAgentQualifyingQuestion,
+    ClinicVoiceAgentScript,
 )
 from api.core.secrets import get_secret
 from api.voice_agent.protocols import (
@@ -254,16 +255,13 @@ def _behavior_rules_section() -> str:
 def _stage_1_greeting_and_reason(
     clinic: Clinic,
     persona: ClinicVoiceAgentPersona | None,
-    script: ClinicVoiceAgentScript | None,
 ) -> str:
     """Stage 1 — Greeting & Reason.
 
-    Hardcoded goals + rules. The clinic-editable ``opening_overrides`` field
-    is injected as *style guidance*, not as a verbatim script. The agent
-    decides how to phrase the actual opener based on what the caller says.
+    Hardcoded goals + rules. The agent decides how to phrase the actual
+    opener based on what the caller says.
     """
     agent_name, agent_title, _voice, _first, _model = _persona_or_defaults(persona)
-    style_notes = (script.opening_overrides or "").strip() if script else ""
 
     out = [
         "## Stage 1 — Greeting & Reason",
@@ -287,19 +285,6 @@ def _stage_1_greeting_and_reason(
         "those questions — a natural acknowledgement or short paraphrase is "
         "enough; do not read their name back verbatim at this stage.",
     ]
-    if style_notes:
-        rendered = _interpolate(
-            style_notes,
-            clinic_name=clinic.clinic_name,
-            agent_name=agent_name,
-            agent_title=agent_title,
-        )
-        out.extend([
-            "",
-            "**Greeting style notes from the clinic** (use these to shape tone "
-            "and signature phrasing — do not recite verbatim):",
-            rendered,
-        ])
     return "\n".join(out)
 
 
@@ -327,8 +312,6 @@ def _stage_2_identity(caps: list[Protocol]) -> str:
         "**Rules**\n"
         "- If the caller already volunteered new-vs-existing in Stage 1, do "
         "not ask again — just acknowledge (\"got it, you're an existing patient\").\n"
-        "- Existing-patient lookups happen quietly. You may say once "
-        "\"let me find you in our system.\"\n"
         "- A failed or ambiguous lookup is fine — proceed and let the staff "
         "resolve identity later. Don't quiz the caller.\n"
         "\n"
@@ -361,13 +344,48 @@ def _render_caller_buckets(buckets: list[ClinicVoiceAgentCallerBucket]) -> str:
     return "\n\n".join(blocks)
 
 
+def _render_qualifying_questions(
+    questions: list[ClinicVoiceAgentQualifyingQuestion],
+) -> str:
+    """Render the clinic's active new-patient screening questions as a
+    numbered block, sorted by ``ordinal``. Returns '' when the clinic has
+    none — unlike caller buckets there is no hardcoded default set, so an
+    unconfigured clinic simply gets no screening block.
+    """
+    active = [q for q in questions if q.active] if questions else []
+    if not active:
+        return ""
+    active.sort(key=lambda q: (q.ordinal, q.id))
+    # Drop blank rows before numbering so the displayed numbers stay
+    # contiguous (1, 2, 3 …) even if an active row has empty text.
+    valid: list[tuple[str, str]] = []
+    for q in active:
+        text = (q.question_text or "").strip()
+        if not text:
+            continue
+        valid.append((text, (q.expected_responses or "").strip()))
+    blocks: list[str] = []
+    for i, (text, expected) in enumerate(valid, start=1):
+        block = f"{i}) {text}"
+        if expected:
+            # Collapse multi-line guidance (the dashboard field is a textarea)
+            # onto one indented line so it can't run into the next numbered
+            # question.
+            expected_oneline = "; ".join(
+                ln.strip() for ln in expected.splitlines() if ln.strip()
+            )
+            block += f"\n   (expected responses: {expected_oneline})"
+        blocks.append(block)
+    return "\n".join(blocks)
+
+
 def _stage_3a_new_patient(
-    script: ClinicVoiceAgentScript | None,
     buckets: list[ClinicVoiceAgentCallerBucket],
+    questions: list[ClinicVoiceAgentQualifyingQuestion] | None = None,
 ) -> str:
     """Stage 3a — New Patient Discovery (only runs if Stage 2 = new)."""
-    intake = (script.new_patient_intake_prompt or "").strip() if script else ""
     rendered_buckets = _render_caller_buckets(buckets)
+    rendered_questions = _render_qualifying_questions(questions or [])
     out = [
         "## Stage 3a — New Patient Discovery (only if new)",
         "**Goals**",
@@ -376,22 +394,37 @@ def _stage_3a_new_patient(
         "3. Deliver the bucket's response in your own warm voice — not as a recital.",
         "",
         "**Rules**",
-        "- Open the discovery with the intake prompt below, unless the caller "
-        "has already given you enough motivation context to skip straight to "
-        "categorization.",
+        "- Open the discovery by learning what's prompting the caller to look "
+        "into their hearing health, unless they've already given enough "
+        "motivation context to skip straight to categorization.",
         "- Categorization is internal — never name the bucket out loud "
         "(\"I'll categorize you as a price shopper\" is wrong).",
         "- The bucket response is *guidance for what to convey*. Adapt phrasing "
         "to fit the conversation; do not read it verbatim.",
     ]
-    if intake:
-        out.extend(["", "**Intake prompt (suggested):**", intake])
     out.extend([
         "",
-        "**Caller buckets — categorize then respond:**",
+        "**Caller buckets — once you understand the caller's motivation, "
+        "categorize it internally then respond:**",
         "",
         rendered_buckets,
     ])
+    if rendered_questions:
+        out.extend([
+            "",
+            "**New-patient screening questions — ask these during discovery:**",
+            "Work each one into the conversation (one at a time, in your own "
+            "words), unless the caller has already answered it. Keep track of "
+            "every answer — you must carry the question→answer pairs forward:",
+            "- If the caller goes on to book, include them in the "
+            "`book_appointment` `notes` as plain text, one `Question: answer` "
+            "per line under a `New-patient screening:` header.",
+            "- If the caller does NOT book, put them in the `submit_ticket` "
+            "`details.screening_answers` field as a list of "
+            "`{question, answer}` objects.",
+            "",
+            rendered_questions,
+        ])
     return "\n".join(out)
 
 
@@ -476,9 +509,7 @@ def _script_section(script: ClinicVoiceAgentScript | None) -> str:
         return ""
     fields = [
         ("Scope of practice",    script.scope_of_practice),
-        ("Services offered",     script.services_offered),
         ("Services NOT offered", script.services_not_offered),
-        ("Caller needs",         script.caller_needs),
         ("Additional notes",     script.additional_notes),
     ]
     blocks = []
@@ -498,9 +529,11 @@ def build_system_prompt(
     script: ClinicVoiceAgentScript | None = None,
     persona: ClinicVoiceAgentPersona | None = None,
     caller_buckets: list[ClinicVoiceAgentCallerBucket] | None = None,
+    qualifying_questions: list[ClinicVoiceAgentQualifyingQuestion] | None = None,
 ) -> str:
     inlined_ids = {VerifyCallerIdentificationProtocol.id}
     buckets = caller_buckets or []
+    questions = qualifying_questions or []
     parts = [
         locale["prompt_block"],
         _identity_section(clinic),
@@ -508,9 +541,9 @@ def build_system_prompt(
         _behavior_rules_section(),
         _script_section(script),
         _hours_block(clinic),
-        _stage_1_greeting_and_reason(clinic, persona, script),
+        _stage_1_greeting_and_reason(clinic, persona),
         _stage_2_identity(caps),
-        _stage_3a_new_patient(script, buckets),
+        _stage_3a_new_patient(buckets, questions),
         _stage_3b_existing_patient(script),
         _stage_4_capture_and_close(),
         *_trailing_capability_blocks(caps, inlined_ids),
@@ -557,10 +590,17 @@ def build_agent_config(db: Session, clinic: Clinic) -> dict:
         .order_by(ClinicVoiceAgentCallerBucket.ordinal.asc(),
                   ClinicVoiceAgentCallerBucket.id.asc())
     ))
+    qualifying_questions = list(db.scalars(
+        select(ClinicVoiceAgentQualifyingQuestion)
+        .where(ClinicVoiceAgentQualifyingQuestion.clinic_id == clinic.clinic_id)
+        .order_by(ClinicVoiceAgentQualifyingQuestion.ordinal.asc(),
+                  ClinicVoiceAgentQualifyingQuestion.id.asc())
+    ))
 
     system_prompt = build_system_prompt(
         clinic, caps, locale, script,
         persona=persona, caller_buckets=caller_buckets,
+        qualifying_questions=qualifying_questions,
     )
     # Flatten: each protocol contributes 1+ VAPI tools. Single-tool ports
     # return a 1-element list; future multi-tool protocols return several.

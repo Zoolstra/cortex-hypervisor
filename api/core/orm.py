@@ -111,6 +111,9 @@ class Clinic(Base):
     voice_agent_caller_buckets: Mapped[list["ClinicVoiceAgentCallerBucket"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
     )
+    voice_agent_qualifying_questions: Mapped[list["ClinicVoiceAgentQualifyingQuestion"]] = relationship(
+        back_populates="clinic", cascade="all, delete-orphan"
+    )
     capabilities: Mapped[list["VoiceAgentCapability"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
     )
@@ -206,6 +209,11 @@ class ClinicBlueprintConfig(Base):
     clinic_code: Mapped[str | None] = mapped_column(String(64))
     api_url: Mapped[str | None] = mapped_column(String(512))
     aws_url: Mapped[str | None] = mapped_column(String(512))
+    # When TRUE the voice agent asks the caller which location to book into
+    # before searching availability. Most clinics are single-location → FALSE.
+    prompt_for_location: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="0"
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
@@ -236,16 +244,16 @@ class ClinicVoiceAgentScript(Base):
         ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
         primary_key=True,
     )
-    scope_of_practice:         Mapped[str | None] = mapped_column(Text)
-    services_offered:          Mapped[str | None] = mapped_column(Text)
-    services_not_offered:      Mapped[str | None] = mapped_column(Text)
-    caller_needs:              Mapped[str | None] = mapped_column(Text)
-    additional_notes:          Mapped[str | None] = mapped_column(Text)
-    # 0003 — added when the prompt builder learned to render an editable
-    # opening + new-patient intake + existing-patient transition.
-    opening_overrides:         Mapped[str | None] = mapped_column(Text)
-    new_patient_intake_prompt: Mapped[str | None] = mapped_column(Text)
-    existing_patient_intro:    Mapped[str | None] = mapped_column(Text)
+    scope_of_practice:      Mapped[str | None] = mapped_column(Text)
+    services_not_offered:   Mapped[str | None] = mapped_column(Text)
+    additional_notes:       Mapped[str | None] = mapped_column(Text)
+    # 0007 — dropped services_offered (now derived from live Blueprint
+    # appointment types), caller_needs (agent is scoped to its enabled
+    # protocols; ticket intent_category is free-text), opening_overrides
+    # (greeting style folded into the hardcoded Stage 1), and
+    # new_patient_intake_prompt (Qualifying Questions governs new-patient
+    # inquiries).
+    existing_patient_intro: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
@@ -328,6 +336,45 @@ class ClinicVoiceAgentCallerBucket(Base):
     )
 
     clinic: Mapped["Clinic"] = relationship(back_populates="voice_agent_caller_buckets")
+
+
+# ──────────────────── clinic_voice_agent_qualifying_question (N) ────────────────────
+
+class ClinicVoiceAgentQualifyingQuestion(Base):
+    """Per-clinic new-patient screening questions, asked during Stage 3a
+    (New Patient Discovery). Each row is one question the agent asks, plus
+    optional ``expected_responses`` guidance describing the answers to listen
+    for. Ordered by ``ordinal`` ASC in the prompt; inactive rows hidden.
+
+    The agent records each answer and serializes the question→answer pairs
+    into the booking ``notes`` (when the patient books) and the ticket
+    ``details.screening_answers`` (when they don't). Unlike caller buckets
+    there is no hardcoded default set — screening is clinic-specific, so a
+    clinic with no rows simply gets no screening block.
+    """
+    __tablename__ = "clinic_voice_agent_qualifying_question"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    ordinal:            Mapped[int]  = mapped_column(SmallInteger, nullable=False, server_default="0")
+    question_text:      Mapped[str]  = mapped_column(String(512), nullable=False)
+    expected_responses: Mapped[str | None] = mapped_column(Text)
+    active:             Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="voice_agent_qualifying_questions")
 
 
 # ──────────────────── voice_agent_capabilities (N) ────────────────────

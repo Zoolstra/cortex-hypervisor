@@ -40,9 +40,9 @@ from api.voice_agent.pms import (
     Appointment,
     AppointmentType,
     AvailabilityDay,
-    AvailabilityFilters,
     AvailabilityResult,
     BookingResult,
+    Location,
     PatientMatchResult,
     PMSAdapter,
 )
@@ -100,6 +100,7 @@ def _get_blueprint_config(db: Session, clinic_id: str) -> dict:
         "api_key": api_key,
         "timezone": location.time_zone if location else None,
         "instance_id": clinic.instance_id,
+        "prompt_for_location": bool(bp.prompt_for_location),
     }
 
 
@@ -271,50 +272,60 @@ class BlueprintAdapter(PMSAdapter):
             if t.get("name")
         ]
 
-    # ── Bookable slot search ──────────────────────────────────────────────────
+    def list_locations(self) -> list[Location]:
+        """Pull bookable locations from Blueprint clinicConfiguration.
 
-    def _online_bookable_provider_pairs(
-        self, *, start_dt: datetime, end_dt: datetime,
-    ) -> list[tuple[int, int]]:
-        """Provider blocks flagged ``availableForOnlineBookingOnly = true``.
-
-        Blueprint's ``POST /rest/availability/search`` returns provider
-        availability blocks (not bookable slots). Per ACNA's request, we
-        use that endpoint with ``availableForOnlineBookingOnly=true`` to
-        learn which (provider_id, location_id) pairs are reachable
-        through online booking, then constrain ``find_available_slots``
-        to only those providers.
-
-        Returns the unique (provider_id, location_id) pairs found.
-        Empty list means no provider has online-bookable availability
-        in the window — the caller treats that as "no slots".
+        clinicConfiguration only returns locations enabled for online
+        booking (lat/long set, availability enabled), so this is the set
+        the agent can actually offer. Null-named placeholders are dropped.
         """
         config = self._require_http_config()
         base = _blueprint_base(config)
-        payload: dict = {
-            "apiKey": config["api_key"],
-            "startTime": int(start_dt.timestamp()),
-            "endTime": int(end_dt.timestamp()),
-            "availableForOnlineBookingOnly": True,
-        }
-        clinic_location_id = _int_field(config, "location_id")
-        if clinic_location_id:
-            payload["locations"] = [clinic_location_id]
 
-        resp = httpx.post(f"{base}/availability/search", json=payload, timeout=15)
+        resp = httpx.get(
+            f"{base}/clinicConfiguration/",
+            params={"apiKey": config["api_key"]},
+            timeout=15,
+        )
         resp.raise_for_status()
-        rows = resp.json() or []
+        data = resp.json()
 
-        pairs: set[tuple[int, int]] = set()
-        for r in rows:
-            pid = r.get("provider_id") or r.get("providerId")
-            lid = r.get("location_id") or r.get("locationId")
-            if pid is not None and lid is not None:
-                try:
-                    pairs.add((int(pid), int(lid)))
-                except (TypeError, ValueError):
-                    continue
-        return sorted(pairs)
+        return [
+            Location(
+                id=loc["id"],
+                name=loc.get("name"),
+                address=loc.get("formattedAddress") or loc.get("street"),
+            )
+            for loc in data.get("locations", [])
+            if loc.get("name")
+        ]
+
+    def _resolve_location_id(self, location_id: int | None) -> int:
+        """Resolve the location to book into.
+
+        Caller-chosen ``location_id`` wins. Otherwise fall back to the
+        clinic's sole location. A multi-location clinic with no explicit
+        choice is an error — we won't guess which one.
+        """
+        if location_id:
+            return location_id
+        locations = self.list_locations()
+        if len(locations) == 1:
+            return locations[0].id
+        if not locations:
+            raise HTTPException(
+                status_code=400,
+                detail="Clinic has no bookable locations configured in Blueprint",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Clinic has multiple locations — a location_id is required "
+                "to book"
+            ),
+        )
+
+    # ── Bookable slot search ──────────────────────────────────────────────────
 
     def find_available_slots(
         self,
@@ -324,25 +335,26 @@ class BlueprintAdapter(PMSAdapter):
         end_date: str,
         providers: list[int] | None = None,
         locations: list[int] | None = None,
-        filters: AvailabilityFilters | None = None,
     ) -> AvailabilityResult:
         """
         Find concrete bookable time slots for one appointment type.
 
-        Proxies Blueprint's GET `/rest/availability/?...`. Hardcodes the
+        Proxies Blueprint's GET `/rest/availability/?...` over the date/time
+        window. Blueprint only generates slots from availability blocks that
+        are **enabled for online booking** and whose provider is mapped to
+        the event type — it is NOT "every scheduled block is bookable". A
+        clinic whose availability isn't flagged for online booking returns
+        nothing here even though staff see a full calendar. Hardcodes the
         booking interval and minimum-advance-booking values; the agent
         doesn't need to care about those.
 
-        ``filters.online_booking_only`` (default False): when True, first
-        calls ``POST /availability/search`` with
-        ``availableForOnlineBookingOnly=true`` to learn which providers
-        and locations accept online bookings, then restricts the slot
-        search to those. Empty result from that lookup → empty slots.
-
-        Response is aggressively stripped — only date + bookable times
-        survive. Provider IDs, location IDs, resource info never reach the
-        agent; clinic staff confirm the actual provider/location at
-        booking time.
+        Response is aggressively stripped — only date + genuinely-open times
+        survive. A slot counts as open only when it has an available provider
+        (`available` non-empty) and no existing appointment
+        (`appointmentId` is null); booked slots still appear in Blueprint's
+        grid and must be filtered out. Provider IDs, location IDs, and
+        resource info never reach the agent; the provider is re-derived
+        server-side at booking time.
         """
         config = self._require_http_config()
         base = _blueprint_base(config)
@@ -352,25 +364,6 @@ class BlueprintAdapter(PMSAdapter):
         end_dt = (
             datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
         ).replace(tzinfo=tz)
-
-        # If the clinic restricts to online-bookable providers, look up
-        # which (provider, location) pairs qualify and pass them as
-        # filters to the slot search. Caller-supplied providers/locations
-        # are ignored in this mode — the policy is "only what's flagged
-        # online-bookable", regardless of what the agent asked for.
-        if filters and filters.online_booking_only:
-            pairs = self._online_bookable_provider_pairs(start_dt=start_dt, end_dt=end_dt)
-            log.info(
-                "find_available_slots[online_booking_only] clinic_id=%s "
-                "event_type_id=%s window=%s..%s online_bookable_pairs=%d",
-                self.clinic_id, event_type_id, start_date, end_date, len(pairs),
-            )
-            if not pairs:
-                # Short-circuit: no online-bookable providers in window.
-                # Skip the GET entirely.
-                return AvailabilityResult(days=[])
-            providers = sorted({p for p, _ in pairs})
-            locations = sorted({l for _, l in pairs})
 
         params: dict = {
             "apiKey": config["api_key"],
@@ -383,12 +376,11 @@ class BlueprintAdapter(PMSAdapter):
 
         if providers is not None:
             params["providers"] = ",".join(str(p) for p in providers)
+        # Caller-chosen locations narrow the search; when omitted Blueprint
+        # includes all locations (per the API docs), which is what we want
+        # for single-location clinics and the "any location" case.
         if locations is not None:
             params["locations"] = ",".join(str(loc) for loc in locations)
-        else:
-            clinic_location_id = _int_field(config, "location_id")
-            if clinic_location_id:
-                params["locations"] = clinic_location_id
 
         # Log the outbound request so we can diagnose empty-response cases
         # without replaying against Blueprint. apiKey is a credential; we
@@ -415,7 +407,11 @@ class BlueprintAdapter(PMSAdapter):
             times: list[str] = []
             for slot in day.get("availabilityTimes", []) or []:
                 t = slot.get("time")
-                if not t:
+                # Keep only genuinely-open slots: an available provider and
+                # no existing appointment. Blueprint lists booked times in
+                # the grid (available=[], appointmentId set) — advertising
+                # those would offer the caller an already-taken slot.
+                if not t or not slot.get("available") or slot.get("appointmentId") is not None:
                     continue
                 # Trim "08:00:00-0600" → "08:00"
                 hhmm = t.split(":")
@@ -572,12 +568,65 @@ class BlueprintAdapter(PMSAdapter):
 
     # ── Book ──────────────────────────────────────────────────────────────────
 
+    def _find_open_provider(
+        self, *, event_type_id: int, start_date: str, start_time: str, location_id: int,
+    ) -> int:
+        """Re-check availability and return the provider open at this exact slot.
+
+        Blueprint's create-appointment requires a concrete ``providerId``;
+        availability is provider-specific, so we query GET ``/availability/``
+        for that single day + location and read back the provider whose slot
+        at ``start_time`` is genuinely open (``available`` non-empty,
+        ``appointmentId`` null). This also self-validates the slot is still
+        free at book time — a no-op double-booking guard.
+        """
+        config = self._require_http_config()
+        base = _blueprint_base(config)
+        tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz)
+        end_dt = start_dt + timedelta(days=1)
+
+        params = {
+            "apiKey": config["api_key"],
+            "startTime": int(start_dt.timestamp()),
+            "endTime": int(end_dt.timestamp()),
+            "eventTypeId": event_type_id,
+            "bookingTimeSlotInterval": _DEFAULT_BOOKING_TIME_SLOT_INTERVAL,
+            "minimumAdvanceBookingTime": _DEFAULT_MINIMUM_ADVANCE_BOOKING_TIME,
+            "locations": location_id,
+        }
+        resp = httpx.get(f"{base}/availability/", params=params, timeout=15)
+        resp.raise_for_status()
+
+        for day in resp.json():
+            if day.get("date") != start_date or not day.get("available"):
+                continue
+            for slot in day.get("availabilityTimes", []) or []:
+                # Blueprint slot times look like "08:00:00-0600"; match HH:MM.
+                if not (slot.get("time") or "").startswith(start_time):
+                    continue
+                if slot.get("appointmentId") is not None:
+                    break  # the slot is taken
+                for entry in slot.get("available", []) or []:
+                    if entry.get("locationId") == location_id:
+                        return entry["providerId"]
+                break
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"No provider is available for event type {event_type_id} at "
+                f"{start_date} {start_time} (location {location_id}) — the slot "
+                "may have just been taken"
+            ),
+        )
+
     def book(
         self,
         *,
         event_type_id: int,
         start_date: str,
         start_time: str,
+        location_id: int | None = None,
         patient_id: str | None = None,
         first_name: str | None = None,
         last_name: str | None = None,
@@ -587,12 +636,7 @@ class BlueprintAdapter(PMSAdapter):
         config = self._require_http_config()
         base = _blueprint_base(config)
         user_id = _int_field(config, "user_id", default=1)
-        location_id = _int_field(config, "location_id")
-        if not location_id:
-            raise HTTPException(
-                status_code=400,
-                detail="location_id not configured for this clinic — cannot book",
-            )
+        location_id = self._resolve_location_id(location_id)
 
         # Derive end_time from the appointment type's duration.
         types = self.list_appointment_types()
@@ -612,6 +656,15 @@ class BlueprintAdapter(PMSAdapter):
             )
         end_time = self._add_minutes(start_time, matching.duration_minutes)
 
+        # Availability is provider-specific and Blueprint requires a concrete
+        # providerId on create — resolve the provider open at this exact slot.
+        provider_id = self._find_open_provider(
+            event_type_id=event_type_id,
+            start_date=start_date,
+            start_time=start_time,
+            location_id=location_id,
+        )
+
         tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
         start_dt = self._combine_local(start_date, start_time, tz)
         end_dt = self._combine_local(start_date, end_time, tz)
@@ -630,7 +683,8 @@ class BlueprintAdapter(PMSAdapter):
             "endTime": int(end_dt.timestamp()),
             "summary": summary,
             "status": 2,  # Tentative by default; staff confirms.
-            "availableProviders": [{"locationId": location_id}],
+            "locationId": location_id,
+            "providerId": provider_id,
         }
         if notes:
             payload["notes"] = notes

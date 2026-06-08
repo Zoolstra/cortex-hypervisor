@@ -36,7 +36,8 @@ from api.core.db import get_session
 from api.core.orm import (
     Clinic, ClinicProtocol, ClinicVoiceAgentCallerBucket,
     ClinicVoiceAgentConfiguration, ClinicVoiceAgentPersona,
-    ClinicVoiceAgentScript, VoiceAgentCapability,
+    ClinicVoiceAgentQualifyingQuestion, ClinicVoiceAgentScript,
+    VoiceAgentCapability,
 )
 from api.voice_agent.protocols import (
     PROTOCOL_METADATA as CAPABILITY_METADATA,
@@ -44,7 +45,7 @@ from api.voice_agent.protocols import (
     is_pms_compatible,
     unmet_dependencies,
 )
-from api.voice_agent.factory import build_agent_config
+from api.voice_agent.factory import build_agent_config, build_first_message
 
 
 router = APIRouter()
@@ -612,41 +613,29 @@ def toggle_capability(
 
 class _VoiceAgentScriptResponse(BaseModel):
     clinic_id: str
-    scope_of_practice:         str | None = None
-    services_offered:          str | None = None
-    services_not_offered:      str | None = None
-    caller_needs:              str | None = None
-    additional_notes:          str | None = None
-    opening_overrides:         str | None = None
-    new_patient_intake_prompt: str | None = None
-    existing_patient_intro:    str | None = None
-    updated_at:                str | None = None
+    scope_of_practice:      str | None = None
+    services_not_offered:   str | None = None
+    additional_notes:       str | None = None
+    existing_patient_intro: str | None = None
+    updated_at:             str | None = None
     # Populated only on PUT — indicates whether the change propagated to
     # the live VAPI assistant. Absent on GET.
-    vapi_sync:                 dict | None = None
+    vapi_sync:              dict | None = None
 
 
 class _VoiceAgentScriptUpdate(BaseModel):
     """Partial update — only fields explicitly set in the payload are
     written. ``None`` clears a column; absent keys leave it alone."""
-    scope_of_practice:         str | None = None
-    services_offered:          str | None = None
-    services_not_offered:      str | None = None
-    caller_needs:              str | None = None
-    additional_notes:          str | None = None
-    opening_overrides:         str | None = None
-    new_patient_intake_prompt: str | None = None
-    existing_patient_intro:    str | None = None
+    scope_of_practice:      str | None = None
+    services_not_offered:   str | None = None
+    additional_notes:       str | None = None
+    existing_patient_intro: str | None = None
 
 
 _SCRIPT_FIELDS = (
     "scope_of_practice",
-    "services_offered",
     "services_not_offered",
-    "caller_needs",
     "additional_notes",
-    "opening_overrides",
-    "new_patient_intake_prompt",
     "existing_patient_intro",
 )
 
@@ -657,12 +646,8 @@ def _script_to_response(clinic_id: str, row: ClinicVoiceAgentScript | None) -> _
     return _VoiceAgentScriptResponse(
         clinic_id=clinic_id,
         scope_of_practice=row.scope_of_practice,
-        services_offered=row.services_offered,
         services_not_offered=row.services_not_offered,
-        caller_needs=row.caller_needs,
         additional_notes=row.additional_notes,
-        opening_overrides=row.opening_overrides,
-        new_patient_intake_prompt=row.new_patient_intake_prompt,
         existing_patient_intro=row.existing_patient_intro,
         updated_at=_isoformat(row.updated_at),
     )
@@ -701,7 +686,7 @@ def put_voice_agent_script(
 ):
     """Upsert the script content. Partial — only keys present in the body
     are written. Sending ``null`` clears the column; omitting the key leaves
-    it unchanged. The dashboard editor sends all five fields at every save
+    it unchanged. The dashboard editor sends all four fields at every save
     (including empty strings → null), so a one-shot save round-trip from
     the UI replaces the row contents wholesale.
     """
@@ -740,6 +725,10 @@ class _PersonaResponse(BaseModel):
     agent_title:   str = "virtual hearing assistant"
     voice_id:      str = "Emma"
     first_message: str | None = None
+    # The greeting the agent actually plays right now: the stored override
+    # when set, otherwise the computed templated default. Lets the dashboard
+    # show "the current first message" rather than an empty override box.
+    effective_first_message: str | None = None
     ai_model:      str = "gpt-4o"
     updated_at:    str | None = None
     vapi_sync:     dict | None = None
@@ -756,15 +745,27 @@ class _PersonaUpdate(BaseModel):
 _PERSONA_FIELDS = ("agent_name", "agent_title", "voice_id", "first_message", "ai_model")
 
 
-def _persona_to_response(clinic_id: str, row: ClinicVoiceAgentPersona | None) -> _PersonaResponse:
+def _persona_to_response(
+    clinic_id: str,
+    row: ClinicVoiceAgentPersona | None,
+    clinic_name: str | None = None,
+) -> _PersonaResponse:
     if row is None:
-        return _PersonaResponse(clinic_id=clinic_id)
+        return _PersonaResponse(
+            clinic_id=clinic_id,
+            effective_first_message=(
+                build_first_message(clinic_name, None) if clinic_name else None
+            ),
+        )
     return _PersonaResponse(
         clinic_id=clinic_id,
         agent_name=row.agent_name,
         agent_title=row.agent_title,
         voice_id=row.voice_id,
         first_message=row.first_message,
+        effective_first_message=(
+            build_first_message(clinic_name, row) if clinic_name else None
+        ),
         ai_model=row.ai_model,
         updated_at=_isoformat(row.updated_at),
     )
@@ -783,7 +784,7 @@ def get_voice_agent_persona(
     clinic = _get_clinic_or_404(db, clinic_id)
     require_read_access(clinic.instance_id, caller)
     row = db.get(ClinicVoiceAgentPersona, clinic_id)
-    return _persona_to_response(clinic_id, row)
+    return _persona_to_response(clinic_id, row, clinic_name=clinic.clinic_name)
 
 
 @router.put(
@@ -830,7 +831,7 @@ def put_voice_agent_persona(
 
     db.flush()
     sync = _sync_assistant_if_provisioned(db, clinic)
-    response = _persona_to_response(clinic_id, row)
+    response = _persona_to_response(clinic_id, row, clinic_name=clinic.clinic_name)
     response.vapi_sync = sync
     return response
 
@@ -1019,5 +1020,198 @@ def delete_voice_agent_caller_bucket(
     return _CallerBucketsResponse(
         clinic_id=clinic_id,
         buckets=[_bucket_to_item(r) for r in rows],
+        vapi_sync=sync,
+    )
+
+
+# ── Voice agent new-patient qualifying questions ─────────────────────────────
+
+class _QualifyingQuestionItem(BaseModel):
+    id:                 int | None = None
+    clinic_id:          str
+    ordinal:            int = 0
+    question_text:      str
+    expected_responses: str | None = None
+    active:             bool = True
+    updated_at:         str | None = None
+
+
+class _QualifyingQuestionCreate(BaseModel):
+    question_text:      str
+    ordinal:            int | None = None
+    expected_responses: str | None = None
+    active:             bool = True
+
+
+class _QualifyingQuestionUpdate(BaseModel):
+    question_text:      str | None = None
+    ordinal:            int | None = None
+    expected_responses: str | None = None
+    active:             bool | None = None
+
+
+class _QualifyingQuestionsResponse(BaseModel):
+    clinic_id: str
+    questions: list[_QualifyingQuestionItem]
+    vapi_sync: dict | None = None
+
+
+def _question_to_item(row: ClinicVoiceAgentQualifyingQuestion) -> _QualifyingQuestionItem:
+    return _QualifyingQuestionItem(
+        id=row.id,
+        clinic_id=row.clinic_id,
+        ordinal=row.ordinal,
+        question_text=row.question_text,
+        expected_responses=row.expected_responses,
+        active=bool(row.active),
+        updated_at=_isoformat(row.updated_at),
+    )
+
+
+def _all_questions_for_clinic(
+    db: Session, clinic_id: str,
+) -> list[ClinicVoiceAgentQualifyingQuestion]:
+    return list(db.scalars(
+        select(ClinicVoiceAgentQualifyingQuestion)
+        .where(ClinicVoiceAgentQualifyingQuestion.clinic_id == clinic_id)
+        .order_by(ClinicVoiceAgentQualifyingQuestion.ordinal.asc(),
+                  ClinicVoiceAgentQualifyingQuestion.id.asc())
+    ))
+
+
+@router.get(
+    "/clinics/{clinic_id}/voice_agent/qualifying_questions",
+    response_model=_QualifyingQuestionsResponse,
+)
+def list_voice_agent_qualifying_questions(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """List the clinic's new-patient screening questions, ordered by ``ordinal``."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
+    rows = _all_questions_for_clinic(db, clinic_id)
+    return _QualifyingQuestionsResponse(
+        clinic_id=clinic_id,
+        questions=[_question_to_item(r) for r in rows],
+    )
+
+
+@router.post(
+    "/clinics/{clinic_id}/voice_agent/qualifying_questions",
+    response_model=_QualifyingQuestionsResponse,
+)
+def create_voice_agent_qualifying_question(
+    clinic_id: str,
+    body: _QualifyingQuestionCreate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Append a new qualifying question. If ``ordinal`` is null, places it at
+    the end (max existing + 1)."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    if not body.question_text or not body.question_text.strip():
+        raise HTTPException(status_code=400, detail="question_text cannot be empty")
+
+    if body.ordinal is None:
+        existing = _all_questions_for_clinic(db, clinic_id)
+        next_ordinal = (max((q.ordinal for q in existing), default=-1) + 1)
+    else:
+        next_ordinal = body.ordinal
+
+    row = ClinicVoiceAgentQualifyingQuestion(
+        clinic_id=clinic_id,
+        ordinal=next_ordinal,
+        question_text=body.question_text.strip(),
+        expected_responses=body.expected_responses,
+        active=body.active,
+    )
+    db.add(row)
+    db.flush()
+    sync = _sync_assistant_if_provisioned(db, clinic)
+
+    rows = _all_questions_for_clinic(db, clinic_id)
+    return _QualifyingQuestionsResponse(
+        clinic_id=clinic_id,
+        questions=[_question_to_item(r) for r in rows],
+        vapi_sync=sync,
+    )
+
+
+@router.put(
+    "/clinics/{clinic_id}/voice_agent/qualifying_questions/{question_id}",
+    response_model=_QualifyingQuestionsResponse,
+)
+def update_voice_agent_qualifying_question(
+    clinic_id: str,
+    question_id: int,
+    body: _QualifyingQuestionUpdate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Update one qualifying question. Partial: only present fields are written."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentQualifyingQuestion, question_id)
+    if row is None or row.clinic_id != clinic_id:
+        raise HTTPException(status_code=404, detail="Qualifying question not found")
+
+    payload = body.model_dump(exclude_unset=True)
+    for field in ("question_text", "ordinal", "expected_responses", "active"):
+        if field not in payload:
+            continue
+        value = payload[field]
+        # ordinal/active are NOT NULL columns; an explicit null in the body
+        # must be ignored rather than written (a NULL write would 500 on the
+        # DB). expected_responses is nullable, so None there is a valid clear.
+        if field in ("ordinal", "active") and value is None:
+            continue
+        if field == "question_text":
+            if value is None or (isinstance(value, str) and not value.strip()):
+                raise HTTPException(status_code=400, detail="question_text cannot be empty")
+            value = value.strip()
+        setattr(row, field, value)
+
+    db.flush()
+    sync = _sync_assistant_if_provisioned(db, clinic)
+
+    rows = _all_questions_for_clinic(db, clinic_id)
+    return _QualifyingQuestionsResponse(
+        clinic_id=clinic_id,
+        questions=[_question_to_item(r) for r in rows],
+        vapi_sync=sync,
+    )
+
+
+@router.delete(
+    "/clinics/{clinic_id}/voice_agent/qualifying_questions/{question_id}",
+    response_model=_QualifyingQuestionsResponse,
+)
+def delete_voice_agent_qualifying_question(
+    clinic_id: str,
+    question_id: int,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Delete one qualifying question. Returns the post-delete list."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentQualifyingQuestion, question_id)
+    if row is None or row.clinic_id != clinic_id:
+        raise HTTPException(status_code=404, detail="Qualifying question not found")
+
+    db.delete(row)
+    db.flush()
+    sync = _sync_assistant_if_provisioned(db, clinic)
+
+    rows = _all_questions_for_clinic(db, clinic_id)
+    return _QualifyingQuestionsResponse(
+        clinic_id=clinic_id,
+        questions=[_question_to_item(r) for r in rows],
         vapi_sync=sync,
     )

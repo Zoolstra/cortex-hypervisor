@@ -48,14 +48,36 @@ _COLLAPSE_DEST = "search_appointment_availability"
 _COLLAPSE_SOURCES = ("list_appointment_types", "find_available_slots")
 
 
-def _rename_simple(table: str, old_id_col: str) -> None:
-    """Issue a straightforward UPDATE for the simple renames."""
+def _rename_simple(table: str, id_col: str) -> None:
+    """Rename ``old_id`` → ``new_id``, collision-safe.
+
+    A naive ``UPDATE ... SET id = new WHERE id = old`` violates the composite
+    PK when a clinic already holds the destination id — which happens because
+    the running app writes the new id (``verify_caller_identification``) while
+    the legacy ``patient_match`` row lingers un-migrated. So we upsert the
+    destination from the old rows (OR-ing enablement, keeping the most recent
+    metadata when the destination already exists) and then delete the old
+    rows. Same strategy as ``_collapse`` below; a no-op when no old rows exist.
+    """
     for old, new in _RENAMES.items():
-        op.execute(
-            sa.text(
-                f"UPDATE {table} SET {old_id_col} = :new WHERE {old_id_col} = :old"
-            ).bindparams(new=new, old=old)
-        )
+        # Source table is aliased ``src`` so the target-table references in the
+        # ON DUPLICATE KEY UPDATE clause aren't ambiguous (INSERT...SELECT from
+        # the same table otherwise errors 1052). Mirrors ``_collapse``'s alias.
+        op.execute(sa.text(f"""
+            INSERT INTO {table}
+                (clinic_id, {id_col}, enabled, config, updated_by,
+                 created_at, updated_at)
+            SELECT src.clinic_id, :new, src.enabled, src.config, src.updated_by,
+                   src.created_at, src.updated_at
+            FROM {table} src WHERE src.{id_col} = :old
+            ON DUPLICATE KEY UPDATE
+                enabled    = GREATEST({table}.enabled, VALUES(enabled)),
+                updated_at = GREATEST({table}.updated_at, VALUES(updated_at)),
+                updated_by = COALESCE(VALUES(updated_by), {table}.updated_by)
+        """).bindparams(new=new, old=old))
+        op.execute(sa.text(
+            f"DELETE FROM {table} WHERE {id_col} = :old"
+        ).bindparams(old=old))
 
 
 def _collapse(table: str, id_col: str) -> None:

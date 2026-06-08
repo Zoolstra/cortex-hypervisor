@@ -33,27 +33,17 @@ DEFAULT_AI_MODEL = "gpt-4o"
 
 # ── Script extensions ────────────────────────────────────────────────────────
 
-# Stage 1 (Greeting & Reason) now has hardcoded goals + rules baked into
-# the prompt assembler. This field is purely optional **style guidance** the
-# clinic can use to shape tone or add signature phrasing — it is not a
-# literal script. Default is empty so the hardcoded stage stands on its own.
-DEFAULT_OPENING_OVERRIDES = ""
-
-DEFAULT_NEW_PATIENT_INTAKE_PROMPT = (
-    "Can I ask what's been prompting you to look into your hearing health right now?"
-)
-
+# Existing-patient guidance is intentionally trimmed to the clinic-UNIQUE
+# value: the list of common call reasons. The capture list (preferred
+# window / urgency / aid model), the "what can I help you with" opener, and
+# the callback-number confirmation all already live in the hardcoded Stage 3b
+# goals/rules and Stage 4 — duplicating them here was redundant.
 DEFAULT_EXISTING_PATIENT_INTRO = (
-    "Greet the patient warmly using their first name.\n"
-    "- \"What can I help you with today?\" <wait for user response> [info collection point]\n"
-    "- Common reasons existing patients call:\n"
-    "  - Booking a follow-up, repair, or wax-removal appointment\n"
-    "  - Hearing aid troubleshooting (battery, fit, connectivity)\n"
-    "  - Insurance, billing, or pricing question\n"
-    "  - Refill or supply request (batteries, domes, wax guards)\n"
-    "- For any in-person need, capture: preferred date/time window, urgency, "
-    "and current hearing aid model if known. [info collection point]\n"
-    "- Confirm the callback number on file is still correct before ending the call."
+    "Common reasons existing patients call:\n"
+    "- Booking a follow-up, repair, or wax-removal appointment\n"
+    "- Hearing aid troubleshooting (battery, fit, connectivity)\n"
+    "- Insurance, billing, or pricing question\n"
+    "- Refill or supply request (batteries, domes, wax guards)"
 )
 
 
@@ -153,34 +143,23 @@ def seed_voice_agent_defaults(
         ))
         summary["persona"] = "created"
 
-    # Script (1:1) — only seed the three new extension fields. The clinic-
+    # Script (1:1) — seed only the existing-patient guidance. The clinic-
     # specific fields (scope_of_practice etc.) stay null until an admin
     # fills them in.
     script = db.get(ClinicVoiceAgentScript, clinic_id)
     if script is None:
         db.add(ClinicVoiceAgentScript(
             clinic_id=clinic_id,
-            opening_overrides=DEFAULT_OPENING_OVERRIDES,
-            new_patient_intake_prompt=DEFAULT_NEW_PATIENT_INTAKE_PROMPT,
             existing_patient_intro=DEFAULT_EXISTING_PATIENT_INTRO,
         ))
         summary["script"] = "created"
     elif not only_if_missing:
-        script.opening_overrides = DEFAULT_OPENING_OVERRIDES
-        script.new_patient_intake_prompt = DEFAULT_NEW_PATIENT_INTAKE_PROMPT
         script.existing_patient_intro = DEFAULT_EXISTING_PATIENT_INTRO
         summary["script"] = "overwritten"
     else:
-        # Backfill any of the three extension fields that are still null on
-        # an existing row.
-        touched = False
-        if not script.opening_overrides:
-            script.opening_overrides = DEFAULT_OPENING_OVERRIDES; touched = True
-        if not script.new_patient_intake_prompt:
-            script.new_patient_intake_prompt = DEFAULT_NEW_PATIENT_INTAKE_PROMPT; touched = True
+        # Backfill existing_patient_intro if it's still null on an existing row.
         if not script.existing_patient_intro:
-            script.existing_patient_intro = DEFAULT_EXISTING_PATIENT_INTRO; touched = True
-        if touched:
+            script.existing_patient_intro = DEFAULT_EXISTING_PATIENT_INTRO
             summary["script"] = "extensions_filled"
 
     # Caller buckets — only insert defaults when the clinic has zero rows,

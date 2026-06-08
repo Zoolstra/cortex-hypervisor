@@ -52,16 +52,16 @@ class SubmitTicketProtocol(Protocol):
                         "type": "string",
                         "enum": ["matched", "unmatched", "new", "ambiguous"],
                         "description": (
-                            "'matched' = match_patient_by_name returned matched. "
+                            "'matched' = verify_caller_identification returned matched. "
                             "'ambiguous' = still ambiguous after the DOB retry. "
-                            "'unmatched' = match_patient_by_name returned unmatched. "
+                            "'unmatched' = verify_caller_identification returned unmatched. "
                             "'new' = the caller self-identified as a new patient."
                         ),
                     },
                     "blueprint_patient_id": {
                         "type": "string",
                         "description": (
-                            "The patient_id returned by match_patient_by_name. "
+                            "The patient_id returned by verify_caller_identification. "
                             "Omit when patient_match_status is not 'matched'."
                         ),
                     },
@@ -75,9 +75,10 @@ class SubmitTicketProtocol(Protocol):
                     "intent_category": {
                         "type": "string",
                         "description": (
-                            "Which of the clinic's Caller's Needs categories best "
-                            "fits this call. Use the label from the script's "
-                            "Caller's Needs section."
+                            "A short free-text label that best describes the "
+                            "caller's need, in your own concise wording "
+                            "(e.g. 'new patient booking', 'hearing aid repair', "
+                            "'insurance question', 'wax removal')."
                         ),
                     },
                     "summary": {
@@ -89,8 +90,28 @@ class SubmitTicketProtocol(Protocol):
                         "description": (
                             "Intent-specific fields collected during the call. "
                             "Free-form JSON — include whatever is relevant to the "
-                            "protocol you followed."
+                            "protocol you followed. If you asked the clinic's "
+                            "new-patient screening questions and the caller did NOT "
+                            "book, put the answers in 'screening_answers' (a JSON "
+                            "array of objects, not a single string)."
                         ),
+                        "properties": {
+                            "screening_answers": {
+                                "type": "array",
+                                "description": (
+                                    "New-patient screening Q&A, only when the caller "
+                                    "did NOT book. One object per question asked."
+                                ),
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question": {"type": "string"},
+                                        "answer": {"type": "string"},
+                                    },
+                                    "required": ["question", "answer"],
+                                },
+                            },
+                        },
                     },
                     "suggested_followup": {
                         "type": "string",
@@ -121,9 +142,9 @@ Before ending the call:
 2. Let them know a team member will follow up — you cannot confirm a specific appointment time.
 3. Call `submit_ticket` EXACTLY ONCE with:
    - caller_name, caller_phone (E.164), patient_match_status, blueprint_patient_id (if matched), last4_confirmed.
-   - intent_category: the label from the Knowledge Base's Caller's Needs section that best fits.
+   - intent_category: a short free-text label for the caller's need (e.g. "new patient booking", "hearing aid repair", "insurance question").
    - summary: 1-2 sentences for clinic staff.
-   - details: any intent-specific fields you collected.
+   - details: any intent-specific fields you collected. If you asked the new-patient screening questions and the caller did NOT book, include `details.screening_answers` as a list of `{question, answer}` objects so staff have the screening on file.
    - suggested_followup: concrete next action (e.g. "book hearing test, afternoon preference", "return wax-removal referral").
    - urgency: 'urgent' only if the caller reported a time-sensitive medical concern; otherwise 'normal'.
 4. Warm goodbye, end the call.

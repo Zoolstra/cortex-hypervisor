@@ -106,7 +106,12 @@ class BookAppointmentProtocol(Protocol):
                         "description": (
                             "Optional free-text notes to attach to the appointment. "
                             "Use this for anything staff should see at booking time "
-                            "(e.g. 'caller mentioned tinnitus on the right side')."
+                            "(e.g. 'caller mentioned tinnitus on the right side'). "
+                            "If you asked the clinic's new-patient screening "
+                            "questions, append the answers here as plain text — one "
+                            "'Question: answer' per line under a 'New-patient "
+                            "screening:' header. This is a single text field; merge "
+                            "screening answers with any other notes into one string."
                         ),
                     },
                 },
@@ -131,7 +136,7 @@ Use this protocol to actually create a booking in the PMS. It's the step AFTER t
 ### How to call
 - For existing patients: pass `event_type_id`, `start_date`, `start_time`, and `patient_id`.
 - For new patients: pass `event_type_id`, `start_date`, `start_time`, `first_name`, `last_name`, and `phone`.
-- Optional `notes`: anything specific the caller mentioned that staff should see (e.g. side of complaint, hearing-aid brand, accessibility needs).
+- Optional `notes`: anything specific the caller mentioned that staff should see (e.g. side of complaint, hearing-aid brand, accessibility needs). If you asked the clinic's new-patient screening questions, append the answers here as plain text — one `Question: answer` per line under a `New-patient screening:` header (it's a single field, so merge them with any other notes).
 
 You don't pass end_time — the server computes it from the appointment type's duration.
 

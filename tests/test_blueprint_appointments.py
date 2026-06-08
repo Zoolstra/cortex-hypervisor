@@ -46,8 +46,33 @@ _FAKE_CONFIG = {
     "timezone": "America/Vancouver",
     "instance_id": "test-instance",
     "user_id": "42",
-    "location_id": "7",
+    "prompt_for_location": False,
 }
+
+# clinicConfiguration locations the adapter resolves a booking against. A
+# single location → the adapter books into it without an explicit choice.
+_LOCATIONS = [{"id": 1, "name": "Main Clinic", "formattedAddress": "1 Main St"}]
+
+
+def _clinic_config(appointment_types: list[dict]) -> dict:
+    """clinicConfiguration response carrying both appointment types and the
+    single bookable location the book/reschedule flows resolve against."""
+    return {"appointmentTypes": appointment_types, "locations": _LOCATIONS}
+
+
+def _avail(date: str, time: str = "10:00", provider_id: int = 50, location_id: int = 1):
+    """GET /availability/ response with one open slot — what book() reads to
+    derive the providerId for the chosen time."""
+    return [{
+        "date": date,
+        "available": True,
+        "availabilityTimes": [{
+            "time": f"{time}:00-0600",
+            "available": [{"providerId": provider_id, "locationId": location_id}],
+            "resources": [],
+            "appointmentId": None,
+        }],
+    }]
 
 
 # ── HTTP stub ─────────────────────────────────────────────────────────────────
@@ -112,9 +137,15 @@ def stub(monkeypatch):
     # Replace the `httpx` binding inside the adapter's module — calls
     # like `httpx.get(...)` now go through the stub.
     monkeypatch.setattr("api.voice_agent.pms.blueprint.httpx", s)
-    # Bypass Cloud SQL + Secret Manager.
+    # Bypass Cloud SQL + Secret Manager. The adapter resolves config via the
+    # name in pms.blueprint; the router calls _get_blueprint_config directly
+    # via its own imported reference — patch both so neither hits Cloud SQL.
     monkeypatch.setattr(
         "api.voice_agent.pms.blueprint._get_blueprint_config",
+        lambda db, clinic_id: dict(_FAKE_CONFIG),
+    )
+    monkeypatch.setattr(
+        "api.voice_agent.blueprint._get_blueprint_config",
         lambda db, clinic_id: dict(_FAKE_CONFIG),
     )
     # Bypass VAPI auth + the database session.
@@ -235,9 +266,9 @@ def test_book_derives_end_time_from_event_type_duration(stub, client):
         posts.append(payload)
         return StubResp(201, {})
 
-    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
-        "appointmentTypes": [{"id": 1, "name": "Hearing Test", "duration": 45}],
-    }))
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 45}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-15", "10:00")))
     stub.set("POST", "/appointments/", capture)
 
     resp = client.post(
@@ -256,14 +287,15 @@ def test_book_derives_end_time_from_event_type_duration(stub, client):
     assert diff_minutes == 45
     assert payload["patientId"] == 316
     assert payload["status"] == 2  # Tentative — staff confirms
-    # location_id from fake config (=7) is on availableProviders
-    assert payload["availableProviders"] == [{"locationId": 7}]
+    # Location resolved from the clinic's sole location; provider derived
+    # from the open availability slot.
+    assert payload["locationId"] == 1
+    assert payload["providerId"] == 50
 
 
 def test_book_rejects_unknown_event_type_id(stub, client):
-    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
-        "appointmentTypes": [{"id": 1, "name": "Hearing Test", "duration": 30}],
-    }))
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
     resp = client.post(
         "/blueprint/CLINIC_X/appointments/book",
         json={
@@ -282,9 +314,9 @@ def test_book_quickadd_path_for_new_patients(stub, client):
     patient object with name + mobile phone digits.
     """
     posts: list[dict] = []
-    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
-        "appointmentTypes": [{"id": 1, "name": "X", "duration": 30}],
-    }))
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "X", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-15", "10:00")))
     stub.set("POST", "/appointments/", lambda p: (posts.append(p), StubResp(201, {}))[1])
 
     resp = client.post(
@@ -393,9 +425,9 @@ def test_reschedule_books_new_before_cancelling_old(stub, client):
     old AND new slots. So we book first, then cancel.
     """
     stub.set("POST", "/appointments/search", StubResp(200, [_appt()]))
-    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
-        "appointmentTypes": [{"id": 1, "name": "Hearing Test", "duration": 30}],
-    }))
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-15", "14:00")))
     stub.set("POST", "/appointments/", StubResp(201, {}))
     stub.set("PUT", "/appointments/10995_0", StubResp(200, {}))
 
@@ -429,9 +461,9 @@ def test_reschedule_returns_partial_when_cancel_fails_after_book(stub, client):
     warning so the agent can surface it + the ticket can capture cleanup.
     """
     stub.set("POST", "/appointments/search", StubResp(200, [_appt()]))
-    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
-        "appointmentTypes": [{"id": 1, "name": "Hearing Test", "duration": 30}],
-    }))
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-15", "14:00")))
     stub.set("POST", "/appointments/", StubResp(201, {}))
     # Cancel of old fails
     stub.set("PUT", "/appointments/10995_0", StubResp(500, {}))
@@ -455,10 +487,10 @@ def test_reschedule_aborts_cleanly_when_book_fails(stub, client):
     issue the PUT, otherwise the caller loses both slots on partial failure.
     """
     stub.set("POST", "/appointments/search", StubResp(200, [_appt()]))
-    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
-        "appointmentTypes": [{"id": 1, "name": "Hearing Test", "duration": 30}],
-    }))
-    # Book fails
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-15", "14:00")))
+    # Book fails at the POST itself (location + provider resolve fine first)
     stub.set("POST", "/appointments/", StubResp(500, {}))
     puts: list[dict] = []
     stub.set("PUT", "/appointments/10995_0",
@@ -474,3 +506,135 @@ def test_reschedule_aborts_cleanly_when_book_fails(stub, client):
     )
     assert resp.status_code >= 400
     assert puts == []  # old appointment untouched
+
+
+# ── Location resolution + provider derivation ─────────────────────────────────
+
+
+def test_book_honours_caller_provided_location_id(stub, client):
+    """When the caller chose a location, book() uses it directly (no
+    single-location fallback) and derives the provider open there."""
+    posts: list[dict] = []
+    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
+        "appointmentTypes": [{"id": 1, "name": "Hearing Test", "duration": 30}],
+        "locations": [{"id": 1, "name": "North"}, {"id": 2, "name": "South"}],
+    }))
+    stub.set("GET", "/availability/",
+             StubResp(200, _avail("2026-06-15", "10:00", provider_id=88, location_id=2)))
+    stub.set("POST", "/appointments/", lambda p: (posts.append(p), StubResp(201, {}))[1])
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/book",
+        json={
+            "event_type_id": 1,
+            "start_date": "2026-06-15",
+            "start_time": "10:00",
+            "location_id": 2,
+            "patient_id": "316",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert posts[0]["locationId"] == 2
+    assert posts[0]["providerId"] == 88
+
+
+def test_book_rejects_multi_location_clinic_with_no_choice(stub, client):
+    """A multi-location clinic with no caller-chosen location is a 400 —
+    the adapter won't guess which location to book into."""
+    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
+        "appointmentTypes": [{"id": 1, "name": "Hearing Test", "duration": 30}],
+        "locations": [{"id": 1, "name": "North"}, {"id": 2, "name": "South"}],
+    }))
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/book",
+        json={
+            "event_type_id": 1,
+            "start_date": "2026-06-15",
+            "start_time": "10:00",
+            "patient_id": "316",
+        },
+    )
+    assert resp.status_code == 400
+    assert "multiple locations" in resp.text
+
+
+def test_book_409_when_slot_has_no_open_provider(stub, client):
+    """If the chosen time has no available provider (slot just taken), book()
+    refuses with 409 rather than posting an appointment with no provider."""
+    taken = _avail("2026-06-15", "10:00")
+    taken[0]["availabilityTimes"][0]["available"] = []  # nobody free
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, taken))
+    posts: list[dict] = []
+    stub.set("POST", "/appointments/", lambda p: (posts.append(p), StubResp(201, {}))[1])
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/book",
+        json={
+            "event_type_id": 1,
+            "start_date": "2026-06-15",
+            "start_time": "10:00",
+            "patient_id": "316",
+        },
+    )
+    assert resp.status_code == 409
+    assert posts == []  # never posted a provider-less appointment
+
+
+def test_find_available_slots_filters_out_booked_and_empty_slots(stub, client):
+    """Blueprint's grid lists booked times too (available=[], appointmentId
+    set). find_available_slots must surface only genuinely-open slots — an
+    available provider AND no existing appointment — so the agent never
+    offers a taken time."""
+    stub.set("GET", "/availability/", StubResp(200, [
+        {
+            "date": "2026-06-15",
+            "available": True,
+            "availabilityTimes": [
+                {"time": "09:00:00-0600",
+                 "available": [{"providerId": 50, "locationId": 1}],
+                 "appointmentId": None},                      # open → kept
+                {"time": "10:00:00-0600",
+                 "available": [], "appointmentId": None},      # nobody free → dropped
+                {"time": "11:00:00-0600",
+                 "available": [{"providerId": 50, "locationId": 1}],
+                 "appointmentId": "555_0"},                    # booked → dropped
+            ],
+        },
+        {
+            "date": "2026-06-16",
+            "available": False,                               # whole day off → dropped
+            "availabilityTimes": [
+                {"time": "09:00:00-0600",
+                 "available": [{"providerId": 50, "locationId": 1}],
+                 "appointmentId": None},
+            ],
+        },
+    ]))
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/availability/find",
+        json={"event_type_id": 1, "start_date": "2026-06-15", "end_date": "2026-06-16"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["days"] == [
+        {"date": "2026-06-15", "available_times": ["09:00"]},
+    ]
+
+
+def test_list_locations_endpoint_returns_locations_and_flag(stub, client):
+    """The locations capability returns the bookable locations plus whether
+    the agent should ask the caller to choose."""
+    stub.set("GET", "/clinicConfiguration/", StubResp(200, {
+        "locations": [
+            {"id": 1, "name": "North", "formattedAddress": "1 North St"},
+            {"id": 2, "name": "South"},
+        ],
+    }))
+    resp = client.post("/blueprint/CLINIC_X/locations")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["prompt_for_location"] is False  # from _FAKE_CONFIG
+    assert {loc["id"] for loc in body["locations"]} == {1, 2}
+    assert body["locations"][0]["address"] == "1 North St"

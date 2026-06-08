@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-
+import json
 import httpx
 from sqlalchemy import select
 
@@ -39,6 +39,8 @@ from api.core.db import session_scope
 from api.core.orm import Clinic, ClinicBlueprintConfig
 from api.core.secrets import get_secret
 from api.voice_agent.pms.blueprint import _blueprint_base
+
+EVENT_TYPE_ID = 3  # overridden by --event-type-id
 
 
 def _inspect_key(key: str) -> list[str]:
@@ -75,6 +77,76 @@ def _resolve_clinics(clinic_id: str | None, clinic_name: str | None, do_all: boo
         return out
 
 
+def availability_search(base: str, key: str) -> None:
+    url = f"{base}/availability/search/"
+    params = {"apiKey": key, "startTime": 1780898400, "endTime": 1782194400}
+    try:
+        r = httpx.post(
+            url,
+            json=params,
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"  FAIL — request error: {type(e).__name__}: {e}")
+        return
+    
+    status = r.status_code
+    size = len(r.content)
+    if status == 200:
+
+        print(f"  RESULT  : 200 OK ({size} bytes)")
+        params.pop("apiKey")
+        print(f" params: {json.dumps(params, indent=10)}")
+        print(f" payload: {json.dumps(r.json(), indent=10)}")
+
+
+
+
+
+def availability_find(base: str, key: str, event_type_id: int) -> None:
+    """Raw GET /rest/availability/ — the exact call find_available_slots makes."""
+    url = f"{base}/availability/"
+    params = {
+        "apiKey": key,
+        "startTime": 1780898400,
+        "endTime": 1782194400,
+        "eventTypeId": event_type_id,
+        "bookingTimeSlotInterval": "DURATION",
+        "minimumAdvanceBookingTime": 30,
+    }
+    print(f"\n  --- GET /availability/ (eventTypeId={event_type_id}) ---")
+    try:
+        r = httpx.get(url, params=params, timeout=20)
+    except Exception as e:
+        print(f"  FAIL — request error: {type(e).__name__}: {e}")
+        return
+    if r.status_code != 200:
+        print(f"  RESULT  : {r.status_code} ({len(r.content)} bytes) {r.text[:300]}")
+        return
+    data = r.json()
+    avail_days = [d for d in data if isinstance(d, dict) and d.get("available")]
+    print(f"  RESULT  : 200 OK ({len(r.content)} bytes) — "
+          f"{len(data)} days, {len(avail_days)} with available=true")
+    print(f"  payload: {json.dumps(data, indent=10)}")
+
+
+def list_types(base: str, key: str) -> None:
+    """Dump appointment types so we can see what eventTypeId=3 is."""
+    print("\n  --- GET /clinicConfiguration/ (appointment types) ---")
+    try:
+        r = httpx.get(f"{base}/clinicConfiguration/", params={"apiKey": key}, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"  FAIL — {type(e).__name__}: {e}")
+        return
+    types = [
+        {"id": t["id"], "name": t.get("name"), "duration": t.get("duration")}
+        for t in r.json().get("appointmentTypes", [])
+        if t.get("name")
+    ]
+    print(f"  payload: {json.dumps(types, indent=10)}")
+
+
 def _check(clinic_id: str, clinic_name: str, pms_type: str, api_url: str | None) -> bool:
     print("=" * 72)
     print(f"  {clinic_name}  ({clinic_id})")
@@ -94,31 +166,13 @@ def _check(clinic_id: str, clinic_name: str, pms_type: str, api_url: str | None)
         return False
 
     base = _blueprint_base({"api_url": api_url})
-    notes = _inspect_key(key)
-    print(f"  api_url : {api_url}")
-    print(f"  base    : {base}")
-    print(f"  key     : len={len(key)} clean={'no — ' + '; '.join(notes) if notes else 'yes'}")
 
-    url = f"{base}/clinicConfiguration/"
-    try:
-        r = httpx.get(url, params={"apiKey": key}, timeout=20)
-    except Exception as e:
-        print(f"  FAIL — request error: {type(e).__name__}: {e}")
-        return False
+    # availability_search(base, key)
+    list_types(base, key)
+    availability_find(base, key, EVENT_TYPE_ID)
 
-    status = r.status_code
-    size = len(r.content)
-    if status == 200:
-        print(f"  RESULT  : 200 OK ({size} bytes) — PASS, key is valid ✓")
-        return True
+   
 
-    reason = {
-        403: "key rejected (wrong/revoked) OR REST API access not enabled for this clinic",
-        404: "path not found — api_url instance/slug is wrong",
-        400: "bad request — apiKey param missing/malformed",
-    }.get(status, "unexpected status")
-    print(f"  RESULT  : {status} ({size} bytes) — FAIL: {reason} ✗")
-    return False
 
 
 def main() -> int:
@@ -127,18 +181,19 @@ def main() -> int:
     g.add_argument("--clinic-id", help="exact clinic_id (UUID)")
     g.add_argument("--clinic-name", help="substring match on clinic_name")
     g.add_argument("--all", action="store_true", help="check every blueprint clinic")
+    p.add_argument("--event-type-id", type=int, default=3,
+                   help="event type to probe in GET /availability/ (default 3)")
     args = p.parse_args()
+
+    global EVENT_TYPE_ID
+    EVENT_TYPE_ID = args.event_type_id
 
     clinics = _resolve_clinics(args.clinic_id, args.clinic_name, args.all)
     if not clinics:
         print("No matching clinic(s) found.")
         return 1
 
-    results = [_check(*c) for c in clinics]
-    passed = sum(results)
-    print("=" * 72)
-    print(f"  {passed}/{len(results)} passed")
-    return 0 if passed == len(results) else 2
+    _check(clinics[0][0], clinics[0][1], clinics[0][2], clinics[0][3])
 
 
 if __name__ == "__main__":

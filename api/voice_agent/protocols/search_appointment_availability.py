@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from api.voice_agent.protocols.base import Protocol
 
@@ -23,26 +23,21 @@ from api.voice_agent.protocols.base import Protocol
 class SearchAppointmentAvailabilityConfig(BaseModel):
     """Per-clinic configuration for the availability search.
 
-    First instance of the design doc's §5 typed protocol config. Stored
-    in ``clinic_protocols.config`` for this protocol id; validated on
-    write and on agent build. Adding a field here automatically surfaces
+    Stored in ``clinic_protocols.config`` for this protocol id; validated
+    on write and on agent build. Adding a field here automatically surfaces
     it in the dashboard's Configure form (the frontend renders from the
     JSON Schema this model emits).
+
+    The protocol has no operator knobs today: every Blueprint provider's
+    scheduled availability is directly bookable, so the search hits
+    Blueprint's GET ``/rest/availability/`` over the window with no
+    pre-filter. The retired ``online_booking_only`` toggle (an early
+    ACNA-specific request) may still be persisted in older config rows —
+    ``extra="ignore"`` drops it harmlessly on read so we don't need a
+    data migration.
     """
 
-    online_booking_only: bool = Field(
-        default=False,
-        title="Online booking only",
-        description=(
-            "When enabled, the agent only quotes time slots whose provider "
-            "blocks are flagged ``availableForOnlineBookingOnly = true`` in "
-            "Blueprint. Use this for clinics whose staff curate which "
-            "availability is reachable through the agent vs. reserved for "
-            "phone-only / staff-managed bookings."
-        ),
-    )
-
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
 
 _CORTEX_BASE = os.environ.get("CORTEX_API_BASE_URL", "http://localhost:8000")
@@ -118,8 +113,7 @@ class SearchAppointmentAvailabilityProtocol(Protocol):
             "description": (
                 "Find bookable appointment slots in a date range for a specific "
                 "appointment type. Returns {days: [{date, available_times: [HH:MM, ...]}]}. "
-                "You MUST supply event_type_id — get it from list_appointment_types "
-                "first. Use a 1-2 week window unless the caller specifies otherwise."
+                "Use a 1-2 week window unless the caller specifies otherwise."
             ),
             "url": self._slots_url(),
             "method": "POST",
