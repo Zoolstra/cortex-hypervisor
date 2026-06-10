@@ -66,6 +66,27 @@ class Location:
 
 
 @dataclass(frozen=True)
+class Provider:
+    """A bookable provider from the PMS — name ↔ id mapping for the agent."""
+
+    id: int
+    name: str | None
+
+
+@dataclass(frozen=True)
+class JournalEntry:
+    """One patient journal/history entry surfaced to the agent for context.
+
+    Clinical PHI — only the minimal fields the agent needs as background.
+    Never includes the raw PMS row.
+    """
+
+    entry_time: str        # ISO-8601 (clinic-local) or YYYY-MM-DD
+    entry_type: str | None
+    text: str              # user_text preferred, generated_text fallback
+
+
+@dataclass(frozen=True)
 class AvailabilityDay:
     """One day of bookable slots in a search result."""
 
@@ -163,6 +184,24 @@ class PMSAdapter(ABC):
         book into before searching availability. Single-location clinics
         still expose their one location here so callers can resolve it
         without separate config.
+        """
+
+    @abstractmethod
+    def list_providers(self) -> list[Provider]:
+        """Return the clinic's bookable providers as a name ↔ id mapping.
+
+        Injected into the system prompt so the agent can map a caller's
+        provider preference to an id and make sense of provider ids in
+        availability responses.
+        """
+
+    @abstractmethod
+    def get_patient_journal(self, *, patient_id: str) -> list[JournalEntry]:
+        """Return recent journal/history entries for an identified patient.
+
+        Clinical PHI — implementations MUST filter by both the clinic and
+        the patient id, exclude deleted rows, and bound recency/volume.
+        Only called after the caller has been verified as an existing patient.
         """
 
     @abstractmethod

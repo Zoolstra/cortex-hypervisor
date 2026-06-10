@@ -214,6 +214,9 @@ class ClinicBlueprintConfig(Base):
     prompt_for_location: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="0"
     )
+    # Blueprint "user creating the appointment" for create/cancel/reschedule.
+    # When NULL the adapter falls back to the booking's providerId.
+    user_id: Mapped[int | None] = mapped_column(Integer)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
@@ -526,3 +529,38 @@ class ClinicAdmin(Base):
     )
 
     instance: Mapped["Instance"] = relationship(back_populates="admins")
+
+
+# ──────────────────── clinic_blueprint_entity_note (N) ────────────────────
+#
+# Admin free-text notes attached to Blueprint appointment types / providers
+# (which live in Blueprint, not our DB — so we key on the Blueprint entity id).
+# Merged into the voice-agent system prompt's Clinic Reference section.
+# One row per (clinic, entity_kind, entity_id); empty notes are deleted.
+
+class ClinicBlueprintEntityNote(Base):
+    __tablename__ = "clinic_blueprint_entity_note"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    entity_kind: Mapped[str] = mapped_column(String(32), nullable=False)  # appointment_type | provider
+    entity_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("clinic_id", "entity_kind", "entity_id",
+                         name="uq_clinic_entity_note"),
+    )

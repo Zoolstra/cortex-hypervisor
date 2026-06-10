@@ -20,9 +20,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.core.orm import (
-    Clinic, ClinicProtocol, ClinicVoiceAgentCallerBucket,
-    ClinicVoiceAgentPersona, ClinicVoiceAgentQualifyingQuestion,
-    ClinicVoiceAgentScript,
+    Clinic, ClinicBlueprintEntityNote, ClinicProtocol,
+    ClinicVoiceAgentCallerBucket, ClinicVoiceAgentPersona,
+    ClinicVoiceAgentQualifyingQuestion, ClinicVoiceAgentScript,
 )
 from api.core.secrets import get_secret
 from api.voice_agent.protocols import (
@@ -179,6 +179,77 @@ def _hours_block(clinic: Clinic) -> str:
     return f"## Hours of Operation\n{rendered}"
 
 
+def _pms_reference_section(db: Session, clinic: Clinic) -> str:
+    """Static PMS reference for the system prompt: the clinic's bookable
+    appointment types and a provider name ↔ id mapping (the online-booking
+    set, matching what the agent can search/book).
+
+    Best-effort: a Blueprint fetch failure logs and drops the section rather
+    than breaking assistant creation. Non-Blueprint clinics get nothing.
+    """
+    if (clinic.pms_type or "none") != "blueprint":
+        return ""
+    try:
+        # Local import — the adapter pulls httpx/BQ stacks we don't want at
+        # factory-import time.
+        from api.voice_agent.pms.blueprint import BlueprintAdapter
+
+        adapter = BlueprintAdapter(clinic_id=clinic.clinic_id)
+        adapter.load_http_config(db)
+        types = adapter.list_appointment_types()
+        providers = adapter.list_providers()
+    except Exception:
+        log.warning(
+            "Could not load Blueprint clinic reference for clinic_id=%s; "
+            "omitting PMS reference section from the prompt",
+            clinic.clinic_id, exc_info=True,
+        )
+        return ""
+
+    if not types and not providers:
+        return ""
+
+    # Admin-attached free-text notes, keyed by (entity_kind, entity_id).
+    notes = {
+        (r.entity_kind, r.entity_id): r.note
+        for r in db.scalars(
+            select(ClinicBlueprintEntityNote).where(
+                ClinicBlueprintEntityNote.clinic_id == clinic.clinic_id
+            )
+        ).all()
+    }
+
+    blocks = [
+        "## Clinic Reference (from the PMS)",
+        "Treat these as ground truth for this clinic's appointment types and providers.",
+    ]
+    if types:
+        type_lines = []
+        for t in types:
+            dur = f" ({t.duration_minutes} min)" if t.duration_minutes else ""
+            line = f"- {t.id} · {t.name}{dur}"
+            note = notes.get(("appointment_type", t.id))
+            if note:
+                line += f" — {note}"
+            type_lines.append(line)
+        blocks.append("### Appointment types\n" + "\n".join(type_lines))
+    if providers:
+        prov_lines = []
+        for p in providers:
+            line = f"- {p.id} · {p.name}"
+            note = notes.get(("provider", p.id))
+            if note:
+                line += f" — {note}"
+            prov_lines.append(line)
+        blocks.append(
+            "### Providers (name ↔ id)\n" + "\n".join(prov_lines)
+            + "\n\nWhen a caller names a provider preference, map it to the id "
+            "above and honor it where possible. Availability and booking "
+            "responses reference these provider ids."
+        )
+    return "\n\n".join(blocks)
+
+
 def _capability_by_id(caps: list[Protocol], capability_id: str) -> Protocol | None:
     for c in caps:
         if c.id == capability_id:
@@ -298,8 +369,9 @@ def _stage_2_identity(caps: list[Protocol]) -> str:
     return (
         "## Stage 2 — Identity\n"
         "**Goals**\n"
-        "1. Determine whether the caller is **new** or **existing** "
-        "**[info collection point]**.\n"
+        "1. Establish whether the caller is **new** or **existing** "
+        "**[info collection point]** — **deduce it from what they want "
+        "whenever you can, rather than asking outright.**\n"
         "2. If existing → silently call the Lookup Patient capability "
         "(see the capability block below). Confirm the match by name.\n"
         "3. Collect the **callback number** **[info collection point]**. "
@@ -310,6 +382,14 @@ def _stage_2_identity(caps: list[Protocol]) -> str:
         "would apply then.)\n"
         "\n"
         "**Rules**\n"
+        "- **Infer existing-patient status from intent — don't reflexively "
+        "ask \"have you been here before?\"** A caller who wants to cancel, "
+        "reschedule, or check an existing appointment, pick up or repair "
+        "hearing aids, or refers to \"my\" appointment/file/account is "
+        "already an existing patient: acknowledge their request and move "
+        "straight to verifying their identity. Only ask new-vs-existing "
+        "outright when it's genuinely unclear (e.g. a general pricing or "
+        "insurance question a brand-new caller could equally ask).\n"
         "- If the caller already volunteered new-vs-existing in Stage 1, do "
         "not ask again — just acknowledge (\"got it, you're an existing patient\").\n"
         "- A failed or ambiguous lookup is fine — proceed and let the staff "
@@ -438,13 +518,6 @@ def _stage_3b_existing_patient(script: ClinicVoiceAgentScript | None) -> str:
         "**[info collection point]**.",
         "2. Capture the details staff will need: aid model if known, urgency, "
         "preferred time window. **[info collection point]**",
-        "",
-        "**Rules**",
-        "- If the caller already named their need in Stage 1, do not ask "
-        "\"what can I help you with?\" — go straight to capturing details.",
-        "- One focused follow-up at a time. Acknowledge details as the "
-        "caller mentions them; verbatim readback of dates/times waits "
-        "until you're about to pass them to a booking or reschedule tool.",
     ]
     if extra:
         out.extend([
@@ -530,6 +603,7 @@ def build_system_prompt(
     persona: ClinicVoiceAgentPersona | None = None,
     caller_buckets: list[ClinicVoiceAgentCallerBucket] | None = None,
     qualifying_questions: list[ClinicVoiceAgentQualifyingQuestion] | None = None,
+    pms_reference: str | None = None,
 ) -> str:
     inlined_ids = {VerifyCallerIdentificationProtocol.id}
     buckets = caller_buckets or []
@@ -541,6 +615,7 @@ def build_system_prompt(
         _behavior_rules_section(),
         _script_section(script),
         _hours_block(clinic),
+        pms_reference or "",
         _stage_1_greeting_and_reason(clinic, persona),
         _stage_2_identity(caps),
         _stage_3a_new_patient(buckets, questions),
@@ -597,10 +672,13 @@ def build_agent_config(db: Session, clinic: Clinic) -> dict:
                   ClinicVoiceAgentQualifyingQuestion.id.asc())
     ))
 
+    pms_reference = _pms_reference_section(db, clinic)
+
     system_prompt = build_system_prompt(
         clinic, caps, locale, script,
         persona=persona, caller_buckets=caller_buckets,
         qualifying_questions=qualifying_questions,
+        pms_reference=pms_reference,
     )
     # Flatten: each protocol contributes 1+ VAPI tools. Single-tool ports
     # return a 1-element list; future multi-tool protocols return several.

@@ -50,6 +50,7 @@ class SearchAppointmentAvailabilityProtocol(Protocol):
         "Surface the clinic's bookable appointment types and concrete available "
         "time slots to the agent so it can quote real options to callers. "
         "Required for Book Appointment and Reschedule Appointment."
+        "If the caller provides a large time window of availability and there's many results, summarize them (eg. We have availbility on Tuesday from 8am-12pm) dont list every single slot"
     )
     # Multi-tool: this protocol contributes 2 VAPI tools. We don't set
     # `agent_tool_name` — the dashboard surfaces the protocol-level

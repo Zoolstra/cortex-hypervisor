@@ -85,8 +85,8 @@ class VerifyCallerIdentificationProtocol(Protocol):
     @property
     def prompt_fragment(self) -> str:
         return """## Verify Caller Identification
-1. Early in the call, ask whether the caller has been to the clinic before.
-2. If yes:
+1. Work out whether the caller is an existing patient — **infer it from what they're asking for; don't reflexively ask "have you been here before?"** A caller who wants to cancel, reschedule, or check an existing appointment, pick up or repair hearing aids, or refers to "my" appointment / file / account / order is self-evidently an existing patient. In those cases, skip the question entirely: acknowledge the request ("Sure, I can help you cancel that") and go straight to verifying their identity (step 2). Only ask outright when their status is genuinely unclear — e.g. a general "how much is a hearing test?" or "do you take my insurance?" that a brand-new caller could equally ask.
+2. Once you know (or have inferred) they're an existing patient:
    a. Collect their first and last name.
    b. **Confirm the spelling of BOTH names before doing anything else.** Voice
       transcription frequently mangles names; the lookup is exact-match, so a
@@ -110,7 +110,8 @@ class VerifyCallerIdentificationProtocol(Protocol):
       retry with the `dob` field.
    g. If the result is `unmatched` after your best effort, treat the caller
       as new and ask for a callback phone number.
-3. If no: treat as a new patient — collect full name (still spell-confirm it
-   so the ticket is accurate) and callback phone number directly.
+3. If they're a new patient (their request implies it, or they say they
+   haven't been in before): collect full name (still spell-confirm it so the
+   ticket is accurate) and callback phone number directly.
 
 You never learn the patient's full record — only a yes/no/ambiguous status and an opaque patient_id. Never pretend you know details about a patient beyond what the caller has told you directly."""

@@ -42,9 +42,11 @@ from api.voice_agent.pms import (
     AvailabilityDay,
     AvailabilityResult,
     BookingResult,
+    JournalEntry,
     Location,
     PatientMatchResult,
     PMSAdapter,
+    Provider,
 )
 
 
@@ -101,6 +103,7 @@ def _get_blueprint_config(db: Session, clinic_id: str) -> dict:
         "timezone": location.time_zone if location else None,
         "instance_id": clinic.instance_id,
         "prompt_for_location": bool(bp.prompt_for_location),
+        "user_id": bp.user_id,
     }
 
 
@@ -241,6 +244,49 @@ class BlueprintAdapter(PMSAdapter):
             )
         return PatientMatchResult(status="ambiguous", patient_id=None, candidates_count=count)
 
+    # ── Patient journal / history (BQ — PHI) ──────────────────────────────────
+
+    def get_patient_journal(self, *, patient_id: str) -> list[JournalEntry]:
+        """Recent journal entries for an identified patient, for agent context.
+
+        The ``_clinic_id`` filter is **mandatory and non-negotiable** — same
+        PHI-isolation rule as ``find_patient``: clinic A's journal must never
+        be returnable from clinic B's endpoint. Bounds: non-deleted rows only,
+        last 24 months, 10 most recent. ``entry_time`` is STRING in the feed,
+        so we SAFE_CAST it for the window + ordering (rows that don't parse
+        drop out rather than erroring).
+        """
+        sql = f"""
+        SELECT entry_time, entry_type, user_text, generated_text
+        FROM `{PROJECT}.Blueprint_PHI.ClientJournal`
+        WHERE _clinic_id = @clinic_id
+          AND client_id = @patient_id
+          AND (deleted_time IS NULL OR deleted_time = '')
+          AND SAFE_CAST(entry_time AS TIMESTAMP)
+              >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 MONTH)
+        ORDER BY SAFE_CAST(entry_time AS TIMESTAMP) DESC
+        LIMIT 10
+        """
+        params = [
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", self.clinic_id),
+            bigquery.ScalarQueryParameter("patient_id", "STRING", str(patient_id)),
+        ]
+        rows = bq_client.query(
+            sql, job_config=bigquery.QueryJobConfig(query_parameters=params),
+        ).result()
+
+        entries: list[JournalEntry] = []
+        for r in rows:
+            text = (r["user_text"] or r["generated_text"] or "").strip()
+            if not text:
+                continue
+            entries.append(JournalEntry(
+                entry_time=r["entry_time"],
+                entry_type=r["entry_type"],
+                text=text,
+            ))
+        return entries
+
     # ── Appointment types ─────────────────────────────────────────────────────
 
     def list_appointment_types(self) -> list[AppointmentType]:
@@ -299,6 +345,30 @@ class BlueprintAdapter(PMSAdapter):
             for loc in data.get("locations", [])
             if loc.get("name")
         ]
+
+    def list_providers(self) -> list[Provider]:
+        """Pull bookable providers (online-booking-enabled) from
+        clinicConfiguration as a name ↔ id mapping for the system prompt.
+        """
+        config = self._require_http_config()
+        base = _blueprint_base(config)
+
+        resp = httpx.get(
+            f"{base}/clinicConfiguration/",
+            params={"apiKey": config["api_key"]},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        providers: list[Provider] = []
+        for p in data.get("providers", []):
+            name = (p.get("onlineDisplayName")
+                    or f"{p.get('firstName', '')} {p.get('lastName', '')}".strip())
+            if not name:
+                continue
+            providers.append(Provider(id=p["id"], name=name))
+        return providers
 
     def _resolve_location_id(self, location_id: int | None) -> int:
         """Resolve the location to book into.
@@ -635,7 +705,6 @@ class BlueprintAdapter(PMSAdapter):
     ) -> BookingResult:
         config = self._require_http_config()
         base = _blueprint_base(config)
-        user_id = _int_field(config, "user_id", default=1)
         location_id = self._resolve_location_id(location_id)
 
         # Derive end_time from the appointment type's duration.
@@ -665,6 +734,11 @@ class BlueprintAdapter(PMSAdapter):
             location_id=location_id,
         )
 
+        # "User creating the appointment" — a configured service-account user
+        # if set, else the booking provider (always a valid Blueprint user).
+        # Never default to a hardcoded id: Blueprint 400s an unknown userId.
+        user_id = _int_field(config, "user_id") or provider_id
+
         tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
         start_dt = self._combine_local(start_date, start_time, tz)
         end_dt = self._combine_local(start_date, end_time, tz)
@@ -686,8 +760,18 @@ class BlueprintAdapter(PMSAdapter):
             "locationId": location_id,
             "providerId": provider_id,
         }
-        if notes:
-            payload["notes"] = notes
+        # Always stamp the booking as voice-agent-originated with the key facts,
+        # then append whatever the agent passed (e.g. new-patient screening
+        # answers). Gives clinic staff immediate provenance + context.
+        booked_on = datetime.now(tz).strftime("%Y-%m-%d")
+        patient_kind = "Existing patient" if patient_id else "New patient"
+        note_lines = [
+            f"Booked via CORTEX voice agent on {booked_on}.",
+            f"{patient_kind}. {matching.name} on {start_date} at {start_time}.",
+        ]
+        if notes and notes.strip():
+            note_lines.append(notes.strip())
+        payload["notes"] = "\n".join(note_lines)
 
         if patient_id:
             try:
@@ -710,7 +794,23 @@ class BlueprintAdapter(PMSAdapter):
             )
 
         resp = httpx.post(f"{base}/appointments/", json=payload, timeout=15)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # Surface Blueprint's actual rejection instead of an opaque 500.
+            # Log only non-PHI booking fields (NEVER the patient name/phone)
+            # plus Blueprint's error body, which is what we need to diagnose.
+            body = (resp.text or "").strip()[:500]
+            log.error(
+                "Blueprint create-appointment rejected clinic_id=%s status=%d "
+                "eventTypeId=%s locationId=%s providerId=%s userId=%s "
+                "appt_status=%s has_patientId=%s has_quickadd=%s body=%r",
+                self.clinic_id, resp.status_code, event_type_id, location_id,
+                provider_id, user_id, payload.get("status"),
+                "patientId" in payload, "patient" in payload, body,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Blueprint rejected the booking ({resp.status_code}): {body}",
+            )
 
         # Blueprint's POST returns 201 with empty body — no appointment_id.
         # We can't echo a server-issued id here without doing a follow-up
@@ -733,11 +833,14 @@ class BlueprintAdapter(PMSAdapter):
     def cancel(self, *, appointment_id: str) -> BookingResult:
         config = self._require_http_config()
         base = _blueprint_base(config)
-        user_id = _int_field(config, "user_id", default=1)
 
         # Recover the onlineBookingSecret (never exposed to the agent).
         raw = self._find_raw_appointment(appointment_id)
         secret = raw.get("onlineBookingSecret")
+
+        # "User" performing the cancel: configured service-account user if
+        # set, else the appointment's own provider (a valid Blueprint user).
+        user_id = _int_field(config, "user_id") or raw.get("provider_id")
         if not secret:
             raise HTTPException(
                 status_code=502,

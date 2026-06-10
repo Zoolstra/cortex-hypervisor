@@ -203,3 +203,49 @@ def test_last4_matches_any_phone_field(capture, client):
     assert "mobile_telephone_no" in sql
     assert "home_telephone_no" in sql
     assert "work_telephone_no" in sql
+
+# ── Patient journal PHI isolation ──────────────────────────────────────────────
+
+
+def test_journal_filters_by_clinic_and_patient(capture, client):
+    """The journal query MUST filter by BOTH _clinic_id (from the path) and
+    the patient_id. Dropping either is a PHI leak across clinics/patients."""
+    resp = client.post(
+        "/blueprint/CLINIC_A/patient/journal",
+        json={"patient_id": "316"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(capture.calls) == 1
+    sql, params = capture.calls[0]
+    assert "_clinic_id = @clinic_id" in sql
+    assert "client_id = @patient_id" in sql
+    assert ("clinic_id", "CLINIC_A") in params
+    assert ("patient_id", "316") in params
+
+
+def test_journal_excludes_deleted_and_bounds_recency(capture, client):
+    """Non-deleted rows only, recency-bounded, ordered/limited — structural guard."""
+    resp = client.post("/blueprint/X/patient/journal", json={"patient_id": "1"})
+    assert resp.status_code == 200
+    sql, _ = capture.calls[0]
+    assert "deleted_time IS NULL" in sql
+    assert "INTERVAL 24 MONTH" in sql
+    assert "SAFE_CAST(entry_time AS TIMESTAMP)" in sql
+    assert "LIMIT 10" in sql
+
+
+def test_journal_prefers_user_text_and_drops_empty(capture, client):
+    """text = user_text, falling back to generated_text; entries with neither
+    are dropped (never surface blank notes to the agent)."""
+    capture.rows = [
+        {"entry_time": "2026-05-01 09:00:00", "entry_type": "note",
+         "user_text": "Fitted left aid", "generated_text": ""},
+        {"entry_time": "2026-04-01 09:00:00", "entry_type": "sys",
+         "user_text": "", "generated_text": "Auto: invoice paid"},
+        {"entry_time": "2026-03-01 09:00:00", "entry_type": "blank",
+         "user_text": "", "generated_text": ""},
+    ]
+    resp = client.post("/blueprint/X/patient/journal", json={"patient_id": "1"})
+    assert resp.status_code == 200
+    entries = resp.json()["entries"]
+    assert [e["text"] for e in entries] == ["Fitted left aid", "Auto: invoice paid"]

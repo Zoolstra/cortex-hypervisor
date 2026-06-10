@@ -27,12 +27,15 @@ isolation rely on:
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 import httpx
 from fastapi.testclient import TestClient
 
 from api import app
 from api.voice_agent.blueprint import verify_vapi_secret
+from api.voice_agent.pms.blueprint import BlueprintAdapter
 from api.core.db import get_session
 
 
@@ -82,6 +85,11 @@ class StubResp:
     def __init__(self, status_code: int = 200, json_data=None):
         self.status_code = status_code
         self._json = json_data if json_data is not None else {}
+
+    @property
+    def text(self) -> str:
+        # Mirror httpx.Response.text so error paths that read the body work.
+        return json.dumps(self._json)
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -621,6 +629,122 @@ def test_find_available_slots_filters_out_booked_and_empty_slots(stub, client):
     assert resp.json()["days"] == [
         {"date": "2026-06-15", "available_times": ["09:00"]},
     ]
+
+
+def test_book_uses_configured_user_id_when_set(stub, client):
+    """A configured service-account user_id is sent as the booking's userId."""
+    posts: list[dict] = []
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-18", "10:00")))
+    stub.set("POST", "/appointments/", lambda p: (posts.append(p), StubResp(201, {}))[1])
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/book",
+        json={"event_type_id": 1, "start_date": "2026-06-18",
+              "start_time": "10:00", "patient_id": "316"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert posts[0]["userId"] == 42  # from _FAKE_CONFIG, not the provider
+
+
+def test_book_falls_back_to_provider_as_user_id(stub, client, monkeypatch):
+    """With no configured user_id, the booking's userId falls back to the
+    resolved provider (a valid Blueprint user) — never a hardcoded 1."""
+    cfg = {k: v for k, v in _FAKE_CONFIG.items() if k != "user_id"}
+    for mod in ("api.voice_agent.pms.blueprint._get_blueprint_config",
+                "api.voice_agent.blueprint._get_blueprint_config"):
+        monkeypatch.setattr(mod, lambda db, clinic_id: dict(cfg))
+
+    posts: list[dict] = []
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/",
+             StubResp(200, _avail("2026-06-18", "10:00", provider_id=526)))
+    stub.set("POST", "/appointments/", lambda p: (posts.append(p), StubResp(201, {}))[1])
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/book",
+        json={"event_type_id": 1, "start_date": "2026-06-18",
+              "start_time": "10:00", "patient_id": "316"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert posts[0]["userId"] == 526  # fell back to providerId
+    assert posts[0]["providerId"] == 526
+
+
+def test_book_surfaces_blueprint_rejection_as_502(stub, client):
+    """A Blueprint 400 on create is surfaced as a 502 carrying Blueprint's
+    error body — not an opaque 500."""
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-18", "10:00")))
+    stub.set("POST", "/appointments/", StubResp(
+        400, {"error_code": "INVALID_INPUT", "error_msg": "Invalid or missing parameters."}))
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/book",
+        json={"event_type_id": 1, "start_date": "2026-06-18",
+              "start_time": "10:00", "patient_id": "316"},
+    )
+    assert resp.status_code == 502, resp.text
+    assert "INVALID_INPUT" in resp.text
+
+
+def test_list_providers_parses_clinic_configuration(stub):
+    """Providers are surfaced as name ↔ id for the system prompt; null-named
+    placeholders dropped, onlineDisplayName preferred over first+last."""
+    stub.set("GET", "/clinicConfiguration/", StubResp(200, {"providers": [
+        {"id": 526, "onlineDisplayName": "Dr. Alex Dean", "firstName": "Alex", "lastName": "Dean"},
+        {"id": 521, "firstName": "Cindy", "lastName": "Schubert"},
+        {"id": 999},  # null-named placeholder → dropped
+    ]}))
+    adapter = BlueprintAdapter(clinic_id="CLINIC_X", http_config=dict(_FAKE_CONFIG))
+    providers = adapter.list_providers()
+    assert [(p.id, p.name) for p in providers] == [
+        (526, "Dr. Alex Dean"),
+        (521, "Cindy Schubert"),
+    ]
+
+
+def test_book_stamps_voice_agent_notes(stub, client):
+    """Every booking gets a server-composed note: voice-agent provenance +
+    patient kind + slot, with any agent-supplied notes appended."""
+    posts: list[dict] = []
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-18", "10:00")))
+    stub.set("POST", "/appointments/", lambda p: (posts.append(p), StubResp(201, {}))[1])
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/book",
+        json={"event_type_id": 1, "start_date": "2026-06-18",
+              "start_time": "10:00", "patient_id": "316",
+              "notes": "Caller mentioned tinnitus, right side."},
+    )
+    assert resp.status_code == 200, resp.text
+    note = posts[0]["notes"]
+    assert "Booked via CORTEX voice agent" in note
+    assert "Existing patient" in note
+    assert "Hearing Test on 2026-06-18 at 10:00" in note
+    assert "Caller mentioned tinnitus, right side." in note  # agent note appended
+
+
+def test_book_notes_mark_new_patient(stub, client):
+    """The composed note distinguishes a QuickAdd new patient."""
+    posts: list[dict] = []
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-18", "10:00")))
+    stub.set("POST", "/appointments/", lambda p: (posts.append(p), StubResp(201, {}))[1])
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/book",
+        json={"event_type_id": 1, "start_date": "2026-06-18", "start_time": "10:00",
+              "first_name": "Jane", "last_name": "Doe", "phone": "5875550000"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "New patient" in posts[0]["notes"]
 
 
 def test_list_locations_endpoint_returns_locations_and_flag(stub, client):

@@ -7,9 +7,10 @@ clinic. Protocols generalize the legacy `Capability` framework — see
 `protocols/base.py` for the shape and `resources/protocols-design.md`
 for the design rationale.
 
-Active protocols (six toggleable + one always-on):
+Active protocols (seven toggleable + one always-on):
 
   - `VerifyCallerIdentificationProtocol`   (Blueprint, Audit Data)
+  - `RetrievePatientContextProtocol`       (Blueprint) journal/history context
   - `SearchAppointmentAvailabilityProtocol`  multi-tool: list types + find slots
   - `LocateAppointmentProtocol`            (Blueprint)
   - `BookAppointmentProtocol`              (Blueprint)
@@ -33,6 +34,9 @@ from api.voice_agent.protocols.book_appointment import BookAppointmentProtocol
 from api.voice_agent.protocols.cancel_appointment import CancelAppointmentProtocol
 from api.voice_agent.protocols.locate_appointment import LocateAppointmentProtocol
 from api.voice_agent.protocols.reschedule_appointment import RescheduleAppointmentProtocol
+from api.voice_agent.protocols.retrieve_patient_context import (
+    RetrievePatientContextProtocol,
+)
 from api.voice_agent.protocols.search_appointment_availability import (
     SearchAppointmentAvailabilityProtocol,
 )
@@ -48,6 +52,7 @@ from api.voice_agent.protocols.verify_caller_identification import (
 PROTOCOL_REGISTRY: dict[str, type[Protocol]] = {
     SubmitTicketProtocol.id:                  SubmitTicketProtocol,
     VerifyCallerIdentificationProtocol.id:    VerifyCallerIdentificationProtocol,
+    RetrievePatientContextProtocol.id:        RetrievePatientContextProtocol,
     SearchAppointmentAvailabilityProtocol.id: SearchAppointmentAvailabilityProtocol,
     LocateAppointmentProtocol.id:             LocateAppointmentProtocol,
     BookAppointmentProtocol.id:               BookAppointmentProtocol,
@@ -62,6 +67,7 @@ PROTOCOL_REGISTRY: dict[str, type[Protocol]] = {
 # assembled system prompt.
 PROTOCOL_METADATA: list[type[Protocol]] = [
     VerifyCallerIdentificationProtocol,
+    RetrievePatientContextProtocol,
     SearchAppointmentAvailabilityProtocol,
     LocateAppointmentProtocol,
     BookAppointmentProtocol,
@@ -165,6 +171,7 @@ __all__ = [
     "BookAppointmentProtocol",
     "CancelAppointmentProtocol",
     "RescheduleAppointmentProtocol",
+    "RetrievePatientContextProtocol",
     "PROTOCOL_REGISTRY",
     "PROTOCOL_METADATA",
     "PROTOCOL_METADATA_BY_ID",

@@ -28,10 +28,12 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api.deps import require_read_access, verify_token
+from api.deps import require_read_access, require_write_access, verify_token
 from api.core.db import get_session
+from api.core.orm import ClinicBlueprintEntityNote
 from api.core.secrets import get_secret
 from api.voice_agent.pms.blueprint import (
     BlueprintAdapter,
@@ -145,6 +147,17 @@ class BookingResultResponse(BaseModel):
 
 # ── Admin endpoint ────────────────────────────────────────────────────────────
 
+def _entity_notes_map(db: Session, clinic_id: str) -> dict[tuple[str, int], str]:
+    """Return {(entity_kind, entity_id): note} for a clinic's saved annotations
+    on Blueprint appointment types / providers."""
+    rows = db.scalars(
+        select(ClinicBlueprintEntityNote).where(
+            ClinicBlueprintEntityNote.clinic_id == clinic_id
+        )
+    ).all()
+    return {(r.entity_kind, r.entity_id): r.note for r in rows}
+
+
 @router.get("/{clinic_id}/clinic-config")
 def get_clinic_config(
     clinic_id: str,
@@ -153,6 +166,10 @@ def get_clinic_config(
 ):
     """
     Fetch Blueprint clinic configuration: appointment types, providers, locations.
+
+    Each appointment type and provider carries a ``note`` — the admin-attached
+    free-text annotation (empty string when none), so the dashboard can render
+    and edit it inline.
     """
     clinic = _get_blueprint_config(db, clinic_id)
     require_read_access(clinic["instance_id"], caller)
@@ -165,6 +182,7 @@ def get_clinic_config(
     )
     resp.raise_for_status()
     data = resp.json()
+    notes = _entity_notes_map(db, clinic_id)
 
     return {
         "appointment_types": [
@@ -173,6 +191,7 @@ def get_clinic_config(
                 "name": t.get("name"),
                 "duration_minutes": t.get("duration"),
                 "description": t.get("description", ""),
+                "note": notes.get(("appointment_type", t["id"]), ""),
             }
             for t in data.get("appointmentTypes", [])
         ],
@@ -184,6 +203,7 @@ def get_clinic_config(
                 "job_title": p.get("jobTitle"),
                 "qualifications": p.get("qualifications"),
                 "location_ids": p.get("locations", []),
+                "note": notes.get(("provider", p["id"]), ""),
             }
             for p in data.get("providers", [])
         ],
@@ -197,6 +217,59 @@ def get_clinic_config(
             for loc in data.get("locations", [])
         ],
     }
+
+
+class EntityNoteRequest(BaseModel):
+    entity_kind: Literal["appointment_type", "provider"]
+    entity_id: int
+    note: str   # blank/whitespace clears (deletes) the note
+
+
+class EntityNoteResponse(BaseModel):
+    entity_kind: Literal["appointment_type", "provider"]
+    entity_id: int
+    note: str
+
+
+@router.put("/{clinic_id}/notes", response_model=EntityNoteResponse)
+def upsert_entity_note(
+    clinic_id: str,
+    body: EntityNoteRequest,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """
+    Attach / update / clear an admin note on a Blueprint appointment type or
+    provider. A blank note deletes the row. The note is merged into the voice
+    agent's Clinic Reference prompt on the clinic's next sync.
+    """
+    clinic = _get_blueprint_config(db, clinic_id)
+    require_write_access(clinic["instance_id"], caller)
+
+    note = body.note.strip()
+    row = db.scalar(
+        select(ClinicBlueprintEntityNote).where(
+            ClinicBlueprintEntityNote.clinic_id == clinic_id,
+            ClinicBlueprintEntityNote.entity_kind == body.entity_kind,
+            ClinicBlueprintEntityNote.entity_id == body.entity_id,
+        )
+    )
+    if not note:
+        if row is not None:
+            db.delete(row)
+    elif row is not None:
+        row.note = note
+    else:
+        db.add(ClinicBlueprintEntityNote(
+            clinic_id=clinic_id,
+            entity_kind=body.entity_kind,
+            entity_id=body.entity_id,
+            note=note,
+        ))
+    # get_session commits on return.
+    return EntityNoteResponse(
+        entity_kind=body.entity_kind, entity_id=body.entity_id, note=note,
+    )
 
 
 # ── VAPI tool endpoints ───────────────────────────────────────────────────────
@@ -561,6 +634,51 @@ class PatientMatchResponse(BaseModel):
     status: Literal["matched", "ambiguous", "unmatched"]
     patient_id: str | None = None
     candidates_count: int
+
+
+class PatientJournalRequest(BaseModel):
+    patient_id: str
+
+
+class JournalEntryItem(BaseModel):
+    entry_time: str
+    entry_type: str | None = None
+    text: str
+
+
+class PatientJournalResponse(BaseModel):
+    entries: list[JournalEntryItem]
+
+
+@router.post("/{clinic_id}/patient/journal", response_model=PatientJournalResponse)
+def get_patient_journal(
+    clinic_id: str,
+    body: PatientJournalRequest,
+    _: None = Depends(verify_vapi_secret),
+):
+    """
+    Recent patient journal entries for an identified caller — background
+    context for the voice agent.
+
+    **The _clinic_id filter is mandatory and non-negotiable** — same PHI
+    isolation rule as patient/match. Only call this after
+    verify_caller_identification returned 'matched'; ``patient_id`` is the
+    opaque id it returned. The BQ query (bounds: non-deleted, last 24 months,
+    10 most recent) lives in ``BlueprintAdapter.get_patient_journal``; this
+    endpoint is the HTTP boundary and (like patient/match) needs no Cloud SQL.
+    """
+    adapter = BlueprintAdapter(clinic_id=clinic_id)
+    entries = adapter.get_patient_journal(patient_id=body.patient_id)
+    return PatientJournalResponse(
+        entries=[
+            JournalEntryItem(
+                entry_time=e.entry_time,
+                entry_type=e.entry_type,
+                text=e.text,
+            )
+            for e in entries
+        ]
+    )
 
 
 @router.post("/{clinic_id}/patient/match", response_model=PatientMatchResponse)
