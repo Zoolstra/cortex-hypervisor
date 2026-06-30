@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from api.audit import log_phi_access
 from api.deps import require_read_access, require_write_access, verify_token
 from api.core.db import get_session
 from api.core.orm import ClinicBlueprintEntityNote
@@ -506,6 +507,13 @@ def locate_appointment(
         days_back=body.days_back,
         days_ahead=body.days_ahead,
     )
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="appointment_locate",
+        patient_id=body.patient_id,
+        outcome="ok",
+        detail=f"appointments={len(appts)}",
+    )
     return LocateAppointmentResponse(
         appointments=[
             LocateAppointmentItem(
@@ -669,6 +677,13 @@ def get_patient_journal(
     """
     adapter = BlueprintAdapter(clinic_id=clinic_id)
     entries = adapter.get_patient_journal(patient_id=body.patient_id)
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="patient_journal",
+        patient_id=body.patient_id,
+        outcome="ok",
+        detail=f"entries={len(entries)}",
+    )
     return PatientJournalResponse(
         entries=[
             JournalEntryItem(
@@ -706,6 +721,13 @@ def match_patient_by_name(
         last_name=body.last_name,
         last4_phone=body.last4_phone,
         dob=body.dob,
+    )
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="patient_match",
+        patient_id=result.patient_id,
+        outcome=result.status,
+        detail=f"candidates={result.candidates_count}",
     )
     return PatientMatchResponse(
         status=result.status,

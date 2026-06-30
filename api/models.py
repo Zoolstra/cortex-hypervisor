@@ -85,6 +85,9 @@ class InstanceUpdate(BaseModel):
     primary_contact_email: Optional[str] = None
     google_ads_customer_id: Optional[str] = None
     invoca_profile_id: Optional[str] = None
+    # Capability flag for the multi-location Group Intelligence section. Toggled
+    # by super_admins; None = leave unchanged (update_instance drops None values).
+    multi_location_group: Optional[bool] = None
 
     @field_validator(
         "primary_contact_name", "primary_contact_email",
@@ -112,6 +115,7 @@ class ClinicUpdate(BaseModel):
     country: Optional[str] = None
     gbp_location_id: Optional[str] = None
     etl_enabled: Optional[bool] = None
+    tier: Optional[Literal["none", "bridge", "growth"]] = None
 
     @field_validator(
         "address", "phone", "email", "place_id", "about_us",
@@ -159,6 +163,53 @@ class PmsConfigSet(BaseModel):
     Secrets are passed in `secrets` and stored in Secret Manager under
     `clinic_{clinic_id}_blueprint_{key}` for Blueprint clinics. Never in the DB.
     """
-    pms_type: Literal["none", "blueprint", "audit_data"]
+    pms_type: Literal["none", "blueprint", "counselear", "audit_data"]
     config: Optional[dict] = None
     secrets: Optional[dict] = None
+
+
+# ── Webforms ──────────────────────────────────────────────────────────────────
+
+class WebformSubmission(BaseModel):
+    """A single web-form submission relayed from one of our clinic sites.
+
+    Posted server-to-server to ``POST /webforms`` with the global
+    ``X-Webform-Secret`` header. ``clinic_id`` routes the row to a clinic
+    (validated against Cloud SQL before any write); every other field is
+    optional so partial captures still land. Blank strings are normalised to
+    None so BigQuery stores NULL rather than "".
+    """
+    clinic_id: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    email: Optional[str] = None
+    utm_source: Optional[str] = None
+    utm_medium: Optional[str] = None
+    utm_campaign: Optional[str] = None
+    utm_term: Optional[str] = None
+    utm_content: Optional[str] = None
+    gclid: Optional[str] = None          # Google Ads click id
+    fbclid: Optional[str] = None         # Meta click id
+    landing_page: Optional[str] = None
+    customer_type: Optional[str] = None  # e.g. "New Customer" / "Returning Customer"
+    message: Optional[str] = None        # free-text "How can we help?" intent
+
+    @field_validator("clinic_id")
+    @classmethod
+    def _v_clinic_id(cls, v):
+        return _require_non_empty(v, "clinic_id")
+
+    @field_validator(
+        "first_name", "last_name", "phone_number", "email",
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "gclid", "fbclid", "landing_page",
+        "customer_type", "message",
+    )
+    @classmethod
+    def _v_optional(cls, v):
+        """Trim whitespace; collapse blank strings to None."""
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None

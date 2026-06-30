@@ -30,6 +30,8 @@ logging.getLogger(__name__).info(
 from api.account import routers as account_routers  # noqa: E402 — after basicConfig
 from api.voice_agent import routers as voice_agent_routers  # noqa: E402
 from api.intelligence import router as intelligence_router  # noqa: E402
+from api.worklists import router as worklists_router  # noqa: E402
+from api.webforms import router as webforms_router  # noqa: E402
 
 app = FastAPI()
 
@@ -56,5 +58,8 @@ def hello():
 # GET /clinics/{id}/voice_agent) and 404s on the literal "voice_agent" being
 # looked up as a clinic_id. FastAPI tries routes in registration order;
 # voice-agent's literal-segment routes are more specific, so they go first.
-for r in voice_agent_routers + account_routers + [intelligence_router]:
+# worklists_router is registered before account_routers for the same reason as
+# voice-agent: its literal "/clinics/{id}/worklists/..." routes are more
+# specific than account's wildcard "/clinics/{instance_id}/{clinic_id}".
+for r in voice_agent_routers + [worklists_router] + account_routers + [intelligence_router, webforms_router]:
     app.include_router(r)

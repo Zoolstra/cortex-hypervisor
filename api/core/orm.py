@@ -45,6 +45,11 @@ class Instance(Base):
     primary_contact_uid: Mapped[str | None] = mapped_column(String(128))
     google_ads_customer_id: Mapped[str | None] = mapped_column(String(32))
     invoca_profile_id: Mapped[str | None] = mapped_column(String(32))
+    # Capability flag: unlocks the multi-location "Group Intelligence" analytics
+    # section (the leaderboard across all of an instance's clinics). Off by
+    # default; flipped on per instance (currently Virsono). See migration 0013.
+    multi_location_group: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="0")
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
@@ -76,10 +81,16 @@ class Clinic(Base):
     place_id: Mapped[str | None] = mapped_column(String(255))
     gbp_location_id: Mapped[str | None] = mapped_column(String(64))
     pms_type: Mapped[str] = mapped_column(
-        Enum("blueprint", "audit_data", "none", name="pms_type_enum"),
+        Enum("blueprint", "counselear", "audit_data", "none", name="pms_type_enum"),
         nullable=False, server_default="none",
     )
     etl_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="0")
+    # Service tier — drives which System-Performance KPI the Intelligence
+    # Overview emphasises (bridge → revenue/clinic-hour, growth → cost/contact).
+    tier: Mapped[str] = mapped_column(
+        Enum("none", "bridge", "growth", name="tier_enum"),
+        nullable=False, server_default="none",
+    )
     country: Mapped[str | None] = mapped_column(CHAR(2))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -100,6 +111,9 @@ class Clinic(Base):
         back_populates="clinic", uselist=False, cascade="all, delete-orphan"
     )
     blueprint_config: Mapped["ClinicBlueprintConfig"] = relationship(
+        back_populates="clinic", uselist=False, cascade="all, delete-orphan"
+    )
+    counselear_config: Mapped["ClinicCounselEarConfig"] = relationship(
         back_populates="clinic", uselist=False, cascade="all, delete-orphan"
     )
     voice_agent_script: Mapped["ClinicVoiceAgentScript"] = relationship(
@@ -228,6 +242,47 @@ class ClinicBlueprintConfig(Base):
     )
 
     clinic: Mapped["Clinic"] = relationship(back_populates="blueprint_config")
+
+
+# ──────────────────── clinic_counselear_config (1:1) ────────────────────
+
+class ClinicCounselEarConfig(Base):
+    """Maps a CORTEX clinic to its identifiers in the CounselEar SFTP feed.
+
+    CounselEar delivers one combined feed per *practice* (SFTP location folder),
+    with each row tagged by CounselEar's own per-clinic id. Ingest needs both:
+      - ``counselear_location_code`` — the ``upload/<code>/`` folder this clinic's
+        files arrive under (the per-practice export id, e.g. "105333").
+      - ``counselear_clinic_id`` — CounselEar's per-row "Clinic ID" (e.g. "10797"),
+        the value the ETL matches against to resolve a feed row to this clinic.
+
+    Multiple clinics of one practice share a location code but have distinct
+    clinic ids, so the ETL can split a single feed across CORTEX clinics.
+    """
+    __tablename__ = "clinic_counselear_config"
+
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    counselear_location_code: Mapped[str | None] = mapped_column(String(64))
+    counselear_clinic_id: Mapped[str | None] = mapped_column(String(64))
+    # SFTP login the practice's feed is delivered under (one account per
+    # practice, chrooted to its upload/ root). The SFTP password lives in Secret
+    # Manager under "<Username>_COUNSELEAR_SFTP_password" per provision_sftp.sh.
+    counselear_sftp_username: Mapped[str | None] = mapped_column(String(64))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="counselear_config")
 
 
 # ──────────────────── clinic_voice_agent_script (1:1) ────────────────────

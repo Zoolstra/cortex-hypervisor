@@ -10,10 +10,10 @@ text, Lora serif headings, gold accent. Two sections render real data today:
     03 — Patient & product  (status mix, line-item revenue split)
     04 — Inbound calls      (only when linked Invoca campaigns exist)
 
-The Google Ads ROI cascade and transcript analysis sections from the Virsono
-report are stubbed with "coming soon" cards — they'll land in a follow-up
-session once we've decided how to handle clinics with mixed/missing form
-data.
+The Google Ads ROI cascade (§06) is now wired to ``queries.google_ads_roi`` —
+per-campaign spend → clicks → calls → bookings → revenue/ROAS. The transcript
+analysis drill-down sections from the Virsono report remain on the separate
+"Leads" surface (``api/worklists.py``) rather than this pushed analytics report.
 """
 from __future__ import annotations
 
@@ -327,6 +327,72 @@ def _funnel_sankey(funnel: dict, channel_mix: list[tuple[str, int, str]]) -> str
         plot_bgcolor=_CX_CREAM,
         font=dict(family="Geist, system-ui, sans-serif", color=_CX_NAVY, size=12),
         height=540,
+        margin=dict(t=14, r=24, b=14, l=24),
+    )
+    return fig.to_html(
+        include_plotlyjs="cdn",
+        full_html=False,
+        config={"displayModeBar": False},
+    )
+
+
+def _webform_funnel_sankey(funnel: dict) -> str:
+    """Plotly Sankey for the web-form funnel: UTM source ▶ Submissions ▶ Invoiced.
+
+    Left column = one node per UTM source (value = submissions), funnelling into
+    a Submissions pool, then splitting into Invoiced (green, converted to a
+    paying patient) and No Invoice Match (faded grey drop-off). Mirrors
+    :func:`_funnel_sankey`'s construction and styling.
+    """
+    sources_data = funnel.get("sources", [])
+    total_sub = int(funnel.get("total_submissions", 0))
+    total_inv = int(funnel.get("total_invoiced", 0))
+    if total_sub == 0:
+        return '<div class="stub">No web-form submissions in the window — funnel hidden.</div>'
+
+    n = len(sources_data)
+    submissions_idx = n
+    invoiced_idx    = n + 1
+    no_inv_idx      = n + 2
+
+    labels = [s["source"] for s in sources_data] + [
+        "Submissions", "Invoiced", "No Invoice Match",
+    ]
+    # Source nodes navy, Submissions gold, Invoiced green, drop-off grey line.
+    colors = [_CX_NAVY_3] * n + [_CX_GOLD, _CX_GREEN, _CX_LINE]
+
+    GOLD = "rgba(212,146,10,0.40)"
+    WIN  = "rgba(26,135,84,0.55)"
+    LOST = "rgba(201,212,222,0.45)"
+
+    sources: list[int] = []
+    targets: list[int] = []
+    values: list[int] = []
+    link_colors: list[str] = []
+
+    def add(s: int, t: int, v: int, color: str) -> None:
+        if v > 0:
+            sources.append(s); targets.append(t); values.append(v); link_colors.append(color)
+
+    for i, s in enumerate(sources_data):
+        add(i, submissions_idx, int(s["submissions"]), "rgba(22,42,80,0.30)")
+    add(submissions_idx, invoiced_idx, total_inv, WIN)
+    add(submissions_idx, no_inv_idx, total_sub - total_inv, LOST)
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=18, thickness=22,
+            line=dict(color=_CX_NAVY, width=0.5),
+            label=labels, color=colors,
+        ),
+        link=dict(source=sources, target=targets, value=values, color=link_colors),
+    ))
+    fig.update_layout(
+        paper_bgcolor=_CX_CREAM,
+        plot_bgcolor=_CX_CREAM,
+        font=dict(family="Geist, system-ui, sans-serif", color=_CX_NAVY, size=12),
+        height=420,
         margin=dict(t=14, r=24, b=14, l=24),
     )
     return fig.to_html(
@@ -678,11 +744,217 @@ def _section_acquisition(
     )
 
 
+def _headline_fallback(m: dict) -> str:
+    """Deterministic one-liner if the LLM is unavailable: lead with the biggest
+    month-over-month mover among the rates / revenue."""
+    last, prior = m["last"], m["prior"]
+    ll, pl = last["label"], prior["label"]
+    moves = []  # (name, prior, last, is_rate)
+    if last["capture_rate"] is not None and prior["capture_rate"] is not None:
+        moves.append(("Phone call capture rate", prior["capture_rate"], last["capture_rate"], True))
+    if last["form_rate"] is not None and prior["form_rate"] is not None:
+        moves.append(("Form response rate", prior["form_rate"], last["form_rate"], True))
+    if prior["revenue"] and last["revenue"]:
+        moves.append(("Revenue", prior["revenue"], last["revenue"], False))
+    if not moves:
+        return f"Not enough month-over-month data to call a headline for {ll} yet."
+    name, p, l, is_rate = max(moves, key=lambda x: abs((x[2] - x[1]) / x[1]) if x[1] else 0)
+    direction = "up" if l >= p else "down"
+    if is_rate:
+        return (f"{name} moved {direction} from {p * 100:.0f}% to {l * 100:.0f}% "
+                f"in {ll} versus {pl} — the number to watch this month.")
+    pct = abs((l - p) / p) * 100 if p else 0
+    return f"Revenue is {direction} {pct:.0f}% in {ll} versus {pl} — the headline read this month."
+
+
+def _headline_sentence(clinic_name: str, m: dict) -> str:
+    """One-sentence 'the thing that matters' read, written by Claude from the
+    month-over-month numbers. Falls back to a deterministic line on any failure
+    so the report never breaks."""
+    fallback = _headline_fallback(m)
+    last, prior = m["last"], m["prior"]
+
+    def pct(v):
+        return f"{v * 100:.0f}%" if v is not None else "n/a"
+
+    facts = (
+        f"Clinic: {clinic_name}. Month-over-month, comparing {last['label']} "
+        f"(most recent full month) to {prior['label']}.\n"
+        f"- Phone call capture rate (booked / connected calls): "
+        f"{pct(prior['capture_rate'])} -> {pct(last['capture_rate'])} "
+        f"({prior['connected']} -> {last['connected']} connected, "
+        f"{prior['booked']} -> {last['booked']} booked).\n"
+        f"- Form response rate (submissions with a later appointment / submissions): "
+        f"{pct(prior['form_rate'])} -> {pct(last['form_rate'])} "
+        f"({prior['submissions']} -> {last['submissions']} submissions).\n"
+        f"- Total inbound calls: {prior['calls']} -> {last['calls']}.\n"
+        f"- Invoiced revenue: ${prior['revenue']:,.0f} -> ${last['revenue']:,.0f}."
+    )
+    prompt = (
+        "You are writing the single headline read for a hearing-clinic owner's "
+        "monthly report. From the month-over-month figures below, write ONE "
+        "sentence (max 30 words) naming the most important thing that changed: "
+        "lead with the direction/trend, plain language, a specific number, no "
+        "preamble, no hedging. Return only the sentence.\n\n" + facts
+    )
+    try:
+        import anthropic
+        from api.core.secrets import get_secret
+        key = (get_secret("anthropic-api-key") or "").strip()
+        if not key:
+            return fallback
+        client = anthropic.Anthropic(api_key=key, timeout=12.0)
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=90,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+        return text or fallback
+    except Exception as e:
+        log.warning("headline LLM failed clinic=%s: %s", clinic_name, e)
+        return fallback
+
+
+def _section_headline(
+    clinic_id: str,
+    clinic_name: str,
+    invoca_campaign_ids: list[str],
+) -> str:
+    """Top-of-report headline: the one thing that matters + the MoM KPI band.
+
+    Compares the last fully-elapsed month to the month before it. KPIs: phone
+    call capture rate and form response rate (voicemail response rate is deferred
+    until calls are classified for voicemail). The lead sentence is LLM-written.
+    """
+    m = q.headline_metrics(clinic_id, invoca_campaign_ids)
+    last, prior = m["last"], m["prior"]
+
+    has_calls = bool(last["connected"] or prior["connected"])
+    has_forms = bool(last["submissions"] or prior["submissions"])
+    if not has_calls and not has_forms:
+        body = (
+            '<div class="empty">Not enough call or web-form activity in '
+            f'{prior["label"]}–{last["label"]} to compute a month-over-month headline.</div>'
+        )
+        return _section(0, "The headline", f"{last['label']} vs {prior['label']}", body)
+
+    def kpi(label: str, p, l, denom_note: str) -> str:
+        if l is None and p is None:
+            return _stat(label, "—", denom_note)
+        value = f"{l * 100:.0f}%" if l is not None else "—"
+        if p is not None and l is not None:
+            delta = (l - p) * 100
+            arrow = "▲" if delta >= 0 else "▼"
+            sub = f"{p * 100:.0f}% → {l * 100:.0f}%   {arrow} {abs(delta):.0f} pts"
+        elif p is not None:
+            sub = f"was {p * 100:.0f}% · no data {last['label']}"
+        else:
+            sub = denom_note
+        return _stat(label, value, sub)
+
+    sentence = _headline_sentence(clinic_name, m)
+
+    cards = '<div class="stats" style="margin-top:16px;">'
+    if has_calls:
+        cards += kpi("Phone call capture rate", prior["capture_rate"], last["capture_rate"],
+                     "booked ÷ connected calls")
+    if has_forms:
+        cards += kpi("Form response rate", prior["form_rate"], last["form_rate"],
+                     "submissions with a later appt ÷ submissions")
+    cards += "</div>"
+
+    voicemail_note = (
+        '<p class="lede" style="margin-top:12px;color:var(--cx-mute);font-size:12px;">'
+        "Voicemail response rate is coming once calls are classified for voicemail.</p>"
+    )
+    headline_read = (
+        f'<p style="font-family:Georgia,\'Times New Roman\',serif;font-size:22px;'
+        f'line-height:1.4;color:var(--cx-navy);margin:6px 0 0;">{escape(sentence)}</p>'
+    )
+    body = headline_read + cards + voicemail_note
+    return _section(
+        0, "The headline",
+        f"The one read that matters · {last['label']} vs {prior['label']} (month over month)",
+        body,
+    )
+
+
+def _utm_filter_control(
+    sources: list[dict],
+    mediums: list[dict],
+    cur_sources: list[str],
+    cur_mediums: list[str],
+) -> str:
+    """Multi-select filter for the call funnel: pick any ``utm_source`` and/or
+    ``utm_medium`` values to include. "Apply" posts the selection up to the parent
+    frame (the report is a srcDoc iframe with no navigable URL of its own), which
+    re-fetches with ``?utm_source=&utm_medium=``.
+    """
+    def boxes(cls: str, options: list[dict], current: list[str]) -> str:
+        cur = set(current)
+        items = []
+        for o in options:
+            v = o["value"]
+            checked = " checked" if v in cur else ""
+            items.append(
+                '<label style="display:inline-flex;align-items:center;gap:4px;'
+                'margin:0 10px 6px 0;font-size:13px;color:var(--cx-navy);white-space:nowrap;">'
+                f'<input type="checkbox" class="{cls}" value="{escape(v)}"{checked}>'
+                f'{escape(v)} <span style="color:var(--cx-mute);">({_fmt_int(o["calls"])})</span>'
+                '</label>'
+            )
+        return "".join(items) or '<span style="color:var(--cx-mute);font-size:13px;">none</span>'
+
+    # Single-quoted JS so it sits inside double-quoted attributes unescaped.
+    collect = ("(function(){var g=function(c){return [].slice.call("
+               "document.querySelectorAll(c)).map(function(x){return x.value})};"
+               "parent.postMessage({type:'cortex:utm-filter',"
+               "sources:g('.cx-utm-src:checked'),mediums:g('.cx-utm-med:checked')},'*')})()")
+    clear = ("(function(){[].slice.call(document.querySelectorAll('.cx-utm-src,.cx-utm-med'))"
+             ".forEach(function(x){x.checked=false});"
+             "parent.postMessage({type:'cortex:utm-filter',sources:[],mediums:[]},'*')})()")
+
+    btn = ("font-family:inherit;font-size:12px;font-weight:600;padding:5px 12px;"
+           "border-radius:6px;border:1px solid var(--cx-line);cursor:pointer;")
+    return (
+        '<div style="border:1px solid var(--cx-line);border-radius:8px;padding:12px 14px;'
+        'margin-bottom:16px;background:#fff;">'
+        '<div style="font-size:12px;font-weight:600;color:var(--cx-navy);margin-bottom:8px;">'
+        'Filter calls to include &nbsp;'
+        '<span style="font-weight:400;color:var(--cx-mute);">'
+        '(source AND medium; leave a row empty for no constraint)</span></div>'
+        '<div style="margin-bottom:4px;"><span style="display:inline-block;min-width:62px;'
+        'font-size:12px;color:var(--cx-mute);">Sources</span>'
+        + boxes("cx-utm-src", sources, cur_sources) + '</div>'
+        '<div style="margin-bottom:10px;"><span style="display:inline-block;min-width:62px;'
+        'font-size:12px;color:var(--cx-mute);">Mediums</span>'
+        + boxes("cx-utm-med", mediums, cur_mediums) + '</div>'
+        f'<button onclick="{collect}" style="{btn}background:var(--cx-gold,#d4920a);'
+        'color:#fff;border-color:transparent;">Apply filter</button> '
+        f'<button onclick="{clear}" style="{btn}background:#fff;color:var(--cx-navy);">Clear</button>'
+        '</div>'
+    )
+
+
+def _utm_filter_label(cur_sources: list[str], cur_mediums: list[str]) -> str:
+    bits = []
+    if cur_sources:
+        bits.append("source: " + ", ".join(cur_sources))
+    if cur_mediums:
+        bits.append("medium: " + ", ".join(cur_mediums))
+    return " · ".join(bits) if bits else "all calls"
+
+
 def _section_funnel(
     clinic_id: str,
     invoca_campaign_ids: list[str],
     google_ads_campaign_ids: list[str],
     days: int,
+    utm_sources: list[str] | None = None,
+    utm_mediums: list[str] | None = None,
 ) -> str:
     """End-to-end patient-acquisition funnel — Virsono methodology.
 
@@ -695,31 +967,91 @@ def _section_funnel(
     No-Conversation and Qualified-Lead-No-Conv drill-down buttons are kept and
     derived from the callscoring crosstab (orthogonal to the Invoca-flag-driven
     Sankey).
+
+    Web-form submissions (``ClinicData.webforms``) are surfaced as a lead source
+    *parallel* to inbound calls in a top-of-section band (total + new/returning),
+    so total leads = calls + form submissions. Form volume is shown even when the
+    clinic has no linked Invoca campaigns or no calls; it is not (yet) threaded
+    into the call→booking→invoice Sankey.
     """
+    forms = q.webform_submissions(clinic_id, days=days)
+    form_total = int(forms.get("total", 0))
+
+    # Normalize the multi-select UTM filters (lowercase/trim/dedupe, drop blanks).
+    utm_sources = q._utm_clean(utm_sources)
+    utm_mediums = q._utm_clean(utm_mediums)
+
+    # Filter options (only meaningful with linked Invoca campaigns).
+    src_opts = (
+        q.funnel_utm_sources(clinic_id, invoca_campaign_ids, days=days)
+        if invoca_campaign_ids else []
+    )
+    med_opts = (
+        q.funnel_utm_mediums(clinic_id, invoca_campaign_ids, days=days)
+        if invoca_campaign_ids else []
+    )
+    filter_control = (
+        _utm_filter_control(src_opts, med_opts, utm_sources, utm_mediums)
+        if invoca_campaign_ids else ""
+    )
+    filtered = bool(utm_sources or utm_mediums)
+
+    def _lead_sources_band(calls: int) -> str:
+        """Top-of-funnel summary: web-form leads alongside inbound calls.
+
+        Volume only — web-form revenue attribution lives in its own section
+        (``_section_webform_revenue``)."""
+        if form_total <= 0:
+            return ""
+        bits = []
+        if forms.get("new"):
+            bits.append(f"{_fmt_int(int(forms['new']))} new")
+        if forms.get("returning"):
+            bits.append(f"{_fmt_int(int(forms['returning']))} returning")
+        form_sub = " · ".join(bits) if bits else f"last {days}d"
+        return (
+            '<div class="stats">'
+            + _stat("Web form submissions", _fmt_int(form_total), form_sub)
+            + _stat("Inbound calls", _fmt_int(calls), f"non-spam · last {days}d")
+            + _stat("Total leads", _fmt_int(calls + form_total), "calls + web forms")
+            + "</div>"
+        )
+
+    _lede = (
+        "Web-form and call lead sources, then the call funnel: channel mix → "
+        "call → connected → discussed → booked → invoiced."
+    )
+
     if not invoca_campaign_ids:
-        body = (
+        note = (
             '<div class="stub">'
             '<b>No Invoca campaigns linked.</b> Link campaigns from '
-            '<em>Manage instance → Campaigns</em> and the funnel will render.'
+            '<em>Manage instance → Campaigns</em> and the call funnel will render.'
             '</div>'
         )
+        band = _lead_sources_band(0)
         return _section(
-            3, "Funnel · end-to-end patient acquisition",
-            "Channel mix → call → connected → discussed → booked → invoiced.",
-            body,
+            3, "Funnel · end-to-end patient acquisition", _lede,
+            (band + note) if band else note,
         )
 
     funnel = q.revenue_funnel(
         clinic_id, google_ads_campaign_ids, invoca_campaign_ids, days=days,
+        utm_sources=utm_sources, utm_mediums=utm_mediums,
     )
     calls = int(funnel.get("calls", 0))
 
     if calls == 0:
-        body = '<div class="empty">No calls in the window — funnel hidden.</div>'
+        band = _lead_sources_band(0)
+        note = (
+            f'<div class="empty">No calls for <b>{escape(_utm_filter_label(utm_sources, utm_mediums))}</b> '
+            'in the window — adjust the filter below.</div>'
+            if filtered else
+            '<div class="empty">No calls in the window — call funnel hidden.</div>'
+        )
         return _section(
-            3, "Funnel · end-to-end patient acquisition",
-            "Channel mix → call → connected → discussed → booked → invoiced.",
-            body,
+            3, "Funnel · end-to-end patient acquisition", _lede,
+            band + filter_control + note,
         )
 
     spam      = int(funnel.get("spam", 0))
@@ -730,7 +1062,8 @@ def _section_funnel(
     revenue   = float(funnel.get("matched_revenue", 0.0))
 
     channels = _bucket_channel_mix(
-        q.channel_mix(clinic_id, invoca_campaign_ids, days=days)
+        q.channel_mix(clinic_id, invoca_campaign_ids, days=days,
+                      utm_sources=utm_sources, utm_mediums=utm_mediums)
     )
 
     # Drill-down button gating — callscoring-based, orthogonal to the Sankey.
@@ -771,10 +1104,13 @@ def _section_funnel(
             '</p>'
         )
 
+    rev_scope = (
+        f"{_utm_filter_label(utm_sources, utm_mediums)} · last {days}d" if filtered
+        else f"invoices for matched patients · last {days}d"
+    )
     revenue_stats = (
         '<div class="stats" style="margin-top:18px;">'
-        + _stat("Matched revenue", _fmt_money(revenue),
-                f"invoices for matched patients · last {days}d")
+        + _stat("Matched revenue", _fmt_money(revenue), rev_scope)
         + _stat("Avg per invoiced call",
                 _fmt_money(revenue / invoiced) if invoiced else "—")
         + "</div>"
@@ -782,8 +1118,11 @@ def _section_funnel(
 
     sankey = _funnel_sankey(funnel, channels)
 
+    lead_band = _lead_sources_band(calls)
     body = (
-        stage_stats
+        lead_band
+        + filter_control
+        + stage_stats
         + spam_note
         + '<div style="margin-top:18px;">' + sankey + "</div>"
         + revenue_stats
@@ -791,10 +1130,286 @@ def _section_funnel(
     return _section(
         3,
         "Funnel · end-to-end patient acquisition",
-        "This funnel shows the marketing channels that drove calls and where "
-        "each call ended up — connected, booked, and ultimately invoiced — or "
-        "where it dropped off along the way.",
+        "Web-form and call lead sources, then where each call ended up — "
+        "connected, booked, and ultimately invoiced — or where it dropped off "
+        "along the way.",
         body,
+    )
+
+
+def _section_webform_revenue(clinic_id: str, days: int) -> str:
+    """Web-form funnel — UTM source → submissions → invoice (its own section).
+
+    Submitters in ``ClinicData.webforms`` are matched to Blueprint patients by
+    phone or email; invoices dated on/after the submission convert them. The
+    funnel Sankey breaks submissions down by UTM source and shows how many flow
+    through to a paying patient; a per-source table carries the numbers. This is
+    correlational attribution — it credits forms whose submitter later
+    transacted, not proof the form drove the visit.
+    """
+    title = "Web-form funnel · UTM → submissions → invoice"
+    lede = (
+        "Where web-form leads come from (UTM source), how many submit, and how "
+        "many convert to a paying patient — matched to Blueprint by phone or "
+        "email, invoices dated on or after submission. Correlational: it credits "
+        "forms whose submitter later transacted, not proof the form drove the visit."
+    )
+    forms = q.webform_submissions(clinic_id, days=days)
+    form_total = int(forms.get("total", 0))
+    if form_total == 0:
+        return _section(
+            4, title, lede,
+            '<div class="empty">No web-form submissions in the window.</div>',
+        )
+
+    rev = q.webform_revenue(clinic_id, days=days)
+    matched       = int(rev.get("matched_patients", 0))
+    invoiced      = int(rev.get("invoiced_patients", 0))
+    invoice_count = int(rev.get("invoice_count", 0))
+    revenue       = float(rev.get("attributed_revenue", 0.0))
+
+    stats = (
+        '<div class="stats">'
+        + _stat("Web-form submissions", _fmt_int(form_total), f"last {days}d")
+        + _stat("Matched patients", _fmt_int(matched),
+                f"{(100 * matched / form_total):.0f}% of submissions" if form_total else "")
+        + _stat("Invoiced patients", _fmt_int(invoiced),
+                f"{(100 * invoiced / matched):.0f}% of matched" if matched else "")
+        + _stat("Attributed revenue", _fmt_money(revenue),
+                f"{_fmt_int(invoice_count)} invoice{'' if invoice_count == 1 else 's'}")
+        + _stat("Avg per invoiced patient",
+                _fmt_money(revenue / invoiced) if invoiced else "—")
+        + "</div>"
+    )
+
+    # UTM source → submissions → invoice funnel.
+    funnel = q.webform_funnel(clinic_id, days=days)
+    sankey = _webform_funnel_sankey(funnel)
+
+    body = (
+        stats
+        + '<div style="margin-top:18px;">' + sankey + "</div>"
+    )
+    if matched == 0:
+        body += (
+            '<p class="lede" style="margin-top:14px;color:var(--cx-mute);">'
+            'No submitters matched a Blueprint patient — either Blueprint isn\'t '
+            'connected for this clinic or contact details didn\'t line up.</p>'
+        )
+    return _section(4, title, lede, body)
+
+
+def _trend_chart(
+    months: list[str],
+    series: list[tuple[str, list, str]],
+    y_title: str,
+    money: bool = False,
+) -> str:
+    """One Plotly line chart: ``series`` = [(name, values, color), …].
+
+    Series that are entirely zero are dropped. Returns a stub if nothing is
+    left to plot. ``money=True`` formats the y-axis as dollars.
+    """
+    active = [(n, v, c) for (n, v, c) in series if any(v)]
+    if not active:
+        return '<div class="empty">No data in the window.</div>'
+    fig = go.Figure()
+    for name, values, color in active:
+        fig.add_trace(go.Scatter(
+            x=months, y=values, name=name, mode="lines+markers",
+            line=dict(color=color, width=2.5), marker=dict(size=6),
+        ))
+    fig.update_layout(
+        paper_bgcolor=_CX_CREAM,
+        plot_bgcolor=_CX_CREAM,
+        font=dict(family="Geist, system-ui, sans-serif", color=_CX_NAVY, size=12),
+        height=320,
+        margin=dict(t=18, r=24, b=40, l=56),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hovermode="x unified",
+        xaxis=dict(showgrid=False),
+        yaxis=dict(title=y_title, rangemode="tozero",
+                   gridcolor="rgba(201,212,222,0.4)",
+                   tickprefix="$" if money else ""),
+    )
+    return fig.to_html(
+        include_plotlyjs="cdn", full_html=False,
+        config={"displayModeBar": False},
+    )
+
+
+def _section_monthly_trends(
+    clinic_id: str,
+    invoca_campaign_ids: list[str],
+    google_ads_campaign_ids: list[str],
+    days: int,
+) -> str:
+    """Monthly trends, split into four charts by stream and axis type.
+
+    Everything is bucketed by acquisition-event month (see
+    ``queries.monthly_trends``) so each month's leads sit with the bookings,
+    invoices and revenue they eventually produced — a cohort view:
+
+      1. Call stream volume   — calls, bookings, booking-attributed invoices
+      2. Call stream revenue  — revenue from those booking-attributed invoices
+      3. Web-form volume      — submissions, submissions with an associated booking
+      4. Web-form revenue     — revenue attributed to submitters
+    """
+    lede = (
+        "Month-over-month trends, bucketed by the month the lead came in. Calls, "
+        "bookings, and the invoices/revenue they drove are attributed back to the "
+        "call's month; web-form submissions, their associated bookings, and "
+        "revenue to the submission's month."
+    )
+    rows = q.monthly_trends(
+        clinic_id, invoca_campaign_ids, google_ads_campaign_ids, days=days,
+    )
+    if not rows:
+        return _section(
+            5, "Monthly trends", lede,
+            '<div class="empty">No monthly data in the window.</div>',
+        )
+
+    def _label(mo: str) -> str:  # "2026-05" → "May 2026"
+        y, m = mo.split("-")
+        return f"{_dt.date(int(y), int(m), 1):%b %Y}"
+
+    months = [_label(r["month"]) for r in rows]
+
+    def col(key: str) -> list:
+        return [r[key] for r in rows]
+
+    def _block(title: str, chart: str) -> str:
+        return (
+            f'<div style="font-weight:600;color:var(--cx-navy);'
+            f'margin:22px 0 6px;">{escape(title)}</div>{chart}'
+        )
+
+    chart1 = _trend_chart(months, [
+        ("Inbound calls", col("calls"),         _CX_GOLD),
+        ("Bookings",      col("bookings"),       _CX_GOLD_2),
+        ("Invoices",      col("call_invoices"),  _CX_NAVY_3),
+    ], "Count")
+    chart2 = _trend_chart(months, [
+        ("Call-stream revenue", col("call_revenue"), _CX_GREEN),
+    ], "Revenue", money=True)
+    chart3 = _trend_chart(months, [
+        ("Web-form submissions", col("submissions"),      _CX_MOSS),
+        ("Associated bookings",  col("webform_bookings"), _CX_GOLD_2),
+    ], "Count")
+    chart4 = _trend_chart(months, [
+        ("Web-form revenue", col("webform_revenue"), _CX_GREEN),
+    ], "Revenue", money=True)
+
+    body = (
+        _block("1 · Call stream — calls, bookings & attributed invoices", chart1)
+        + _block("2 · Call stream — attributed revenue", chart2)
+        + _block("3 · Web-form — submissions & associated bookings", chart3)
+        + _block("4 · Web-form — attributed revenue", chart4)
+    )
+    return _section(5, "Monthly trends · by stream", lede, body)
+
+
+def _section_roas(
+    clinic_id: str,
+    google_ads_campaign_ids: list[str],
+    days: int,
+) -> str:
+    """Per-campaign Google Ads ROI cascade: clicks → calls → bookings, with
+    spend/revenue/ROAS in each campaign's header.
+
+    Reads :func:`queries.google_ads_roi` — spend from ``ad_groups``, clicks from
+    ``ad_clicks_v2``, calls/bookings via GCLID → ``transactions`` →
+    ``callscoring.appointment_booked``, and revenue from GCLID-matched callers
+    phone-joined to Blueprint invoices. Everything here is campaign-level
+    aggregate — no PHI — so it's safe on the pushed analytics surface. ROAS is
+    revenue ÷ ad spend (the retainer is deliberately excluded; ads are judged on
+    ad spend alone). Renders an explanatory stub when the clinic has no linked
+    Google Ads campaigns or no clicks landed in the window.
+    """
+    lede = (
+        "What the ad spend returned, per campaign. Spend buys clicks; clicks "
+        "become tracked calls; calls become booked appointments; bookings tie "
+        "back to Blueprint invoices for revenue. ROAS is revenue ÷ ad spend."
+    )
+    if not google_ads_campaign_ids:
+        return _section(
+            6, "Google Ads · return on ad spend", lede,
+            '<div class="stub">No Google Ads campaigns are linked to this clinic '
+            'yet — link them in <b>clinic_campaigns</b> to surface per-campaign '
+            'ROAS.</div>',
+        )
+    rows = q.google_ads_roi(clinic_id, google_ads_campaign_ids, days=days)
+    if not rows:
+        return _section(
+            6, "Google Ads · return on ad spend", lede,
+            '<div class="stub">No Google Ads clicks landed in the window for the '
+            'linked campaigns.</div>',
+        )
+
+    tot_spend   = sum(r["spend"] for r in rows)
+    tot_revenue = sum(r["revenue"] for r in rows)
+    blended_roas = (tot_revenue / tot_spend) if tot_spend else 0.0
+
+    def _pct(v: float) -> str:
+        return f"{v:.0f}%"
+
+    def _roas(v: float) -> str:
+        return f"{v:.1f}×"
+
+    cards: list[str] = []
+    for r in rows:
+        summary = (
+            f'spend <b>{_fmt_money(r["spend"])}</b> &nbsp;·&nbsp; '
+            f'revenue <b>{_fmt_money(r["revenue"])}</b> &nbsp;·&nbsp; '
+            f'ROAS <b>{_roas(r["roas"])}</b>'
+        )
+        stages = (
+            '<div class="roi-stages">'
+            '<div class="roi-stage" data-stage="clicks">'
+            '<span class="label">Clicks</span>'
+            f'<span class="value">{_fmt_int(r["clicks"])}</span>'
+            f'<span class="sub">${r["cpc"]:,.2f}/click</span>'
+            '</div>'
+            '<div class="roi-arrow"><span class="arrow">→</span>'
+            f'<span class="conv">{_pct(r["click_to_call_pct"])}</span>'
+            f'<span class="cost">{_fmt_money(r["cost_per_call"])}/call</span>'
+            '</div>'
+            '<div class="roi-stage" data-stage="calls">'
+            '<span class="label">Calls</span>'
+            f'<span class="value">{_fmt_int(r["calls"])}</span>'
+            '<span class="sub">tracked</span>'
+            '</div>'
+            '<div class="roi-arrow"><span class="arrow">→</span>'
+            f'<span class="conv">{_pct(r["call_to_book_pct"])}</span>'
+            f'<span class="cost">{_fmt_money(r["cost_per_booking"])}/booking</span>'
+            '</div>'
+            '<div class="roi-stage" data-stage="bookings">'
+            '<span class="label">Bookings</span>'
+            f'<span class="value">{_fmt_int(r["booked"])}</span>'
+            f'<span class="sub">{_fmt_money(r["revenue_per_booking"])}/booking</span>'
+            '</div>'
+            '</div>'
+        )
+        cards.append(
+            '<div class="roi-row">'
+            '<div class="roi-header">'
+            f'<span class="name">{escape(r["campaign_name"])}</span>'
+            f'<span class="summary">{summary}</span>'
+            '</div>'
+            f'{stages}'
+            '</div>'
+        )
+
+    blended = (
+        '<div class="stub" style="margin-bottom:14px;">'
+        f'Across linked campaigns: spend <b>{_fmt_money(tot_spend)}</b>, '
+        f'revenue <b>{_fmt_money(tot_revenue)}</b>, '
+        f'blended ROAS <b>{_roas(blended_roas)}</b>.'
+        '</div>'
+    )
+    return _section(
+        6, "Google Ads · return on ad spend", lede, blended + "".join(cards),
     )
 
 
@@ -1171,316 +1786,37 @@ def _section_patient_product(clinic_id: str, days: int) -> str:
     line_mix = q.line_item_mix(clinic_id, days=days)
 
     patient_bars = _bar_chart(sorted(patients.items(), key=lambda kv: -kv[1])[:8])
-    total_lines = sum(r["line_count"] for r in line_mix) or 1
-    line_rows = [
-        [
-            escape(r["item_type"]),
-            _fmt_int(r["line_count"]),
-            f"{r['line_count'] / total_lines * 100:.1f}%",
-            _fmt_money(r["revenue"]),
-        ]
-        for r in line_mix
-    ]
     body = (
         '<h3 style="font-family: Lora, serif; font-weight: 500; font-size: 16px; margin: 6px 0 8px; color: var(--cx-navy);">Patient status mix</h3>'
         + patient_bars
-        + '<h3 style="font-family: Lora, serif; font-weight: 500; font-size: 16px; margin: 22px 0 8px; color: var(--cx-navy);">Line-item revenue split</h3>'
-        + _table(["Item type", "Lines", "% lines", "Revenue"], line_rows)
-    )
-    return _section(
-        3, "Patient & product mix",
-        "Patient base by Blueprint status; line-item revenue broken out by "
-        "<code>item_type</code> (hearing aid, accessory, service, etc.).",
-        body,
     )
 
-
-def _section_inbound(clinic_id: str, campaign_ids: list[str], days: int = 90) -> str:
-    calls = q.inbound_calls(clinic_id, campaign_ids, days=days)
-    if not campaign_ids:
-        return _section(
-            4, "Inbound calls",
-            "Per-clinic call funnel from Invoca, scoped by the clinic's linked Invoca campaigns.",
-            '<div class="stub">'
-            '<b>No Invoca campaigns linked to this clinic yet.</b> '
-            'Link one from <em>Manage instance → Campaigns → Invoca</em> and this section '
-            'will populate from the next page load.'
-            '</div>',
-        )
-    answered_rate = (calls["answered"] / calls["calls"] * 100) if calls["calls"] else 0
-    booked_rate   = (calls["booked"]   / calls["calls"] * 100) if calls["calls"] else 0
-    body = (
-        '<div class="stats">'
-        + _stat("Calls",          _fmt_int(calls["calls"]),     f"last {calls['window_days']}d")
-        + _stat("Answered",       _fmt_int(calls["answered"]),  f"{answered_rate:.0f}% of calls")
-        + _stat("Appt discussed", _fmt_int(calls["discussed"]))
-        + _stat("Booked",         _fmt_int(calls["booked"]),    f"{booked_rate:.0f}% of calls")
-        + "</div>"
-        + f'<p class="lede" style="margin-top:14px;">Linked campaigns: '
-        + ", ".join(f"<code>{escape(c)}</code>" for c in campaign_ids)
-        + "</p>"
-    )
-    return _section(
-        4, "Inbound calls",
-        f"Invoca-tracked inbound calls over the last <b>{calls['window_days']}</b> days, "
-        "filtered to this clinic's linked campaigns.",
-        body,
-    )
-
-
-def _section_revenue_funnel_legacy(
-    clinic_id: str, ga_ids: list[str], invoca_ids: list[str], days: int,
-    include_detail_link: bool = True,
-) -> str:
-    # Legacy revenue-funnel renderer from the Virsono report. No longer wired
-    # into generate_report_with_campaigns — kept here until the dependent
-    # queries (revenue_funnel, channel_mix) are removed in a follow-up.
-    funnel = q.revenue_funnel(clinic_id, ga_ids, invoca_ids, days)
-    if not (ga_ids or invoca_ids):
-        return _section(
-            2, "Revenue funnel",
-            "Click → call → answered → discussed → booked → patient → appointment → invoice.",
-            '<div class="stub">'
-            '<b>No campaigns linked.</b> Link Google Ads or Invoca campaigns from '
-            '<em>Manage instance → Campaigns</em> and the funnel will render.'
-            '</div>',
+    # Line-item revenue split only renders when the PMS supplies line items
+    # (Blueprint does; CounselEar invoices have no line detail) — otherwise the
+    # patient-status block stands alone rather than showing an empty table.
+    if line_mix:
+        total_lines = sum(r["line_count"] for r in line_mix) or 1
+        line_rows = [
+            [
+                escape(r["item_type"]),
+                _fmt_int(r["line_count"]),
+                f"{r['line_count'] / total_lines * 100:.1f}%",
+                _fmt_money(r["revenue"]),
+            ]
+            for r in line_mix
+        ]
+        body += (
+            '<h3 style="font-family: Lora, serif; font-weight: 500; font-size: 16px; margin: 22px 0 8px; color: var(--cx-navy);">Line-item revenue split</h3>'
+            + _table(["Item type", "Lines", "% lines", "Revenue"], line_rows)
         )
 
-    # Channel mix powers the Sankey's left-most column. Empty when no Invoca
-    # campaigns are linked — Sankey falls back to a single "Inbound" source.
-    channels = _bucket_channel_mix(q.channel_mix(clinic_id, invoca_ids, days))
-
-    revenue_stat = (
-        '<div class="stats" style="margin-top:18px;">'
-        + _stat("Matched revenue", _fmt_money(funnel["matched_revenue"]),
-                f"invoices for matched patients · last {days}d")
-        + _stat("Avg per invoiced call",
-                _fmt_money(funnel["matched_revenue"] / funnel["invoiced"])
-                if funnel["invoiced"] else "—")
-        + "</div>"
+    title = "Patient & product mix" if line_mix else "Patient mix"
+    lede = (
+        "Patient base by PMS status"
+        + ("; line-item revenue broken out by <code>item_type</code> "
+           "(hearing aid, accessory, service, etc.)." if line_mix else ".")
     )
-
-    return _section(
-        2, "Revenue funnel",
-        "Every call made from your website traced to an invoice."
-        '<ol style="margin: 10px 0 0; padding-left: 22px;">'
-        "<li>Successful calls are matched to patients.</li>"
-        f"<li>Patients are linked to appointments that occurred within "
-        f"<b>{funnel['booking_window_hours']}h</b> of the call.</li>"
-        "<li>Appointments are linked to invoices.</li>"
-        "</ol>",
-        _funnel_sankey(funnel, channels)
-        + revenue_stat
-        + (_detail_link_button(clinic_id) if include_detail_link and invoca_ids else ""),
-    )
-
-
-def _section_non_booked_journey(
-    clinic_id: str,
-    invoca_ids: list[str],
-    days: int,
-    booking_window_hours: int = 24,
-) -> str:
-    if not invoca_ids:
-        return _section(
-            3, "Non-booked caller journey",
-            "Where calls that Invoca didn't flag as bookings actually landed in Blueprint.",
-            '<div class="stub">'
-            '<b>No Invoca campaigns linked.</b> Link one from '
-            '<em>Manage instance → Campaigns → Invoca</em> to populate this section.'
-            '</div>',
-        )
-
-    buckets = q.non_booked_journey(
-        clinic_id, invoca_ids,
-        days=days, booking_window_hours=booking_window_hours,
-    )
-    total = sum(buckets.values())
-    if total == 0:
-        return _section(
-            3, "Non-booked caller journey",
-            f"Where non-booked callers actually landed in Blueprint over the last <b>{days}</b> days.",
-            '<div class="stub">No non-booked calls in the window.</div>',
-        )
-
-    # Order presented from "least progress" to "most progress" so the eye walks
-    # the journey forward. Catching `converted` in this bucket means Invoca's
-    # AI booking flag missed a real booking — the patient ended up paying.
-    order = [
-        ("ghost",                "Ghost — no patient match",
-         "Phone never matched a Blueprint patient. Either a new caller who didn't get entered, a wrong number, or fell off before staff captured them."),
-        ("patient_no_appt",      "Patient on file, no appointment",
-         "Known patient called but no appointment was created within the window. Service calls, info questions, or callers who walked away."),
-        ("scheduled_future",     "Scheduled (future / in progress)",
-         "Booking landed but the visit hasn't happened yet. Status is Tentative / Confirmed / Ready / In progress."),
-        ("cancelled",            "Booked then cancelled",
-         "Appointment created from the call, later cancelled. Re-engagement candidate."),
-        ("no_show",              "Booked, no-showed",
-         "Appointment created from the call, patient didn't show. Recovery candidate."),
-        ("completed_no_invoice", "Visited, no invoice",
-         "Patient came in but no invoice has been recorded yet. Pending invoicing, or a no-purchase visit."),
-        ("converted",            "Converted (Invoca missed)",
-         "Patient came in AND has an invoice — meaning this was a real booking, and Invoca's AI flag missed it."),
-    ]
-
-    # Color the "converted" row green (good news), the lost stages (cancelled,
-    # no_show) red, the rest neutral gold.
-    color_map = {
-        "converted":            "var(--cx-green)",
-        "completed_no_invoice": "var(--cx-gold-2)",
-        "cancelled":            "var(--cx-red)",
-        "no_show":              "var(--cx-red)",
-        "scheduled_future":     "var(--cx-gold)",
-        "patient_no_appt":      "var(--cx-faint)",
-        "ghost":                "var(--cx-faint)",
-    }
-
-    rows = []
-    for key, label, helptext in order:
-        count = buckets.get(key, 0)
-        pct = (count / total) * 100 if total else 0
-        bar_w = pct  # bar width = share of non-booked total
-        color = color_map.get(key, "var(--cx-gold)")
-        rows.append(
-            f'<div class="bar-row" style="grid-template-columns: 260px 1fr 80px 70px;">'
-            f'  <div class="label">{escape(label)}'
-            f'    <div style="font-size:10px;color:var(--cx-mute);font-family:Geist,sans-serif;font-weight:400;margin-top:2px;line-height:1.4;">{escape(helptext)}</div>'
-            f'  </div>'
-            f'  <div class="bar-track"><div class="bar-fill" style="width:{bar_w:.1f}%;background:{color};"></div></div>'
-            f'  <div class="count" style="font-weight:600;color:var(--cx-navy);">{count:,}</div>'
-            f'  <div class="count">{pct:.1f}%</div>'
-            f'</div>'
-        )
-
-    summary = (
-        '<div class="stats" style="margin-bottom:18px;">'
-        + _stat("Non-booked calls", _fmt_int(total), f"last {days}d")
-        + _stat("Recovered bookings",
-                _fmt_int(buckets["converted"] + buckets["scheduled_future"]
-                         + buckets["cancelled"] + buckets["no_show"]
-                         + buckets["completed_no_invoice"]),
-                "appointment created within window")
-        + _stat("Lost in Blueprint",
-                _fmt_int(buckets["cancelled"] + buckets["no_show"]),
-                "booked then cancelled / no-show")
-        + "</div>"
-    )
-
-    return _section(
-        3, "Non-booked caller journey",
-        f"For every call in the last <b>{days}</b> days that Invoca did <em>not</em> "
-        "flag as booked, where the caller actually landed in Blueprint. Buckets are "
-        f"mutually exclusive (precedence: converted > completed > cancelled > no-show > "
-        f"scheduled > patient_no_appt > ghost) so each call appears once. The "
-        "<b>Converted</b> row is the most actionable — those are real bookings Invoca's "
-        "AI flag missed; the <b>Cancelled</b> and <b>No-showed</b> rows are recovery "
-        "candidates the clinic can call back.",
-        summary + '<div class="funnel">' + "".join(rows) + "</div>",
-    )
-
-
-def _section_google_ads_roi(clinic_id: str, ga_ids: list[str], days: int) -> str:
-    if not ga_ids:
-        return _section(
-            6, "ROAS · Google Ads campaigns",
-            "Per-campaign click → call → booking → revenue cascade with spend.",
-            '<div class="stub">'
-            '<b>No Google Ads campaigns linked.</b> Link from '
-            '<em>Manage instance → Campaigns → Google Ads</em>; spend + ROAS render once linked.'
-            '</div>',
-        )
-
-    rows = q.google_ads_roi(clinic_id, ga_ids, days=days)
-    if not rows:
-        return _section(
-            6, "ROAS · Google Ads campaigns",
-            f"Per-campaign cascade over the last {days} days.",
-            '<div class="stub">No clicks in the window for any linked campaign.</div>',
-        )
-
-    cards = []
-    for r in rows:
-        roas_str = f"{r['roas']:.1f}× ROAS" if r['roas'] else "ROAS —"
-        cards.append(f"""
-<div class="roi-row">
-  <div class="roi-header">
-    <span class="name">{escape(r['campaign_name'])}</span>
-    <span class="summary">
-      Spend <b>{_fmt_money(r['spend'])}</b> ·
-      Revenue <b>{_fmt_money(r['revenue'])}</b> ·
-      <b>{roas_str}</b> ·
-      CPC <b>${r['cpc']:.2f}</b> ·
-      ${r['cost_per_booking']:.2f}/booking
-    </span>
-  </div>
-  <div class="roi-stages">
-    <div class="roi-stage" data-stage="clicks">
-      <div class="label">Ad clicks</div>
-      <div class="value">{_fmt_int(r['clicks'])}</div>
-      <div class="sub">{_fmt_money(r['spend'])} spent</div>
-    </div>
-    <div class="roi-arrow">
-      <div class="arrow">→</div>
-      <div class="conv">{r['click_to_call_pct']:.0f}%</div>
-      <div class="cost">${r['cost_per_call']:.2f}/call</div>
-    </div>
-    <div class="roi-stage" data-stage="calls">
-      <div class="label">Tracked calls</div>
-      <div class="value">{_fmt_int(r['calls'])}</div>
-      <div class="sub">via GCLID match</div>
-    </div>
-    <div class="roi-arrow">
-      <div class="arrow">→</div>
-      <div class="conv">{r['call_to_book_pct']:.1f}%</div>
-      <div class="cost">${r['cost_per_booking']:.2f}/booking</div>
-    </div>
-    <div class="roi-stage" data-stage="bookings">
-      <div class="label">Bookings</div>
-      <div class="value">{_fmt_int(r['booked'])}</div>
-      <div class="sub">LLM-scored</div>
-    </div>
-    <div class="roi-arrow">
-      <div class="arrow">→</div>
-      <div class="conv">${r['revenue_per_booking']:,.0f}</div>
-      <div class="cost">avg / booking</div>
-    </div>
-    <div class="roi-stage" data-stage="revenue" style="background:#f3faf5;border-top-color:var(--cx-green);">
-      <div class="label">Revenue</div>
-      <div class="value">{_fmt_money(r['revenue'])}</div>
-      <div class="sub">{_fmt_int(r['invoice_count'])} invoices</div>
-    </div>
-  </div>
-</div>
-""")
-
-    return _section(
-        6, "ROAS · Google Ads campaigns",
-        "How each linked Google Ads campaign is performing — clicks all the way "
-        "through to revenue, with spend and ROAS surfaced for each.",
-        "".join(cards) + _detail_link_button(clinic_id),
-    )
-
-
-def _detail_link_button(clinic_id: str, label: str = "View marketing-attributed patients") -> str:
-    """Anchor button that breaks out of the iframe to the detail subpage.
-
-    ``target="_top"`` is needed because the main report is rendered inside an
-    iframe in the cortex frontend; without it, navigation would happen inside
-    the iframe and clip into the sandbox.
-    """
-    href = f"/intelligence/{escape(clinic_id)}/attributed-invoices"
-    return (
-        f'<div style="margin-top:18px;">'
-        f'  <a href="{href}" target="_top" '
-        f'     style="display:inline-block;background:var(--cx-navy);color:var(--cx-cream);'
-        f'            font-family:Geist Mono,monospace;font-size:11px;font-weight:500;'
-        f'            text-transform:uppercase;letter-spacing:0.08em;'
-        f'            padding:10px 16px;border-radius:4px;text-decoration:none;'
-        f'            border:1px solid var(--cx-navy-3);">'
-        f'    {escape(label)} →'
-        f'  </a>'
-        f'</div>'
-    )
+    return _section(3, title, lede, body)
 
 
 # ── Top-level ────────────────────────────────────────────────────────────────
@@ -1500,14 +1836,48 @@ def generate_report(clinic_id: str, clinic_name: str, days: int = 365) -> str:
     )
 
 
+# Canonical date-range windows (days). The pre-warm job (prewarm.py) renders
+# these for every active clinic so the standard ranges are always cache-warm;
+# the UI's range presets should match this list for guaranteed hits. Arbitrary
+# windows still render live (a cache miss) — they're just not pre-warmed.
+CANONICAL_RANGES = [30, 90, 180, 365, 730]
+
 # ── Rendered-report cache ─────────────────────────────────────────────────────
-# Module-level TTL cache keyed by (clinic_id, days, sorted invoca ids, sorted
-# google ads ids). 5-minute TTL covers refresh-heavy debugging sessions; bound
-# the cache size so it can't grow without limit. Thread-safe enough for read-
-# heavy CPython workloads — the GIL serialises dict mutations.
-_REPORT_CACHE_TTL_SECONDS = 300
+# The full-report cache key encodes a data_version (Blueprint snapshot date +
+# UTC date — see generate_report_with_campaigns), so a hit is valid by
+# construction and the TTL can be long: new data → new key, never a stale serve.
+# 6h keeps the standard ranges warm through a working day on a single instance.
+# Bounded size; GIL serialises the dict mutations.
+_REPORT_CACHE_TTL_SECONDS = 21600  # 6h — safe because the key is data-versioned
 _REPORT_CACHE_MAX_ENTRIES = 128
 _REPORT_CACHE: dict[tuple, tuple[float, str]] = {}
+
+# Per-section cache. Its key is NOT data-versioned, so keep the original short
+# TTL — a filter that only affects one section (e.g. the §03 UTM source) reuses
+# the other sections' cached HTML instead of re-running their BigQuery queries.
+_SECTION_CACHE_TTL_SECONDS = 300
+_SECTION_CACHE_MAX_ENTRIES = 512
+_SECTION_CACHE: dict[tuple, tuple[float, str]] = {}
+
+
+def _section_cache_get(key: tuple) -> str | None:
+    import time as _time
+    entry = _SECTION_CACHE.get(key)
+    if entry is None:
+        return None
+    ts, html = entry
+    if _time.time() - ts > _SECTION_CACHE_TTL_SECONDS:
+        _SECTION_CACHE.pop(key, None)
+        return None
+    return html
+
+
+def _section_cache_put(key: tuple, html: str) -> None:
+    import time as _time
+    if len(_SECTION_CACHE) >= _SECTION_CACHE_MAX_ENTRIES:
+        oldest = min(_SECTION_CACHE, key=lambda k: _SECTION_CACHE[k][0])
+        _SECTION_CACHE.pop(oldest, None)
+    _SECTION_CACHE[key] = (_time.time(), html)
 
 
 def _report_cache_key(
@@ -1515,12 +1885,18 @@ def _report_cache_key(
     invoca_campaign_ids: list[str],
     google_ads_campaign_ids: list[str],
     days: int,
+    utm_sources: list[str] | None = None,
+    utm_mediums: list[str] | None = None,
+    data_version: str = "",
 ) -> tuple:
     return (
         clinic_id,
         int(days),
         tuple(sorted(invoca_campaign_ids)),
         tuple(sorted(google_ads_campaign_ids)),
+        tuple(sorted(utm_sources or [])),
+        tuple(sorted(utm_mediums or [])),
+        data_version,
     )
 
 
@@ -1546,6 +1922,86 @@ def _report_cache_put(key: tuple, html: str) -> None:
     _REPORT_CACHE[key] = (_time.time(), html)
 
 
+# ── Shared, persistent report cache (GCS-backed) ──────────────────────────────
+# The in-process caches above are per-instance and lost on cold start / scale-out.
+# This layer is shared across instances and survives restarts, and lets the
+# pre-warm job (intelligence_report/prewarm.py) populate the cache after each ETL
+# load so interactive loads of the standard ranges are near-instant. The cache key
+# encodes a data_version (Blueprint snapshot date + UTC date), so an object's mere
+# existence implies it's valid — stale data yields a different key, so no TTL is
+# needed (the bucket also has a 14-day lifecycle to sweep orphaned versions). A GCS
+# GET is ~100 ms (vs ~3 s for a BigQuery point-lookup), so warm hits are
+# sub-second. Every op fails safe (None / no-op) so a storage hiccup never breaks
+# rendering. The cached payload is the §00–§06 analytics surface (aggregate-only,
+# no patient PII).
+#
+# The bucket is dedicated, private, and lifecycle-managed; the hypervisor SA has
+# roles/storage.objectAdmin on it. To repoint elsewhere, change the constant and
+# grant the SA objectAdmin on the new bucket.
+_REPORT_CACHE_BUCKET = "project-demo-2-482101-report-cache"
+_REPORT_CACHE_PREFIX = "report-cache/"
+_storage_client = None  # lazy singleton
+
+
+def _cache_key_str(key: tuple) -> str:
+    import hashlib
+    return hashlib.sha256(repr(key).encode()).hexdigest()
+
+
+# Snapshot date is needed on every request to form the data_version, but it only
+# changes when ETL runs (≈daily). Querying BigQuery for it on each hit was the
+# dominant cost on the otherwise ~100 ms GCS warm path, so memoize it per clinic
+# with a short TTL — a stale read is bounded by the TTL and the data_version also
+# carries the UTC date as a backstop.
+_SNAPSHOT_CACHE: dict[str, tuple[float, object]] = {}
+_SNAPSHOT_TTL_SECONDS = 600
+
+
+def _cached_snapshot_date(clinic_id: str):
+    import time as _time
+    entry = _SNAPSHOT_CACHE.get(clinic_id)
+    if entry is not None and _time.time() - entry[0] <= _SNAPSHOT_TTL_SECONDS:
+        return entry[1]
+    val = q.blueprint_snapshot_date(clinic_id)
+    _SNAPSHOT_CACHE[clinic_id] = (_time.time(), val)
+    return val
+
+
+def _cache_bucket():
+    global _storage_client
+    if _storage_client is None:
+        from google.cloud import storage
+        _storage_client = storage.Client()
+    return _storage_client.bucket(_REPORT_CACHE_BUCKET)
+
+
+def _cache_blob_name(key_str: str, clinic_id: str) -> str:
+    # clinic_id in the path keeps objects browsable/cleanable per clinic; key_str
+    # (a sha256 of the full data-versioned key) guarantees uniqueness.
+    return f"{_REPORT_CACHE_PREFIX}{clinic_id}/{key_str}.html"
+
+
+def _shared_cache_get(key_str: str, clinic_id: str) -> str | None:
+    from google.cloud.exceptions import NotFound
+    try:
+        return _cache_bucket().blob(
+            _cache_blob_name(key_str, clinic_id)).download_as_text()
+    except NotFound:
+        return None
+    except Exception as exc:  # never let the cache path break rendering
+        log.warning("shared report cache GET failed: %s", exc)
+        return None
+
+
+def _shared_cache_put(key_str: str, clinic_id: str, html: str, data_version: str) -> None:
+    try:
+        blob = _cache_bucket().blob(_cache_blob_name(key_str, clinic_id))
+        blob.metadata = {"data_version": data_version, "clinic_id": clinic_id}
+        blob.upload_from_string(html, content_type="text/html; charset=utf-8")
+    except Exception as exc:  # best-effort; a write failure must not break serving
+        log.warning("shared report cache PUT failed: %s", exc)
+
+
 def generate_report_with_campaigns(
     clinic_id: str,
     clinic_name: str,
@@ -1553,6 +2009,8 @@ def generate_report_with_campaigns(
     google_ads_campaign_ids: list[str] | None = None,
     days: int = 365,
     use_cache: bool = True,
+    utm_sources: list[str] | None = None,
+    utm_mediums: list[str] | None = None,
 ) -> str:
     """Render the full report scoped to a clinic's linked campaigns.
 
@@ -1560,23 +2018,40 @@ def generate_report_with_campaigns(
     take the linked campaign IDs as args so this module doesn't depend on the
     Cloud SQL ORM. The hypervisor route looks the IDs up and passes them in.
 
+    ``utm_sources`` / ``utm_mediums`` are multi-select include-lists that filter
+    the §03 call funnel (source AND medium; each optional); they only affect §03.
+
     Set ``use_cache=False`` to bypass the in-process TTL cache (useful for
     debugging / verifying a fresh render).
     """
     google_ads_campaign_ids = google_ads_campaign_ids or []
+    utm_sources = q._utm_clean(utm_sources)
+    utm_mediums = q._utm_clean(utm_mediums)
+
+    # Data version: a cached render is only valid for the same underlying data.
+    # Fold the Blueprint snapshot date + UTC date into the cache key so a new ETL
+    # load (or a new day) yields a fresh key instead of serving stale HTML — this
+    # is what lets the cache TTLs be long. snapshot/today are reused in the header.
+    snapshot = _cached_snapshot_date(clinic_id)
+    today    = _dt.date.today().isoformat()
+    data_version = f"{snapshot}|{today}"
 
     cache_key = _report_cache_key(
-        clinic_id, invoca_campaign_ids, google_ads_campaign_ids, days
+        clinic_id, invoca_campaign_ids, google_ads_campaign_ids, days,
+        utm_sources, utm_mediums, data_version,
     )
+    key_str = _cache_key_str(cache_key)
     if use_cache:
         cached = _report_cache_get(cache_key)
         if cached is not None:
-            log.info("intelligence_report cache=HIT clinic=%s days=%d", clinic_id, days)
+            log.info("intelligence_report cache=HIT(mem) clinic=%s days=%d", clinic_id, days)
+            return cached
+        cached = _shared_cache_get(key_str, clinic_id)
+        if cached is not None:
+            _report_cache_put(cache_key, cached)  # promote into the in-process tier
+            log.info("intelligence_report cache=HIT(shared) clinic=%s days=%d", clinic_id, days)
             return cached
         log.info("intelligence_report cache=MISS clinic=%s days=%d", clinic_id, days)
-
-    snapshot = q.blueprint_snapshot_date(clinic_id)
-    today    = _dt.date.today().isoformat()
 
     header = (
         f'<header class="report-header">'
@@ -1600,13 +2075,33 @@ def generate_report_with_campaigns(
     import time as _time
     from concurrent.futures import ThreadPoolExecutor
 
+    inv_key = tuple(sorted(invoca_campaign_ids))
+    ga_key = tuple(sorted(google_ads_campaign_ids))
+
     def _timed(name: str, fn) -> str:
+        # Only §03 varies with utm_source; everything else is shared across
+        # filter values, so a UTM change reuses their cached HTML.
+        if name == "00_headline":
+            # Month-over-month: independent of the day window / utm filter.
+            sect_key = (name, clinic_id, inv_key)
+        elif name == "03_funnel":
+            sect_key = (name, clinic_id, int(days), inv_key, ga_key,
+                        tuple(sorted(utm_sources)), tuple(sorted(utm_mediums)))
+        else:
+            sect_key = (name, clinic_id, int(days), inv_key, ga_key)
+        cached = _section_cache_get(sect_key) if use_cache else None
+        if cached is not None:
+            log.info("intelligence_report section=%s clinic=%s cache=HIT", name, clinic_id)
+            return cached
+
         t0 = _time.perf_counter()
         try:
             html = fn()
             dt = _time.perf_counter() - t0
             log.info("intelligence_report section=%s clinic=%s ok dt=%.2fs",
                      name, clinic_id, dt)
+            if use_cache:
+                _section_cache_put(sect_key, html)
             return html
         except Exception as e:
             dt = _time.perf_counter() - t0
@@ -1617,18 +2112,28 @@ def generate_report_with_campaigns(
                 f'<p class="lede">This section failed to render: <code>{escape(type(e).__name__)}: {escape(str(e)[:200])}</code></p></section>'
             )
 
+    # This report is the "Analytics" surface: marketing analytics only —
+    # acquisition, engagement, funnel, ROAS. The call-level breakdowns
+    # (callscoring categories, cohort drill-downs) moved to the separate
+    # "Leads" section (React + JSON via api/worklists.py). The
+    # _section_callscoring / _section_cohorts functions are intentionally kept
+    # — they still power the standalone detail HTML pages (no-conversation,
+    # qualified-no-conv, attributed-invoices) served by api/intelligence.py.
     section_specs: list[tuple[str, callable]] = [
+        ("00_headline",       lambda: _section_headline(
+            clinic_id, clinic_name, invoca_campaign_ids)),
         ("01_acquisition",    lambda: _section_acquisition(
             clinic_id, invoca_campaign_ids, google_ads_campaign_ids, days=days)),
         ("02_engagement",     lambda: _section_engagement(
             clinic_id, invoca_campaign_ids, days=days)),
         ("03_funnel",         lambda: _section_funnel(
+            clinic_id, invoca_campaign_ids, google_ads_campaign_ids, days=days,
+            utm_sources=utm_sources, utm_mediums=utm_mediums)),
+        ("04_webform_revenue", lambda: _section_webform_revenue(
+            clinic_id, days=days)),
+        ("05_monthly_trends", lambda: _section_monthly_trends(
             clinic_id, invoca_campaign_ids, google_ads_campaign_ids, days=days)),
-        ("04_callscoring",    lambda: _section_callscoring(
-            clinic_id, invoca_campaign_ids, days=days)),
-        ("05_cohorts",        lambda: _section_cohorts(
-            clinic_id, invoca_campaign_ids, days=days)),
-        ("06_google_ads_roi", lambda: _section_google_ads_roi(
+        ("06_roas",           lambda: _section_roas(
             clinic_id, google_ads_campaign_ids, days=days)),
     ]
 
@@ -1649,6 +2154,7 @@ def generate_report_with_campaigns(
     html = _HEAD.format(title=escape(title)) + body + _FOOT
     if use_cache:
         _report_cache_put(cache_key, html)
+        _shared_cache_put(key_str, clinic_id, html, data_version)
     return html
 
 
