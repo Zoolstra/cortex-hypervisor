@@ -108,6 +108,7 @@ def build_active_leads(
             "date": d, "utm_source": None, "utm_medium": c.get("utm_medium"),
             "landing_page": None, "customer_type": None,
             "detail": c.get("reasoning") or "",
+            "complete_call_id": c.get("complete_call_id"),
         })
 
     # Missed (non-spam) calls that landed during business hours — only when we
@@ -129,6 +130,7 @@ def build_active_leads(
                 "date": d, "utm_source": None, "utm_medium": c.get("utm_medium"),
                 "landing_page": None, "customer_type": None,
                 "detail": "Missed call during business hours",
+                "complete_call_id": c.get("complete_call_id"),
             })
 
     for f in _safe(lambda: q.open_form_leads(clinic_id, window=w), "forms"):
@@ -145,6 +147,7 @@ def build_active_leads(
             "date": d, "utm_source": f.get("utm_source"), "utm_medium": f.get("utm_medium"),
             "landing_page": f.get("landing_page"), "customer_type": f.get("customer_type"),
             "detail": f.get("message") or "",
+            "complete_call_id": None,
         })
 
     if not raw:
@@ -171,6 +174,10 @@ def build_active_leads(
         cur["phone_raw"] = cur["phone_raw"] or lead["phone_raw"]
         cur["email_raw"] = cur["email_raw"] or lead["email_raw"]
         cur["detail"] = cur["detail"] or lead["detail"]
+        # Keep a call id so the lead can surface "what was said" — prefer the
+        # first call touch (the qualified/missed call), fill if not yet set.
+        if not cur.get("complete_call_id") and lead.get("complete_call_id"):
+            cur["complete_call_id"] = lead["complete_call_id"]
 
     leads = list(merged.values())
 
@@ -245,6 +252,7 @@ def build_active_leads(
             "landing_page": l["landing_page"],
             "customer_type": l["customer_type"],
             "detail": (l["detail"] or "")[:400],
+            "complete_call_id": l.get("complete_call_id"),
             "matched": bool(cid),
             "client_id": cid,
             "returning": returning,

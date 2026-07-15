@@ -13,6 +13,7 @@ data is fully isolated by ``_clinic_id``.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import logging
 from typing import Any
 
@@ -29,6 +30,16 @@ log = logging.getLogger(__name__)
 _BP = "project-demo-2-482101.PMS_Unified"
 _CLINIC_DATA = "project-demo-2-482101.ClinicData"
 _PATIENT_CONTACTS = f"{_BP}.patient_contacts"
+
+# Raw CounselEar feed. For Virsono (CounselEar) clinics, web-form submissions are
+# not in ClinicData.webforms — they book directly into CounselEar and surface as
+# appointments tagged ``appt_referral_type = "Referral - Zoolstra"``. The forms
+# counters below add these so the acquisition funnel reflects them. Non-CounselEar
+# clinics have no such rows, so the addition is a no-op for them.
+_COUNSELEAR = "project-demo-2-482101.CounselEar_PHI"
+ZOOLSTRA_REFERRAL_TAG = "Referral - Zoolstra"
+# CounselEar appointment statuses that count as a kept / converted visit.
+_ZOOLSTRA_BOOKED_STATUSES = ("completed", "arrived")
 
 
 def _client() -> bigquery.Client:
@@ -73,7 +84,7 @@ def _truthy_flag(v: Any) -> bool:
 # earlier than this is absent/unreliable, so every window's start is clamped up
 # to it (see ``Window.from_days`` / ``Window.floored`` and the API window
 # resolver). Bump this only if reliable earlier history becomes available.
-MIN_WINDOW_DATE = _dt.date(2026, 1, 1)
+MIN_WINDOW_DATE = _dt.date(2025, 12, 4)
 
 # Upper data-availability bound. Rolls forward to *today* (UTC) so the
 # in-progress month is always visible as data lands — every window's end is
@@ -153,11 +164,13 @@ class Window:
 
     @property
     def start_month_ts(self) -> str:
-        """Start snapped to the *first of its month*. ``ad_groups`` is
-        monthly-grained (its ``timestamp`` is always the first of the month),
-        so a window starting mid-month must still include that whole month —
-        otherwise spend drops a month whose clicks/calls ARE counted, which
-        would distort CPC/ROAS."""
+        """Start snapped to the *first of its month*.
+
+        LEGACY: ``ad_groups`` used to be monthly-grained, so spend had to be
+        pulled a whole month at a time. It is now ingested daily and windowed
+        exactly (see ``google_ads_roi``'s spend CTE), so this month-snap is no
+        longer used there. Retained only for any caller that still needs a
+        month-aligned lower bound."""
         return f"{self.start.replace(day=1).isoformat()} 00:00:00+00:00"
 
 
@@ -406,91 +419,160 @@ def line_item_mix(clinic_id: str, days: int = 365, window: "Window | None" = Non
 
 # ── Google Ads ROI (per linked Google Ads campaign) ──────────────────────────
 
-def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str], days: int = 90, window: "Window | None" = None) -> list[dict]:
+def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
+                   invoca_campaign_ids: list[str] | None = None, days: int = 90,
+                   window: "Window | None" = None, match_days: int = 3) -> list[dict]:
     """Per-campaign cascade for the clinic's linked Google Ads campaigns.
 
-    Pulls clicks from ``ad_clicks_v2``, monthly spend from ``ad_groups`` (cost
-    derived as ``metrics_clicks * metrics_average_cpc / 1e6`` — Google Ads
-    reports CPC in micros), and the calls-and-bookings tied back to those
-    clicks via GCLID matching against ``transactions``. GCLID-matched callers
-    are further phone-joined to ``Blueprint_PHI.ClientDemographics`` and their
-    invoices summed to give per-campaign revenue and ROAS.
+    Calls are attributed to a campaign by **normalized campaign name** — the same
+    approach as the May 5th analysis — NOT by GCLID. GCLID coverage is sparse
+    (~⅔ of calls carry one and land in ``ad_clicks_v2``), which collapsed the
+    per-campaign numbers toward zero. Each Google Ads campaign name
+    (``ad_clicks_v2.campaign_name``, e.g. "Beta Princeton") is normalized —
+    leading "Beta " stripped, trimmed, lower-cased — and matched to the Invoca
+    campaign name on each call (``transactions.advertiser_campaign_name``, e.g.
+    "Princeton"). Calls are scoped to the clinic's own Invoca campaigns first, so
+    a name shared across clinics can't cross-attribute.
 
-    Returns one dict per campaign with derived ratios (CPC, cost-per-call,
-    cost-per-booking, ROAS). Per-campaign revenue dedups invoices within each
-    campaign — the same patient counted against two campaigns will have their
-    invoice show up in both columns (Virsono attribution convention).
-    Skips campaigns with zero clicks in the window.
+    Per campaign: clicks (``ad_clicks_v2``), spend (``ad_groups`` —
+    ``metrics_cost_micros / 1e6``, Google's true billed cost, windowed to the
+    range at daily granularity), name-matched
+    Invoca calls, ``booked`` (PMS-reconciled: a distinct
+    ``PMS_Unified.Appointments`` row CREATED within ``match_days`` on/after the
+    CLOSEST genuine, connected name-matched call. Requires a real conversation —
+    spam, wrong-number, no-conversation and no-transcript calls do NOT book, so a
+    coincidental phone match is excluded — but patient type is IGNORED: new and
+    existing patients both count), and attributed revenue
+    (matched callers phone-joined to their patient → any ``InvoiceMaster`` invoice
+    in the window, deduped per campaign — no on/after-call gate, consistent with
+    ``pipeline_revenue_by_month``).
+
+    NOTE: captures ad → *phone call* → booking only; CounselEar web-portal
+    conversions (no call) are not linked here. Returns one dict per campaign with
+    derived ratios (CPC, cost-per-call, cost-per-booking, ROAS). With no linked
+    Invoca campaigns the call/booked/revenue columns are 0 (clicks + spend still
+    report). Skips clinics with no linked Google Ads campaigns.
     """
     if not ga_campaign_ids:
         return []
     w = _win(window, days)
-    in_list = "(" + ", ".join(f"'{c}'" for c in ga_campaign_ids) + ")"
+    ga_in = "(" + ", ".join(f"'{c}'" for c in ga_campaign_ids) + ")"
+    iv_in = "(" + ", ".join(f"'{c}'" for c in (invoca_campaign_ids or [])) + ")"
+    calls_scope = f"CAST(t.invoca_campaign_id AS STRING) IN {iv_in}" if invoca_campaign_ids else "FALSE"
+
+    def _norm(col: str) -> str:
+        # Strip a leading "Beta " (Google Ads names) case-insensitively, trim,
+        # lower-case — so "Beta Princeton" (Ads) matches "Princeton" (Invoca).
+        return f"LOWER(TRIM(REGEXP_REPLACE(IFNULL({col}, ''), r'(?i)^Beta\\s+', '')))"
+
     sql = f"""
-        WITH clicks AS (
+        WITH ga AS (
             SELECT
               google_ads_campaign_id,
               ANY_VALUE(campaign_name) AS campaign_name,
               COUNT(*) AS clicks
             FROM `{_CLINIC_DATA}.ad_clicks_v2`
-            WHERE google_ads_campaign_id IN {in_list}
+            WHERE google_ads_campaign_id IN {ga_in}
               AND {_ts_between("timestamp", w)}
             GROUP BY google_ads_campaign_id
         ),
+        ga_norm AS (
+            SELECT google_ads_campaign_id, campaign_name, clicks,
+                   {_norm("campaign_name")} AS norm
+            FROM ga
+        ),
         spend AS (
+            -- Accurate billed spend straight from Google Ads
+            -- (metrics_cost_micros, in micros → /1e6). ``ad_groups`` is ingested
+            -- at DAILY granularity, so summing the rows whose own date falls in
+            -- the window gives exact spend for any range — no month-snap and no
+            -- clicks × average_cpc estimate.
             SELECT
               google_ads_campaign_id,
-              SUM(SAFE_CAST(metrics_clicks AS FLOAT64))                                AS ad_group_clicks,
-              SUM(SAFE_CAST(metrics_clicks AS FLOAT64) * metrics_average_cpc / 1e6)    AS spend
+              SUM(SAFE_CAST(metrics_cost_micros AS FLOAT64) / 1e6) AS spend
             FROM `{_CLINIC_DATA}.ad_groups`
-            WHERE google_ads_campaign_id IN {in_list}
-              AND timestamp >= TIMESTAMP('{w.start_month_ts}') AND timestamp < TIMESTAMP('{w.end_ts}')
+            WHERE google_ads_campaign_id IN {ga_in}
+              AND {_ts_between("timestamp", w)}
             GROUP BY google_ads_campaign_id
         ),
-        gads_call_detail AS (
-            -- Booking comes from LLM-scored callscoring.appointment_booked,
-            -- matching the rest of the funnel. Calls without a callscoring
-            -- row contribute 0 to `booked`.
+        calls AS (
+            -- Clinic's Invoca calls, tagged with a normalized campaign name and
+            -- the callscoring flags needed to gate NEW-patient bookings.
             SELECT
-              ac.google_ads_campaign_id,
               t.transaction_id,
+              t.timestamp AS call_ts,
               RIGHT(REGEXP_REPLACE(IFNULL(t.calling_phone_number, ''), r'\\D', ''), 10) AS phone_norm,
-              CASE WHEN IFNULL(cs.appointment_booked, FALSE) THEN 1 ELSE 0 END AS booked
+              {_norm("t.advertiser_campaign_name")} AS norm,
+              (cs.complete_call_id IS NOT NULL)              AS has_cs,
+              IFNULL(cs.empty_transcript, FALSE)             AS empty_transcript,
+              IFNULL(cs.spam_or_solicitor, FALSE)            AS spam,
+              IFNULL(cs.wrong_number, FALSE)                 AS wrong,
+              IFNULL(cs.no_conversation, FALSE)              AS no_conv
             FROM `{_CLINIC_DATA}.transactions` t
-            INNER JOIN `{_CLINIC_DATA}.ad_clicks_v2` ac
-              ON ac.click_view_gclid = t.gclid
-             AND ac.google_ads_campaign_id IN {in_list}
             LEFT JOIN `{_CLINIC_DATA}.callscoring` cs
               ON cs.complete_call_id = t.complete_call_id
-            WHERE {_ts_between("t.timestamp", w)}
-              AND t.gclid IS NOT NULL AND t.gclid != ''
+            WHERE {calls_scope}
+              AND {_ts_between("t.timestamp", w)}
         ),
-        gads_calls AS (
-            SELECT
-              google_ads_campaign_id,
-              COUNT(DISTINCT transaction_id) AS calls,
-              SUM(booked)                    AS booked
-            FROM gads_call_detail
-            GROUP BY google_ads_campaign_id
+        call_camp AS (
+            -- Attach each call to a Google Ads campaign by normalized name.
+            SELECT c.transaction_id, c.call_ts, c.phone_norm, g.google_ads_campaign_id,
+                   c.has_cs, c.empty_transcript, c.spam, c.wrong, c.no_conv
+            FROM calls c
+            JOIN ga_norm g ON g.norm = c.norm AND c.norm != ''
         ),
         patients AS (
             SELECT DISTINCT client_id, phone_norm
             FROM `{_PATIENT_CONTACTS}`
-            WHERE _clinic_id = @clinic_id
-              AND LENGTH(phone_norm) = 10
+            WHERE _clinic_id = @clinic_id AND LENGTH(phone_norm) = 10
         ),
-        -- Distinct patients touched by each campaign (via GCLID-matched call
-        -- whose phone matches a Blueprint patient).
+        booked_calls AS (
+            -- One row per PMS appointment, credited to the MOST RECENT genuine,
+            -- connected, name-matched call (same rule as §01
+            -- ``call_outcomes_funnel``). We then count DISTINCT booked CALLS per
+            -- campaign (``gads_booked`` below) — the SAME unit §01 reports — so
+            -- per-campaign booked reconciles with, and never exceeds, the §01
+            -- total (counting distinct appointments here would over-count a call
+            -- that produced several appointments). A booking requires a GENUINE,
+            -- CONNECTED call (excludes no-transcript / spam / wrong / no-conv, so
+            -- a coincidental phone match ≠ a booking). Orthogonal to patient type.
+            SELECT google_ads_campaign_id, transaction_id FROM (
+                SELECT cc.google_ads_campaign_id, cc.transaction_id, a.event_id,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY a.event_id
+                         ORDER BY cc.call_ts DESC
+                       ) AS rn
+                FROM call_camp cc
+                JOIN patients p
+                  ON p.phone_norm = cc.phone_norm AND LENGTH(cc.phone_norm) = 10
+                JOIN `{_BP}.Appointments` a
+                  ON a._clinic_id = @clinic_id AND a.client_id = p.client_id
+                WHERE DATE_DIFF(DATE(SAFE_CAST(a.created_time AS TIMESTAMP)), DATE(cc.call_ts), DAY)
+                      BETWEEN 0 AND @match_days
+                  AND cc.has_cs AND NOT cc.empty_transcript
+                  AND NOT cc.spam AND NOT cc.wrong AND NOT cc.no_conv
+            )
+            WHERE rn = 1
+        ),
+        gads_calls AS (
+            SELECT google_ads_campaign_id, COUNT(DISTINCT transaction_id) AS calls
+            FROM call_camp GROUP BY google_ads_campaign_id
+        ),
+        gads_booked AS (
+            SELECT google_ads_campaign_id, COUNT(DISTINCT transaction_id) AS booked
+            FROM booked_calls GROUP BY google_ads_campaign_id
+        ),
+        -- Distinct patients touched by each campaign (name-matched call whose
+        -- phone matches a patient record).
         campaign_clients AS (
-            SELECT DISTINCT
-              gc.google_ads_campaign_id,
-              p.client_id
-            FROM gads_call_detail gc
+            SELECT DISTINCT cc.google_ads_campaign_id, p.client_id
+            FROM call_camp cc
             JOIN patients p
-              ON p.phone_norm = gc.phone_norm
-             AND LENGTH(gc.phone_norm) = 10
+              ON p.phone_norm = cc.phone_norm AND LENGTH(cc.phone_norm) = 10
         ),
         campaign_revenue AS (
+            -- Any invoice in the window for a matched patient (no on/after-call
+            -- gate) — consistent with pipeline_revenue_by_month.
             SELECT
               cc.google_ads_campaign_id,
               SUM(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS revenue,
@@ -504,23 +586,27 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str], days: int = 90, w
             GROUP BY cc.google_ads_campaign_id
         )
         SELECT
-          cl.google_ads_campaign_id AS campaign_id,
-          cl.campaign_name,
-          cl.clicks,
+          g.google_ads_campaign_id AS campaign_id,
+          g.campaign_name,
+          g.clicks,
           COALESCE(gc.calls, 0)     AS calls,
-          COALESCE(gc.booked, 0)    AS booked,
+          COALESCE(gb.booked, 0)    AS booked,
           COALESCE(s.spend, 0)      AS spend,
           COALESCE(cr.revenue, 0)   AS revenue,
           COALESCE(cr.invoice_count, 0) AS invoice_count
-        FROM clicks cl
+        FROM ga_norm g
         LEFT JOIN spend s USING (google_ads_campaign_id)
         LEFT JOIN gads_calls gc USING (google_ads_campaign_id)
+        LEFT JOIN gads_booked gb USING (google_ads_campaign_id)
         LEFT JOIN campaign_revenue cr USING (google_ads_campaign_id)
-        ORDER BY cl.clicks DESC
+        ORDER BY g.clicks DESC
     """
     client = _client()
     out: list[dict] = []
-    job_config = bigquery.QueryJobConfig(query_parameters=_params(clinic_id))
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+        bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+    ])
     for r in client.query(sql, job_config=job_config).result():
         clicks   = int(r.clicks or 0)
         calls    = int(r.calls or 0)
@@ -3016,6 +3102,1352 @@ def call_capture(
     return out
 
 
+# How many days a PMS appointment may be created from a call and still count as
+# "booked from that call" (the booking is entered on/just after the call).
+CALL_BOOKING_MATCH_DAYS = 3
+
+# How far back before a booking call to look for preceding calls from the same
+# number that "led to" the booking (the touchpoint history the client sees when
+# filtering on Booked). Bounds an episode so an unrelated old call isn't linked.
+CALL_BOOKING_LOOKBACK_DAYS = 30
+
+# How many days after a call a PMS invoice may be dated and still be attributed
+# to that call's patient. Much wider than the booking window: the appointment is
+# created during/just after the call, but the actual sale (hearing aids) often
+# lands weeks later. Patient-level attribution — approximate, labelled as such.
+CALL_INVOICE_ATTRIBUTION_DAYS = 90
+
+
+def _call_tagging_cte(in_iv: str, w: "Window") -> str:
+    """Shared CTE that tags each inbound call with the funnel's mutually-exclusive
+    bucket flags. Both the aggregate funnel (``call_outcomes_funnel``) and the
+    per-call drill-down lists (``leak_calls``) build on this ONE definition so
+    their numbers always reconcile. Expects query params ``@clinic_id`` and
+    ``@match_days``; exposes a ``tagged`` CTE with per-call columns
+    (complete_call_id, call_ts, start_time_local, phone_raw, reasoning) plus the
+    flags: has_cs, no_transcript, spam, is_wrong, genuine, reconciled,
+    connected_raw, is_voicemail, is_hangup, qualified, existing, appt_active,
+    appt_lapsing, appt_deep_dormant, appt_none, tx_existing, appt_booked.
+
+    ``existing`` is the CANONICAL new-vs-existing patient signal: the UNION of a
+    PMS prior-appointment (caller's phone matches a clinic patient with an
+    appointment dated before the call) and the transcript ``existing_customer``
+    flag. Either alone under-counts existing patients — the appointment anchor
+    misses existing patients whose PMS history isn't linked to the matched
+    record (common: duplicate/merged records), and the transcript misses
+    family-on-behalf callers — so the union is used. A caller flagged by neither
+    is NEW (new-patient acquisition). The ``appt_*`` flags split existing patients
+    by the recency of their last appointment BEFORE the call (appointment-only,
+    against the hearing-care recall cycle): ``appt_active`` = within 12 months;
+    ``appt_lapsing`` = 12–24 months; ``appt_deep_dormant`` = 24 months+;
+    ``appt_none`` = existing patient with no prior appointment (transcript-only /
+    tested-not-sold — dormant from day one). Active vs dormant = appt_active vs
+    NOT appt_active; the bands are a sub-segmentation of existing only.
+
+    ``reconciled`` (booked) is ORTHOGONAL to patient type — it does NOT exclude
+    existing patients; a booking is reported within its type segment
+    (booked_new vs booked_existing). ``tx_existing`` exposes the raw transcript
+    flag.
+
+    NOTE: ``genuine`` requires ``has_cs`` (a callscoring row / transcript
+    exists). Calls with NO transcript are ``no_transcript`` and partition the
+    total alongside spam / wrong — they are NOT under genuine. Everything
+    downstream keys on ``connected_raw`` (which implies ``has_cs``), so only
+    genuine / never-connected shift because of this."""
+    return f"""
+        WITH c AS (
+          SELECT
+            t.complete_call_id,
+            t.timestamp                                    AS call_ts,
+            t.start_time_local                             AS start_time_local,
+            t.calling_phone_number                         AS phone_raw,
+            RIGHT(REGEXP_REPLACE(IFNULL(t.calling_phone_number, ''), r'\\D', ''), 10) AS phone_norm,
+            IFNULL(cs.spam_or_solicitor, FALSE)            AS spam,
+            IFNULL(cs.wrong_number, FALSE)                 AS wrong,
+            (cs.complete_call_id IS NOT NULL)              AS has_cs,
+            IFNULL(cs.empty_transcript, FALSE)             AS empty_transcript,
+            IFNULL(cs.no_conversation, FALSE)              AS no_conv,
+            cs.no_conversation_type                        AS no_conv_type,
+            IFNULL(cs.qualified_lead_no_conversion, FALSE) AS qualified,
+            IFNULL(cs.existing_customer, FALSE)            AS tx_existing,
+            IFNULL(cs.looking_to_book, FALSE)              AS looking_to_book,
+            IFNULL(cs.appointment_booked, FALSE)           AS appt_booked,
+            cs.reasoning                                   AS reasoning
+          FROM `{_CLINIC_DATA}.transactions` t
+          LEFT JOIN `{_CLINIC_DATA}.callscoring` cs
+            ON cs.complete_call_id = t.complete_call_id
+          WHERE CAST(t.invoca_campaign_id AS STRING) IN {in_iv}
+            AND {_ts_between('t.timestamp', w)}
+          -- Exactly one row per call: transactions (and occasionally callscoring)
+          -- can carry duplicate complete_call_id rows; keep the latest-scored so
+          -- every consumer (funnel counts, tree, per-call table) agrees.
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY t.complete_call_id
+            ORDER BY cs.scored_at DESC NULLS LAST, t.timestamp DESC) = 1
+        ),
+        patients AS (
+          SELECT DISTINCT client_id, phone_norm
+          FROM `{_PATIENT_CONTACTS}`
+          WHERE _clinic_id = @clinic_id AND LENGTH(phone_norm) = 10
+        ),
+        -- PMS appointment dates for the clinic's patients, keyed by contact phone.
+        -- Reuses the ``patients`` CTE so there's no second contacts scan.
+        appt_dates AS (
+          SELECT p.phone_norm, SAFE_CAST(a.start_time AS TIMESTAMP) AS appt_ts, a.status_2
+          FROM patients p
+          JOIN `{_BP}.Appointments` a
+            ON a.client_id = p.client_id AND a._clinic_id = @clinic_id
+        ),
+        -- PMS prior-appointment signal: TRUE when the caller's phone matches a
+        -- clinic patient who has an appointment DATED BEFORE the call. One boolean
+        -- per call (LOGICAL_OR across any matching appointment). Combined with the
+        -- transcript flag as a UNION (see ``existing`` in ``tagged``), so each
+        -- catches what the other misses.
+        prior_appt AS (
+          SELECT c.complete_call_id,
+                 LOGICAL_OR(ad.appt_ts < c.call_ts) AS has_prior_appt,
+                 -- Most recent appointment DATED BEFORE the call. Drives the
+                 -- recency (active vs dormant) split of existing patients against
+                 -- the hearing-care recall/replacement cycle. Appointment-only.
+                 MAX(IF(ad.appt_ts < c.call_ts, ad.appt_ts, NULL)) AS last_prior_appt_ts
+          FROM c
+          LEFT JOIN appt_dates ad
+            ON ad.phone_norm = c.phone_norm AND LENGTH(c.phone_norm) = 10
+          GROUP BY c.complete_call_id
+        ),
+        booked_calls AS (
+          -- Reconciled bookings, ONE call per appointment. Each PMS appointment
+          -- created within match_days on/after a call is credited to the MOST
+          -- RECENT genuine, connected call that could have produced it (the last
+          -- call before the booking landed) — so ``booked`` counts DISTINCT
+          -- appointments, not reconciled calls. Repeat earlier calls to the same
+          -- appointment are NOT credited.
+          --
+          -- ``booked`` is ORTHOGONAL to patient type: it does NOT exclude
+          -- existing patients. New-vs-existing is a separate dimension
+          -- (``existing``), so a booking is reported within its patient-type
+          -- segment (booked_new vs booked_existing) rather than being hidden.
+          -- Still excludes spam / wrong-number / no-conversation / no-transcript
+          -- (a coincidental phone match to an appointment ≠ a booking).
+          SELECT complete_call_id FROM (
+            SELECT c.complete_call_id,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY a.event_id
+                     ORDER BY c.call_ts DESC
+                   ) AS rn
+            FROM c
+            JOIN patients p ON p.phone_norm = c.phone_norm AND LENGTH(c.phone_norm) = 10
+            JOIN `{_BP}.Appointments` a ON a._clinic_id = @clinic_id AND a.client_id = p.client_id
+            WHERE DATE_DIFF(DATE(SAFE_CAST(a.created_time AS TIMESTAMP)), DATE(c.call_ts), DAY)
+                  BETWEEN 0 AND @match_days
+              AND c.has_cs AND NOT c.empty_transcript
+              AND NOT c.spam AND NOT c.wrong AND NOT c.no_conv
+          )
+          WHERE rn = 1
+        ),
+        tagged AS (
+          SELECT
+            c.complete_call_id, c.call_ts, c.start_time_local, c.phone_raw, c.reasoning,
+            c.has_cs,
+            -- "Has a usable transcript" — a callscoring row AND real content. An
+            -- empty ``[]`` transcript still gets scored, so gate on content, not
+            -- just row existence, or empty calls wrongly land in hangup.
+            (c.has_cs AND NOT c.empty_transcript) AS has_content,
+            (NOT (c.has_cs AND NOT c.empty_transcript)) AS no_transcript,
+            c.spam,
+            (NOT c.spam AND c.wrong)             AS is_wrong,
+            (c.has_cs AND NOT c.empty_transcript AND NOT c.spam AND NOT c.wrong) AS genuine,
+            (c.complete_call_id IN (SELECT complete_call_id FROM booked_calls)) AS reconciled,
+            (c.has_cs AND NOT c.empty_transcript AND NOT c.no_conv) AS connected_raw,
+            (c.no_conv AND c.no_conv_type = 'voicemail')                        AS is_voicemail,
+            (c.no_conv AND (c.no_conv_type IS NULL OR c.no_conv_type != 'voicemail')) AS is_hangup,
+            -- ``existing`` = UNION of the PMS prior-appointment signal and the
+            -- transcript ``existing_customer`` flag. The appointment anchor catches
+            -- phone-matched existing patients with linked history; the transcript
+            -- catches existing patients whose PMS history isn't linked to the
+            -- matched record (the larger group in practice). ``tx_existing`` also
+            -- exposed raw for descriptive use.
+            c.qualified,
+            (IFNULL(pa.has_prior_appt, FALSE) OR c.tx_existing) AS existing,
+            -- Recency sub-segmentation of EXISTING patients, appointment-only,
+            -- against the hearing-care recall/replacement cycle. ACTIVE = a prior
+            -- appointment within the last 12 months (inside the annual recall
+            -- rhythm). DORMANT = last prior appointment 12+ months ago OR an
+            -- existing patient with no prior appointment at all (transcript-only /
+            -- tested-not-sold — dormant from day one). Finer bands map to the CEC
+            -- warranty-recent vs deep-dormant segmentation (lapsing 12–24mo,
+            -- deep-dormant 24mo+). Data is backfilled to 2021-01-01, so a 12-month
+            -- lookback from a 2026 call is fully observed. These flags partition
+            -- existing only; they do NOT move new / existing / connected / booked.
+            (pa.last_prior_appt_ts IS NOT NULL
+             AND DATE_DIFF(DATE(c.call_ts), DATE(pa.last_prior_appt_ts), DAY) <= 365) AS appt_active,
+            (pa.last_prior_appt_ts IS NOT NULL
+             AND DATE_DIFF(DATE(c.call_ts), DATE(pa.last_prior_appt_ts), DAY) BETWEEN 366 AND 730) AS appt_lapsing,
+            (pa.last_prior_appt_ts IS NOT NULL
+             AND DATE_DIFF(DATE(c.call_ts), DATE(pa.last_prior_appt_ts), DAY) > 730) AS appt_deep_dormant,
+            (pa.last_prior_appt_ts IS NULL) AS appt_none,
+            c.tx_existing, c.looking_to_book, c.appt_booked
+          FROM c
+          LEFT JOIN prior_appt pa USING (complete_call_id)
+        )
+    """
+
+
+# Bucket predicates over the shared ``tagged`` CTE — used by BOTH the funnel and
+# the per-call sample lists so the counts and rows match exactly. Each predicate
+# mirrors the mutually-exclusive segment of ``call_outcomes_funnel`` with the same
+# name, so a call appears under exactly one bucket here.
+_BUCKET_PREDICATE = {
+    "booked": "genuine AND connected_raw AND reconciled",
+    "existing_customer": "genuine AND connected_raw AND NOT reconciled AND NOT qualified AND existing",
+    "qualified_no_conversion": "genuine AND connected_raw AND NOT reconciled AND qualified",
+    # never_connected now = voicemail + hangup only (genuine requires a
+    # transcript), so this drill-down no longer surfaces transcript-less calls.
+    "never_connected": "genuine AND NOT connected_raw",
+    "voicemail": "genuine AND NOT connected_raw AND is_voicemail",
+    "hangup": "genuine AND NOT connected_raw AND is_hangup",
+}
+
+
+def call_outcomes_funnel(
+    clinic_id: str,
+    invoca_campaign_ids: list[str],
+    days: int = 90,
+    window: "Window | None" = None,
+    match_days: int = CALL_BOOKING_MATCH_DAYS,
+) -> dict[str, Any]:
+    """Call-traffic outcome funnel for the window. Two dimensions:
+
+    (1) Reachability partition (mutually exclusive, sums to total):
+      total → (no_transcript + spam + wrong_number, filtered out) → genuine
+            → missed (has transcript, no real conversation): voicemail + hangup
+            → connected (real conversation)
+
+    (2) Connected calls partitioned by PATIENT TYPE (mutually exclusive):
+            → new                (no prior appointment, transcript not existing)
+            → existing           → active (last appointment within 12 months)
+                                 → lapsed/dormant (last appointment 12+ months ago,
+                                   or existing with no prior appointment). Lapsed
+                                   further splits: lapsing 12–24mo, deep_dormant
+                                   24mo+, dormant_never (no prior appointment).
+
+    ``booked`` is an ORTHOGONAL overlay on connected calls (NOT a bucket): a call
+    reconciled to a ``PMS_Unified.Appointments`` row CREATED within ``match_days``
+    on/after the call, credited to the most-recent such call per appointment. It
+    is reported within each patient-type segment — ``booked_new`` and
+    ``booked_existing`` (they sum to ``booked``) — so bookings by existing
+    patients are surfaced, not hidden.
+
+    ``no_transcript`` = calls with no callscoring row; they sit beside spam /
+    wrong_number, NOT under genuine. Level-1 partition:
+    no_transcript + spam + wrong_number + genuine = total;
+    genuine = voicemail + hangup + connected;
+    connected = new + existing; existing = active + lapsed.
+    ``qualified_not_booked`` / ``other`` are the no-booking split of NEW callers,
+    retained for the new-patient leak view. Empty Invoca list → all zeros."""
+    w = _win(window, days)
+    out = {
+        "total": 0, "no_transcript": 0, "spam": 0, "wrong_number": 0, "genuine": 0,
+        "missed": 0, "voicemail": 0, "hangup": 0,
+        "connected": 0, "connected_new": 0, "connected_existing": 0,
+        "booked": 0, "booked_new": 0, "booked_existing": 0,
+        "booked_existing_active": 0, "booked_existing_lapsing": 0,
+        "booked_existing_deep_dormant": 0, "booked_existing_never": 0,
+        "existing_patient": 0, "existing_active": 0, "existing_lapsed": 0,
+        "existing_lapsing": 0, "existing_deep_dormant": 0, "existing_dormant_never": 0,
+        "qualified_not_booked": 0, "other": 0, "booked_rate": None,
+        "booked_method": "pms_reconciled", "match_days": int(match_days),
+    }
+    if not invoca_campaign_ids:
+        return out
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
+    # Funnel is strictly nested (so the visual differences are exact):
+    #   total     = no_transcript + spam + wrong_number + genuine
+    #   genuine   = connected + never-connected(missed); missed = voicemail + hangup
+    #   connected = booked + existing_patient + qualified_not_booked + other
+    #     where existing_patient == connected_existing (existing-patient activity:
+    #     reschedules / pickups / service — NOT a new booking).
+    # ``booked`` = distinct PMS booking on a genuine connected call, credited to
+    # the most-recent such call per appointment (orthogonal to patient type;
+    # booked_new + booked_existing == booked). ``qualified``/``other`` are the
+    # no-booking split of NEW callers.
+    sql = _call_tagging_cte(in_iv, w) + """
+            SELECT
+              COUNT(*)                                                              AS total,
+              COUNTIF(no_transcript)                                                AS no_transcript,
+              COUNTIF(spam)                                                         AS spam,
+              COUNTIF(is_wrong)                                                     AS wrong_number,
+              COUNTIF(genuine)                                                      AS genuine,
+              COUNTIF(genuine AND connected_raw)                                    AS connected,
+              COUNTIF(genuine AND connected_raw AND NOT existing)                   AS connected_new,
+              COUNTIF(genuine AND connected_raw AND existing)                       AS connected_existing,
+              COUNTIF(genuine AND NOT connected_raw)                                AS missed,
+              COUNTIF(genuine AND NOT connected_raw AND is_voicemail)               AS voicemail,
+              COUNTIF(genuine AND NOT connected_raw AND is_hangup)                  AS hangup,
+              -- Booked overlay (orthogonal to patient type).
+              COUNTIF(genuine AND connected_raw AND reconciled)                     AS booked,
+              COUNTIF(genuine AND connected_raw AND reconciled AND NOT existing)     AS booked_new,
+              COUNTIF(genuine AND connected_raw AND reconciled AND existing)         AS booked_existing,
+              -- WHO among existing patients is booking, by recency of last visit:
+              -- active (coming anyway) vs dormant/reactivated (ad pulled them back).
+              -- These four sum to ``booked_existing``.
+              COUNTIF(genuine AND connected_raw AND reconciled AND existing AND appt_active)       AS booked_existing_active,
+              COUNTIF(genuine AND connected_raw AND reconciled AND existing AND appt_lapsing)      AS booked_existing_lapsing,
+              COUNTIF(genuine AND connected_raw AND reconciled AND existing AND appt_deep_dormant) AS booked_existing_deep_dormant,
+              COUNTIF(genuine AND connected_raw AND reconciled AND existing AND appt_none)         AS booked_existing_never,
+              -- Patient-type partition of connected (existing → active / lapsed).
+              COUNTIF(genuine AND connected_raw AND existing)                        AS existing_patient,
+              -- Recency split of existing (appointment-only, 12-month recall cut).
+              -- active + lapsed == existing_patient; lapsed = lapsing + deep_dormant
+              -- + dormant_never (existing patients with no prior appointment).
+              COUNTIF(genuine AND connected_raw AND existing AND appt_active)         AS existing_active,
+              COUNTIF(genuine AND connected_raw AND existing AND NOT appt_active)     AS existing_lapsed,
+              COUNTIF(genuine AND connected_raw AND existing AND appt_lapsing)        AS existing_lapsing,
+              COUNTIF(genuine AND connected_raw AND existing AND appt_deep_dormant)   AS existing_deep_dormant,
+              COUNTIF(genuine AND connected_raw AND existing AND appt_none)           AS existing_dormant_never,
+              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT existing AND looking_to_book)     AS qualified_not_booked,
+              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT existing AND NOT looking_to_book) AS other
+            FROM tagged
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+        ])).result())
+    except Exception as exc:
+        log.warning("call_outcomes_funnel failed clinic=%s: %s", clinic_id, exc)
+        return out
+    if rows:
+        r = rows[0]
+        out["total"] = int(r.total or 0)
+        out["no_transcript"] = int(r.no_transcript or 0)
+        out["spam"] = int(r.spam or 0)
+        out["wrong_number"] = int(r.wrong_number or 0)
+        out["genuine"] = int(r.genuine or 0)
+        out["booked"] = int(r.booked or 0)
+        out["booked_new"] = int(r.booked_new or 0)
+        out["booked_existing"] = int(r.booked_existing or 0)
+        out["booked_existing_active"] = int(r.booked_existing_active or 0)
+        out["booked_existing_lapsing"] = int(r.booked_existing_lapsing or 0)
+        out["booked_existing_deep_dormant"] = int(r.booked_existing_deep_dormant or 0)
+        out["booked_existing_never"] = int(r.booked_existing_never or 0)
+        out["connected"] = int(r.connected or 0)
+        out["connected_new"] = int(r.connected_new or 0)
+        out["connected_existing"] = int(r.connected_existing or 0)
+        out["missed"] = int(r.missed or 0)
+        out["voicemail"] = int(r.voicemail or 0)
+        out["hangup"] = int(r.hangup or 0)
+        out["existing_patient"] = int(r.existing_patient or 0)
+        out["existing_active"] = int(r.existing_active or 0)
+        out["existing_lapsed"] = int(r.existing_lapsed or 0)
+        out["existing_lapsing"] = int(r.existing_lapsing or 0)
+        out["existing_deep_dormant"] = int(r.existing_deep_dormant or 0)
+        out["existing_dormant_never"] = int(r.existing_dormant_never or 0)
+        out["qualified_not_booked"] = int(r.qualified_not_booked or 0)
+        out["other"] = int(r.other or 0)
+        out["booked_rate"] = (out["booked"] / out["connected"]) if out["connected"] else None
+    return out
+
+
+def call_funnel_matthew_split(
+    clinic_id: str,
+    invoca_campaign_ids: list[str],
+    days: int = 90,
+    window: "Window | None" = None,
+    match_days: int = CALL_BOOKING_MATCH_DAYS,
+) -> dict[str, int] | None:
+    """For each CONNECTED funnel bucket, how many calls were answered by Matthew
+    (the AI receptionist) rather than clinic staff. Reuses the funnel's shared
+    tagging CTE and joins ``ClinicData.matthew_calls`` by ``complete_call_id``,
+    so the per-bucket splits reconcile exactly with ``call_outcomes_funnel``.
+
+    Returns None when there is no Matthew signal — the ``matthew_calls`` table is
+    absent (clinics without the AI receptionist) or no connected call was
+    Matthew-answered — so the caller can omit the split. Kept SEPARATE from
+    ``call_outcomes_funnel`` on purpose: a missing ``matthew_calls`` table must
+    not zero out the main funnel."""
+    w = _win(window, days)
+    if not invoca_campaign_ids:
+        return None
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
+    # Matthew membership as a set test in the SELECT (not a CTE join): it keeps
+    # the shared tagging CTE untouched and confines the matthew_calls reference
+    # to this one query, whose own try/except isolates a missing-table failure.
+    mx = (
+        f"complete_call_id IN (SELECT complete_call_id "
+        f"FROM `{_CLINIC_DATA}.matthew_calls` WHERE answered_by_matthew)"
+    )
+    sql = _call_tagging_cte(in_iv, w) + f"""
+            SELECT
+              COUNTIF(genuine AND connected_raw AND {mx})                                                       AS connected,
+              COUNTIF(genuine AND connected_raw AND reconciled AND {mx})                                        AS booked,
+              COUNTIF(genuine AND connected_raw AND NOT reconciled AND qualified AND {mx})                      AS qualified_not_booked,
+              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT qualified AND existing AND {mx})     AS existing_customer,
+              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT qualified AND NOT existing AND {mx}) AS other
+            FROM tagged
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+        ])).result())
+    except Exception as exc:
+        # info, not warning: a missing matthew_calls table is expected for
+        # clinics without the AI receptionist and is not an error condition.
+        log.info("call_funnel_matthew_split skipped clinic=%s: %s", clinic_id, exc)
+        return None
+    if not rows:
+        return None
+    r = rows[0]
+    split = {
+        "connected": int(r.connected or 0),
+        "booked": int(r.booked or 0),
+        "qualified_not_booked": int(r.qualified_not_booked or 0),
+        "existing_customer": int(r.existing_customer or 0),
+        "other": int(r.other or 0),
+    }
+    # No Matthew-answered connected calls → nothing to split; omit the section.
+    return split if split["connected"] > 0 else None
+
+
+def connected_outcomes_by_month(
+    clinic_id: str,
+    invoca_campaign_ids: list[str],
+    days: int = 90,
+    window: "Window | None" = None,
+    match_days: int = CALL_BOOKING_MATCH_DAYS,
+) -> list[dict]:
+    """Month-over-month distribution of CONNECTED-call outcomes: per month, the
+    split of connected calls into booked / qualified_not_booked / existing_customer
+    / other. The trend is pinned to start at ``MIN_WINDOW_DATE`` (Dec 4 2025) and
+    runs monthly through the selected window's end. Built on the SAME shared
+    tagging CTE as the funnel, so each month's segments sum to that month's
+    connected calls. Empty for no Invoca campaigns."""
+    w = _win(window, days)
+    end_incl = w.end_excl - _dt.timedelta(days=1)
+    if not invoca_campaign_ids or end_incl < MIN_WINDOW_DATE:
+        return []
+    # Pin the start of the trend to the data floor, regardless of the selected
+    # window's start; the end follows the selected range.
+    span = Window(MIN_WINDOW_DATE.isoformat(), end_incl.isoformat())
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
+    sql = _call_tagging_cte(in_iv, span) + """
+            SELECT
+              FORMAT_DATE('%Y-%m', DATE(TIMESTAMP_TRUNC(call_ts, MONTH))) AS month,
+              COUNTIF(reconciled)                                    AS booked,
+              COUNTIF(NOT reconciled AND qualified)                  AS qualified_not_booked,
+              COUNTIF(NOT reconciled AND NOT qualified AND existing) AS existing_customer,
+              COUNTIF(NOT reconciled AND NOT qualified AND NOT existing) AS other,
+              COUNT(*)                                               AS connected
+            FROM tagged
+            WHERE genuine AND connected_raw
+            GROUP BY month
+            ORDER BY month
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+        ])).result())
+    except Exception as exc:
+        log.warning("connected_outcomes_by_month failed clinic=%s: %s", clinic_id, exc)
+        return []
+    return [{
+        "month": r.month,
+        "booked": int(r.booked or 0),
+        "qualified_not_booked": int(r.qualified_not_booked or 0),
+        "existing_customer": int(r.existing_customer or 0),
+        "other": int(r.other or 0),
+        "connected": int(r.connected or 0),
+    } for r in rows]
+
+
+def pipeline_revenue_by_month(
+    clinic_id: str,
+    invoca_campaign_ids: list[str],
+    days: int = 90,
+    window: "Window | None" = None,
+) -> list[dict]:
+    """Month-over-month revenue the marketing pipeline is responsible for, pinned
+    to start Dec 2025.
+
+    A patient is "pipeline-touched" when their phone matched a tracked inbound
+    call (Invoca) OR they have a ``Referral - Zoolstra`` CounselEar appointment.
+    All their invoices in the window are summed by INVOICE month (any date — no
+    on/after-touch gate), from Dec 2025 through the selected window's end;
+    invoices are deduped by ``order_id``. Empty when the clinic has no pipeline
+    sources."""
+    w = _win(window, days)
+    end_incl = w.end_excl - _dt.timedelta(days=1)
+    if end_incl < MIN_WINDOW_DATE:
+        return []
+    # Both the touches and the invoice buckets span Dec 2025 → window end.
+    touch = Window(MIN_WINDOW_DATE.isoformat(), end_incl.isoformat())
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")" if invoca_campaign_ids else "('')"
+    sql = f"""
+        WITH call_touch AS (
+          SELECT pc.client_id AS client_id, MIN(DATE(t.timestamp)) AS touch_date
+          FROM `{_CLINIC_DATA}.transactions` t
+          JOIN `{_PATIENT_CONTACTS}` pc
+            ON pc._clinic_id = @clinic_id AND LENGTH(pc.phone_norm) = 10
+           AND pc.phone_norm = RIGHT(REGEXP_REPLACE(IFNULL(t.calling_phone_number, ''), r'\\D', ''), 10)
+          WHERE CAST(t.invoca_campaign_id AS STRING) IN {in_iv}
+            AND {_ts_between('t.timestamp', touch)}
+          GROUP BY client_id
+        ),
+        zoolstra_touch AS (
+          SELECT CAST(patient_id AS STRING) AS client_id, MIN(appt_date) AS touch_date
+          FROM `{_COUNSELEAR}.appointments`
+          WHERE _clinic_id = @clinic_id AND appt_referral_type = @ztag AND patient_id IS NOT NULL
+            AND {_date_between('appt_date', touch)}
+          GROUP BY client_id
+        ),
+        touched AS (
+          SELECT client_id, MIN(touch_date) AS touch_date
+          FROM (SELECT * FROM call_touch UNION ALL SELECT * FROM zoolstra_touch)
+          GROUP BY client_id
+        ),
+        inv AS (
+          SELECT im.order_id,
+                 SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date) AS inv_date,
+                 MAX(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS amt
+          FROM `{_BP}.InvoiceMaster` im
+          JOIN touched tt ON CAST(im.client_id AS STRING) = tt.client_id
+          WHERE im._clinic_id = @clinic_id
+            AND SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
+          GROUP BY im.order_id, inv_date
+        )
+        SELECT
+          FORMAT_DATE('%Y-%m', DATE_TRUNC(inv_date, MONTH)) AS month,
+          SUM(amt)                 AS revenue,
+          COUNT(DISTINCT order_id) AS invoices
+        FROM inv
+        WHERE {_date_between('inv_date', touch)}
+        GROUP BY month
+        ORDER BY month
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ScalarQueryParameter("ztag", "STRING", ZOOLSTRA_REFERRAL_TAG),
+        ])).result())
+    except Exception as exc:
+        log.warning("pipeline_revenue_by_month failed clinic=%s: %s", clinic_id, exc)
+        return []
+    return [{"month": r.month, "revenue": float(r.revenue or 0.0), "invoices": int(r.invoices or 0)} for r in rows]
+
+
+def form_submission_outcomes(clinic_id: str, days: int = 90,
+                             window: "Window | None" = None) -> dict[str, Any]:
+    """Online form submissions and their outcomes for the window.
+
+    For Virsono, web-form submissions are self-service bookings through the
+    embedded CounselEar portal — they land as appointments tagged
+    ``appt_referral_type = "Referral - Zoolstra"``. This returns the submission
+    count and how those appointments resolved (attended / upcoming / cancelled /
+    no-show), plus how many converted to a paid invoice and the revenue (invoices
+    dated within the window). Returns zeros (never raises) for clinics with no
+    such bookings."""
+    w = _win(window, days)
+    out = {"submissions": 0, "patients": 0, "attended": 0, "upcoming": 0,
+           "cancelled": 0, "no_show": 0, "converted_patients": 0, "revenue": 0.0}
+    sql = f"""
+        WITH subs AS (
+          SELECT appt_id, CAST(patient_id AS STRING) AS patient_id, LOWER(status) AS status
+          FROM `{_COUNSELEAR}.appointments`
+          WHERE _clinic_id = @clinic_id AND appt_referral_type = @ztag
+            AND {_date_between('appt_date', w)}
+        ),
+        agg AS (
+          SELECT
+            COUNT(*)                                                          AS submissions,
+            COUNT(DISTINCT patient_id)                                        AS patients,
+            COUNTIF(status IN ('completed', 'arrived'))                       AS attended,
+            COUNTIF(status LIKE 'cancel%')                                    AS cancelled,
+            COUNTIF(status LIKE 'no show%')                                   AS no_show,
+            COUNTIF(status NOT IN ('completed', 'arrived')
+                    AND status NOT LIKE 'cancel%' AND status NOT LIKE 'no show%') AS upcoming
+          FROM subs
+        ),
+        rev AS (
+          -- Invoices for the submitter, scoped to the report window (any date in
+          -- window — no on/after gate), consistent with the other revenue paths.
+          SELECT COUNT(DISTINCT s.patient_id) AS converted_patients,
+                 SUM(SAFE_CAST(i.total_cost AS NUMERIC)) AS revenue
+          FROM subs s
+          JOIN `{_COUNSELEAR}.invoices` i
+            ON i._clinic_id = @clinic_id AND CAST(i.patient_id AS STRING) = s.patient_id
+           AND SAFE_CAST(i.total_cost AS NUMERIC) > 0
+           AND {_date_between('i.invoice_date', w)}
+        )
+        SELECT agg.*, rev.converted_patients, rev.revenue
+        FROM agg CROSS JOIN rev
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(
+            query_parameters=_params(clinic_id, ztag=ZOOLSTRA_REFERRAL_TAG))).result())
+    except Exception as exc:
+        log.warning("form_submission_outcomes failed clinic=%s: %s", clinic_id, exc)
+        return out
+    if rows:
+        r = rows[0]
+        out["submissions"] = int(r.submissions or 0)
+        out["patients"] = int(r.patients or 0)
+        out["attended"] = int(r.attended or 0)
+        out["upcoming"] = int(r.upcoming or 0)
+        out["cancelled"] = int(r.cancelled or 0)
+        out["no_show"] = int(r.no_show or 0)
+        out["converted_patients"] = int(r.converted_patients or 0)
+        out["revenue"] = float(r.revenue or 0.0)
+    return out
+
+
+MATTHEW_CALLS_TABLE = f"{_CLINIC_DATA}.matthew_calls"
+# How many days the CounselEar booking may be created from the call and still
+# count as "the booking landed" (Matthew enters it during/just after the call).
+MATTHEW_MATCH_DAYS = 3
+
+
+def matthew_outcomes(clinic_id: str, invoca_campaign_ids: list[str], days: int = 90,
+                     window: "Window | None" = None,
+                     match_days: int = CALL_BOOKING_MATCH_DAYS) -> dict[str, Any]:
+    """Outcomes of calls handled by the Matthew AI receptionist (Virsono).
+
+    Built on the SAME shared call-tagging CTE (:func:`_call_tagging_cte`) as the
+    call funnel and the "Booked — what was said" drawer, then intersected with
+    ``ClinicData.matthew_calls`` (``answered_by_matthew = TRUE``). This guarantees
+    every number here reconciles with the funnel/drawer — same call set (the
+    clinic's Invoca campaigns), same "handled by Matthew" (``answered_by_matthew``)
+    and same "booked" (``genuine AND connected_raw AND reconciled``) definitions.
+
+    ``answered`` — Matthew-handled calls in the funnel's call set.
+    ``booked``  — of those, the ones in the funnel's booked bucket (caller
+       reconciled to a PMS appointment). Identical, by construction, to the count
+       of ``booked_by_matthew`` rows in the Booked drawer. We do NOT require the
+       transcript ``appointment_confirmed`` flag — Matthew triages + transfers
+       rather than confirming a date, so most booked calls read as
+       ``engaged_no_conversion`` (requiring ``appointment_confirmed`` undercounted
+       bookings ~90%).
+    ``not_booked`` = ``answered − booked``.
+
+    ``booked`` is further split — using the per-call reasoning (callscoring's
+    ``appointment_booked``, i.e. "a NEW appointment was booked live during the
+    call; confirming/rescheduling an existing one does not count") — into:
+
+    ``booked_on_call``   — reconciled AND the transcript shows Matthew (or the
+       staffer he transferred to, on the same call) booked a NEW appointment
+       live. This is the tightest "what the AI actually converted on the call".
+    ``booked_in_window`` — reconciled but NOT booked live on the call: the PMS
+       appointment appeared within the 3-day match window without a live booking
+       on the transcript (booked after the hand-off, or the caller already had
+       an appointment). ``booked_on_call + booked_in_window = booked``.
+
+    New-patient acquisition vs existing-patient service (``existing`` = the
+    caller has an appointment dated before the call OR the transcript identifies
+    them as a current patient):
+
+    ``connected`` — genuine, connected Matthew calls (real conversations).
+    ``connected_new`` / ``connected_existing`` — that set split by ``existing``;
+       the existing share is the "service-rebooking line" character.
+    ``booked_new_patient`` / ``booked_existing_patient`` — ``booked`` split by
+       patient type (booked is orthogonal to type). They sum to ``booked``; the
+       existing share is bookings from patients the clinic already had.
+
+    The transcript-outcome breakdown (``hung_up_immediately`` /
+    ``engaged_no_conversion`` / ``confirmed``) is descriptive colour;
+    ``confirmed_not_landed`` (Matthew told the caller they're booked but the call
+    is NOT in the booked bucket) is the write-failure signal worth surfacing.
+
+    Returns zeros (never raises) for clinics with no Matthew/Invoca data.
+    Aggregate-only.
+    """
+    w = _win(window, days)
+    out = {"answered": 0, "booked": 0, "not_booked": 0,
+           "booked_on_call": 0, "booked_in_window": 0,
+           "connected": 0, "connected_new": 0, "connected_existing": 0,
+           "booked_new_patient": 0, "booked_existing_patient": 0,
+           "hung_up_immediately": 0, "engaged_no_conversion": 0,
+           "confirmed": 0, "confirmed_not_landed": 0}
+    if not invoca_campaign_ids:
+        return out
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
+    sql = _call_tagging_cte(in_iv, w) + f""",
+        mc AS (
+          SELECT complete_call_id, ANY_VALUE(outcome) AS outcome
+          FROM `{MATTHEW_CALLS_TABLE}`
+          WHERE answered_by_matthew = TRUE AND clinic_id = @clinic_id
+          GROUP BY complete_call_id
+        ),
+        matthew AS (
+          -- Matthew-handled calls within the funnel's (campaign-scoped) call set,
+          -- flagged with the funnel's own booked-bucket predicate.
+          SELECT t.complete_call_id, mc.outcome, t.appt_booked, t.existing,
+                 (t.genuine AND t.connected_raw)               AS connected,
+                 (t.genuine AND t.connected_raw AND t.reconciled) AS booked
+          FROM tagged t JOIN mc USING (complete_call_id)
+        )
+        SELECT
+          COUNT(*)                                                    AS answered,
+          COUNTIF(booked)                                             AS booked,
+          -- Split of `booked` by the per-call reasoning: booked LIVE on the call
+          -- (a new appointment was made during the call) vs merely reconciled to
+          -- an appointment in the 3-day window without a live booking.
+          COUNTIF(booked AND appt_booked)                             AS booked_on_call,
+          COUNTIF(booked AND NOT appt_booked)                         AS booked_in_window,
+          -- New-patient acquisition vs existing-patient service (PMS ground truth:
+          -- existing = caller had an appointment dated before the call).
+          COUNTIF(connected)                                          AS connected,
+          COUNTIF(connected AND NOT existing)                         AS connected_new,
+          COUNTIF(connected AND existing)                             AS connected_existing,
+          -- Booked split by patient type (booked is orthogonal to type).
+          COUNTIF(booked AND NOT existing)                            AS booked_new_patient,
+          COUNTIF(booked AND existing)                                AS booked_existing_patient,
+          COUNTIF(outcome = 'hung_up_immediately')                    AS hung_up_immediately,
+          COUNTIF(outcome = 'engaged_no_conversion')                  AS engaged_no_conversion,
+          COUNTIF(outcome = 'appointment_confirmed')                  AS confirmed,
+          COUNTIF(outcome = 'appointment_confirmed' AND NOT booked)   AS confirmed_not_landed
+        FROM matthew
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+        ])).result())
+    except Exception as exc:
+        log.warning("matthew_outcomes failed clinic=%s: %s", clinic_id, exc)
+        return out
+    if rows:
+        r = rows[0]
+        out["answered"] = int(r.answered or 0)
+        out["booked"] = int(r.booked or 0)
+        out["booked_on_call"] = int(r.booked_on_call or 0)
+        out["booked_in_window"] = int(r.booked_in_window or 0)
+        out["connected"] = int(r.connected or 0)
+        out["connected_new"] = int(r.connected_new or 0)
+        out["connected_existing"] = int(r.connected_existing or 0)
+        out["booked_new_patient"] = int(r.booked_new_patient or 0)
+        out["booked_existing_patient"] = int(r.booked_existing_patient or 0)
+        out["hung_up_immediately"] = int(r.hung_up_immediately or 0)
+        out["engaged_no_conversion"] = int(r.engaged_no_conversion or 0)
+        out["confirmed"] = int(r.confirmed or 0)
+        out["confirmed_not_landed"] = int(r.confirmed_not_landed or 0)
+        out["not_booked"] = max(out["answered"] - out["booked"], 0)
+    return out
+
+
+def matthew_outcomes_by_month(clinic_ids: list[str], days: int = 90,
+                              window: "Window | None" = None) -> list[dict]:
+    """Month-over-month Matthew call outcomes: per month, answered calls split
+    into appointment_confirmed / engaged_no_conversion / hung_up_immediately.
+    Pinned to start Dec 2025 (like ``connected_outcomes_by_month``); deduped by
+    complete_call_id via the transactions timestamp join. Empty for no clinics."""
+    w = _win(window, days)
+    end_incl = w.end_excl - _dt.timedelta(days=1)
+    if not clinic_ids or end_incl < MIN_WINDOW_DATE:
+        return []
+    span = Window(MIN_WINDOW_DATE.isoformat(), end_incl.isoformat())
+    sql = f"""
+        WITH mc AS (
+          SELECT complete_call_id, ANY_VALUE(outcome) AS outcome
+          FROM `{MATTHEW_CALLS_TABLE}`
+          WHERE answered_by_matthew = TRUE AND clinic_id IN UNNEST(@clinic_ids)
+          GROUP BY complete_call_id
+        ),
+        ts AS (
+          SELECT complete_call_id, MIN(timestamp) AS call_ts
+          FROM `{_CLINIC_DATA}.transactions`
+          WHERE {_ts_between('timestamp', span)}
+          GROUP BY complete_call_id
+        ),
+        m AS (SELECT mc.outcome, ts.call_ts FROM mc JOIN ts USING (complete_call_id))
+        SELECT
+          FORMAT_DATE('%Y-%m', DATE(TIMESTAMP_TRUNC(call_ts, MONTH))) AS month,
+          COUNTIF(outcome = 'appointment_confirmed') AS appointment_confirmed,
+          COUNTIF(outcome = 'engaged_no_conversion') AS engaged_no_conversion,
+          COUNTIF(outcome = 'hung_up_immediately')   AS hung_up_immediately,
+          COUNT(*)                                   AS answered
+        FROM m
+        GROUP BY month
+        ORDER BY month
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("clinic_ids", "STRING", list(clinic_ids)),
+        ])).result())
+    except Exception as exc:
+        log.warning("matthew_outcomes_by_month failed clinics=%s: %s", clinic_ids, exc)
+        return []
+    return [{
+        "month": r.month,
+        "appointment_confirmed": int(r.appointment_confirmed or 0),
+        "engaged_no_conversion": int(r.engaged_no_conversion or 0),
+        "hung_up_immediately": int(r.hung_up_immediately or 0),
+        "answered": int(r.answered or 0),
+    } for r in rows]
+
+
+def matthew_leak_calls(clinic_id: str, invoca_campaign_ids: list[str], window: "Window",
+                       limit: int = 500,
+                       match_days: int = CALL_BOOKING_MATCH_DAYS) -> list[dict]:
+    """Per-call detail for Matthew's NON-CONVERTED calls — the appendix drill-down
+    counterpart to :func:`leak_calls`, returned in the same row shape (+``outcome``).
+
+    A Matthew-handled call counts as *booked* when the caller reconciles to a PMS
+    appointment created within ``match_days`` on/after the call — the SAME
+    reconciliation as :func:`matthew_outcomes` and the call funnel (regardless of
+    transcript outcome, since Matthew triages + transfers rather than confirming a
+    date). Everything else Matthew answered is non-converted and listed here:
+    hang-ups, engaged-but-no-booking, and ``appointment_confirmed`` calls whose
+    booking never reached the PMS. This is exactly ``answered − booked`` from
+    :func:`matthew_outcomes`, so the counts reconcile.
+
+    Each row: ``complete_call_id`` (→ transcript), ``date`` (local), ``phone``,
+    ``reasoning``, ``outcome`` (human label). PHI — gated + audited at the endpoint.
+    Empty for no clinics."""
+    if not invoca_campaign_ids:
+        return []
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
+    # Same shared tagging CTE as the funnel + drawer, intersected with Matthew's
+    # handled calls; list the ones NOT in the funnel's booked bucket. This is
+    # exactly ``answered − booked`` from matthew_outcomes, so the counts reconcile.
+    sql = _call_tagging_cte(in_iv, window) + f""",
+        mc AS (
+          SELECT complete_call_id,
+                 ANY_VALUE(outcome)   AS outcome,
+                 ANY_VALUE(reasoning) AS reasoning
+          FROM `{MATTHEW_CALLS_TABLE}`
+          WHERE answered_by_matthew = TRUE AND clinic_id = @clinic_id
+          GROUP BY complete_call_id
+        )
+        SELECT t.complete_call_id, t.start_time_local, t.phone_raw,
+               mc.reasoning, mc.outcome
+        FROM tagged t JOIN mc USING (complete_call_id)
+        WHERE NOT (t.genuine AND t.connected_raw AND t.reconciled)
+        ORDER BY t.call_ts DESC
+        LIMIT @limit
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+            bigquery.ScalarQueryParameter("limit", "INT64", int(limit)),
+        ])).result())
+    except Exception as exc:
+        log.warning("matthew_leak_calls failed clinic=%s: %s", clinic_id, exc)
+        return []
+    labels = {
+        "hung_up_immediately":   "Hung up immediately",
+        "engaged_no_conversion": "Engaged, no conversion",
+        "appointment_confirmed": "Confirmed — not in PMS",
+    }
+    return [{
+        "complete_call_id": r.get("complete_call_id"),
+        "date":     r.get("start_time_local"),
+        "phone":    r.get("phone_raw"),
+        "reasoning": r.get("reasoning") or "",
+        "outcome":  labels.get(r.get("outcome"), r.get("outcome")),
+    } for r in rows]
+
+
+def leak_calls(clinic_id: str, invoca_campaign_ids: list[str], bucket: str,
+               window: "Window", limit: int = 500,
+               match_days: int = CALL_BOOKING_MATCH_DAYS) -> list[dict]:
+    """Per-call sample rows for one call-funnel bucket — the calls behind
+    "Booked" (``booked``), "Existing customer" (``existing_customer``),
+    "Never connected" (``never_connected``) and "Qualified - No Conversion"
+    (``qualified_no_conversion``). Uses the SAME shared tagging CTE + bucket
+    predicate as ``call_outcomes_funnel``, so these rows are exactly the calls
+    the funnel counts in that bucket (the buckets are mutually exclusive, so each
+    call appears under one only — e.g. a qualified call that reconciled to a
+    booking counts as *booked*, not *qualified*). ``limit`` caps how many sample
+    rows come back (newest first). Each row: ``complete_call_id`` (→ transcript),
+    ``date`` (local), ``phone`` (caller), ``reasoning``. PHI — gated
+    admin/super_admin + audited at the endpoint. Empty for unknown bucket / no
+    Invoca campaigns."""
+    predicate = _BUCKET_PREDICATE.get(bucket)
+    if not predicate or not invoca_campaign_ids:
+        return []
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
+    sql = _call_tagging_cte(in_iv, window) + f"""
+            SELECT complete_call_id, start_time_local, phone_raw, reasoning
+            FROM tagged
+            WHERE {predicate}
+            ORDER BY call_ts DESC
+            LIMIT @limit
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+            bigquery.ScalarQueryParameter("limit", "INT64", int(limit)),
+        ])).result())
+    except Exception as exc:
+        log.warning("leak_calls failed clinic=%s bucket=%s: %s", clinic_id, bucket, exc)
+        return []
+    return [{
+        "complete_call_id": r.get("complete_call_id"),
+        "date": r.get("start_time_local"),
+        "phone": r.get("phone_raw"),
+        "reasoning": r.get("reasoning") or "",
+    } for r in rows]
+
+
+def _matthew_booked_call_ids(clinic_id: str, call_ids: list[str]) -> set[str]:
+    """Of ``call_ids`` (all already in the PMS-reconciled *booked* bucket), which
+    were handled BY Matthew — the Matthew AI receptionist answered the call
+    (``matthew_calls.answered_by_matthew = TRUE``).
+
+    "Handled by Matthew" is defined identically here, in :func:`matthew_outcomes`,
+    and in the funnel — just ``answered_by_matthew`` — so the Booked drawer flag,
+    the "Calls handled by Matthew" section, and the funnel all agree. We do NOT
+    require ``outcome = 'appointment_confirmed'``: Matthew triages the caller,
+    collects details and *transfers to the clinic* rather than confirming a date,
+    so the transcript outcome is almost always ``engaged_no_conversion`` even when
+    the call drives a booking (requiring ``appointment_confirmed`` undercounted
+    Matthew-driven bookings by ~90%). Booked-bucket membership (these ``call_ids``)
+    already proves the appointment landed.
+
+    Kept as a separate, self-contained query (rather than joined into the booked
+    tagging CTE) so a missing/empty ``matthew_calls`` table — every non-Virsono
+    clinic — can never break the Booked drill-down; it just returns an empty set.
+    """
+    if not call_ids:
+        return set()
+    sql = f"""
+        SELECT DISTINCT complete_call_id
+        FROM `{MATTHEW_CALLS_TABLE}`
+        WHERE clinic_id = @clinic_id
+          AND complete_call_id IN UNNEST(@call_ids)
+          AND answered_by_matthew = TRUE
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ArrayQueryParameter("call_ids", "STRING", list(call_ids)),
+        ])).result())
+    except Exception as exc:
+        log.warning("_matthew_booked_call_ids failed clinic=%s: %s", clinic_id, exc)
+        return set()
+    return {r.complete_call_id for r in rows}
+
+
+def booked_sample_calls(clinic_id: str, invoca_campaign_ids: list[str],
+                        window: "Window", limit: int = 4,
+                        match_days: int = CALL_BOOKING_MATCH_DAYS) -> list[dict]:
+    """Sample "Booked" calls, each enriched with the appointment it reconciled to.
+
+    Same rows as ``leak_calls(bucket="booked")`` — genuine, connected calls whose
+    caller has a ``PMS_Unified.Appointments`` row CREATED within ``match_days``
+    on/after the call — but each row carries the booking it drove under
+    ``booking`` (the earliest such appointment's ``date``/``title``/``type``/
+    ``status``). Reuses the SAME shared tagging CTE + booked-reconciliation join as
+    ``call_outcomes_funnel``, so these are exactly the calls the funnel counts as
+    booked. PHI (caller phone + booking detail) — gated admin/super_admin +
+    audited at the endpoint. Empty for no Invoca campaigns.
+
+    Each row also carries ``booked_by_matthew`` — TRUE when the Matthew AI
+    receptionist handled the call (answered + engaged; see
+    :func:`_matthew_booked_call_ids`). Virsono only; always FALSE elsewhere."""
+    if not invoca_campaign_ids:
+        return []
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
+    predicate = _BUCKET_PREDICATE["booked"]
+    # Append a `booking` CTE to the shared tagging WITH block, then join it to the
+    # booked rows. `c` and `patients` are exposed by _call_tagging_cte; the join
+    # here mirrors its `booked_calls` reconciliation exactly (so every booked call
+    # matches), picking the earliest-created reconciling appointment per call.
+    sql = _call_tagging_cte(in_iv, window) + f""",
+        booking AS (
+            SELECT * EXCEPT(rn) FROM (
+                SELECT
+                  c.complete_call_id,
+                  SUBSTR(a.start_time, 1, 16)        AS appt_start_time,
+                  a.title                            AS appt_title,
+                  a.event_type                       AS appt_type,
+                  a.status_2                         AS appt_status,
+                  ROW_NUMBER() OVER (
+                      PARTITION BY c.complete_call_id
+                      ORDER BY SAFE_CAST(a.created_time AS TIMESTAMP) ASC
+                  ) AS rn
+                FROM c
+                JOIN patients p ON p.phone_norm = c.phone_norm AND LENGTH(c.phone_norm) = 10
+                JOIN `{_BP}.Appointments` a
+                  ON a._clinic_id = @clinic_id AND a.client_id = p.client_id
+                WHERE DATE_DIFF(DATE(SAFE_CAST(a.created_time AS TIMESTAMP)), DATE(c.call_ts), DAY)
+                      BETWEEN 0 AND @match_days
+            )
+            WHERE rn = 1
+        )
+        SELECT
+          t.complete_call_id, t.start_time_local, t.phone_raw, t.reasoning,
+          b.appt_start_time, b.appt_title, b.appt_type, b.appt_status
+        FROM tagged t
+        LEFT JOIN booking b USING (complete_call_id)
+        WHERE {predicate}
+        ORDER BY t.call_ts DESC
+        LIMIT @limit
+    """
+    try:
+        rows = list(_client().query(sql, job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+            bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+            bigquery.ScalarQueryParameter("limit", "INT64", int(limit)),
+        ])).result())
+    except Exception as exc:
+        log.warning("booked_sample_calls failed clinic=%s: %s", clinic_id, exc)
+        return []
+    out: list[dict] = []
+    for r in rows:
+        booking = None
+        if r.get("appt_start_time") or r.get("appt_title") or r.get("appt_status"):
+            booking = {
+                "date":   r.get("appt_start_time"),
+                "title":  r.get("appt_title"),
+                "type":   r.get("appt_type"),
+                "status": r.get("appt_status"),
+            }
+        out.append({
+            "complete_call_id": r.get("complete_call_id"),
+            "date":      r.get("start_time_local"),
+            "phone":     r.get("phone_raw"),
+            "reasoning": r.get("reasoning") or "",
+            "booking":   booking,
+        })
+    matthew_ids = _matthew_booked_call_ids(
+        clinic_id, [o["complete_call_id"] for o in out if o["complete_call_id"]])
+    for o in out:
+        o["booked_by_matthew"] = o["complete_call_id"] in matthew_ids
+    return out
+
+
+def line_item_calls(
+    clinic_id: str,
+    invoca_campaign_ids: list[str],
+    window: "Window",
+    limit: int = 5000,
+    match_days: int = CALL_BOOKING_MATCH_DAYS,
+    lookback_days: int = CALL_BOOKING_LOOKBACK_DAYS,
+    clinic_tz: str | None = None,
+) -> list[dict]:
+    """Full per-call table for the line-item calls report — one row per call.
+
+    Built on the SHARED ``_call_tagging_cte`` so each row's ``outcome`` matches
+    the funnel/tree exactly. Each row carries: caller (phone + name), location,
+    marketing_channel/campaign, duration, the mutually-exclusive ``outcome``, the
+    callscoring ``reasoning``, ``has_transcript``, Matthew handling + outcome, the
+    matched PMS patient, and aggregated appointments (created within
+    ``match_days`` of the call — same rule as ``booked``) and attributed revenue
+    (the matched patient's invoices, ANY date, order-deduped, positive only —
+    the SAME method as the Overview's ``pipeline_revenue_by_month``, so the two
+    reconcile). ``datetime`` is in the clinic's own timezone when ``clinic_tz``
+    (IANA) is given. PHI — gated admin/super_admin + audited at the endpoint.
+    Empty Invoca list → []."""
+    if not invoca_campaign_ids:
+        return []
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")"
+    # Datetime in the clinic's own timezone (UTC call_ts → IANA tz); human
+    # formatting happens client-side. Fallback: Invoca's start_time_local string.
+    dt_sql = ("FORMAT_DATETIME('%Y-%m-%d %H:%M', DATETIME(t.call_ts, @clinic_tz))"
+              if clinic_tz else "t.start_time_local")
+    sql = _call_tagging_cte(in_iv, window) + f""",
+        pm AS (   -- call ↔ matched PMS patient(s), by last-10 phone
+            SELECT DISTINCT c.complete_call_id, c.call_ts, p.client_id
+            FROM c JOIN patients p
+              ON p.phone_norm = c.phone_norm AND LENGTH(c.phone_norm) = 10
+        ),
+        appt_agg AS (
+            SELECT complete_call_id,
+                   COUNT(*) AS appointment_count,
+                   ARRAY_AGG(STRUCT(start_time, event_type, status, practitioner,
+                                    location_name, created_time, sales_opportunity)
+                             ORDER BY start_time LIMIT 100) AS appointments
+            FROM (
+              SELECT pm.complete_call_id,
+                     SUBSTR(a.start_time, 1, 16) AS start_time,
+                     a.event_type                AS event_type,
+                     a.status_2                  AS status,
+                     a.practitioner              AS practitioner,
+                     a.location_name             AS location_name,
+                     a.created_time              AS created_time,
+                     a.sales_opportunity         AS sales_opportunity
+              FROM pm
+              JOIN `{_BP}.Appointments` a
+                ON a._clinic_id = @clinic_id AND a.client_id = pm.client_id
+              WHERE DATE_DIFF(DATE(SAFE_CAST(a.created_time AS TIMESTAMP)),
+                              DATE(pm.call_ts), DAY) BETWEEN 0 AND @match_days
+            )
+            GROUP BY complete_call_id
+        ),
+        first_call AS (   -- each matched patient's EARLIEST call owns their revenue
+            SELECT client_id, complete_call_id FROM (
+              SELECT client_id, complete_call_id,
+                     ROW_NUMBER() OVER (PARTITION BY client_id ORDER BY call_ts ASC) AS rn
+              FROM pm
+            ) WHERE rn = 1
+        ),
+        inv_agg AS (
+            -- Attributed revenue, matching the Overview's pipeline_revenue method:
+            -- the patient's invoices, ANY date, deduped by order_id (MAX per
+            -- order), positive only. Each order is attributed to the patient's
+            -- FIRST call so the same invoice never appears on two call rows —
+            -- the column is additive and reconciles with the Overview's per-order
+            -- dedup. No date surfaced (attribution is patient-level).
+            SELECT fc.complete_call_id,
+                   COUNT(*) AS invoice_count,
+                   SUM(o.amt) AS revenue_total,
+                   ARRAY_AGG(STRUCT(o.invoice_number AS invoice_number, o.amt AS total,
+                                    o.provider AS provider, o.location AS location)
+                             ORDER BY o.amt DESC LIMIT 100) AS invoices
+            FROM (
+              SELECT im.client_id                                     AS client_id,
+                     im.order_id                                      AS order_id,
+                     ANY_VALUE(im.invoice_number)                     AS invoice_number,
+                     MAX(SAFE_CAST(im.order_total_with_tax AS FLOAT64)) AS amt,
+                     ANY_VALUE(im.provider)                           AS provider,
+                     ANY_VALUE(im.location)                           AS location
+              FROM `{_BP}.InvoiceMaster` im
+              WHERE im._clinic_id = @clinic_id
+                AND SAFE_CAST(im.order_total_with_tax AS FLOAT64) > 0
+                AND im.client_id IN (SELECT DISTINCT client_id FROM pm)
+              GROUP BY im.client_id, im.order_id
+            ) o
+            JOIN first_call fc ON fc.client_id = o.client_id
+            GROUP BY fc.complete_call_id
+        ),
+        pid AS (
+            SELECT complete_call_id, ANY_VALUE(client_id) AS patient_id
+            FROM pm GROUP BY complete_call_id
+        ),
+        bp_name AS (   -- matched patient's name from Blueprint/PMS demographics
+            SELECT pm.complete_call_id,
+                   ANY_VALUE(NULLIF(TRIM(CONCAT(IFNULL(d.given_name, ''), ' ',
+                                              IFNULL(d.surname, ''))), '')) AS name
+            FROM pm
+            JOIN `{_BP}.ClientDemographics` d
+              ON d._clinic_id = @clinic_id AND d.client_id = pm.client_id
+            GROUP BY pm.complete_call_id
+        ),
+        mx AS (
+            SELECT complete_call_id,
+                   ANY_VALUE(answered_by_matthew) AS handled_by_matthew,
+                   ANY_VALUE(outcome)             AS matthew_outcome,
+                   ANY_VALUE(caller_name)         AS caller_name
+            FROM `{MATTHEW_CALLS_TABLE}`
+            GROUP BY complete_call_id
+        ),
+        booked_ep AS (   -- the booking calls (closest-to-appt), with phone + time
+            SELECT c.complete_call_id AS booking_call_id, c.phone_norm, c.call_ts AS booking_ts
+            FROM c
+            WHERE c.complete_call_id IN (SELECT complete_call_id FROM booked_calls)
+        ),
+        led AS (   -- non-booking calls from the SAME number that preceded a
+                   -- booking within the lookback window → "led to booking"
+            SELECT c.complete_call_id,
+                   ARRAY_AGG(b.booking_call_id ORDER BY b.booking_ts ASC LIMIT 1)[OFFSET(0)] AS booking_call_id
+            FROM c
+            JOIN booked_ep b
+              ON b.phone_norm = c.phone_norm AND LENGTH(c.phone_norm) = 10
+             AND b.booking_ts > c.call_ts
+             AND TIMESTAMP_DIFF(b.booking_ts, c.call_ts, DAY) <= @lookback_days
+            WHERE c.complete_call_id NOT IN (SELECT complete_call_id FROM booked_calls)
+            GROUP BY c.complete_call_id
+        ),
+        ep_count AS (   -- preceding-call count per booking (episode size = this + 1)
+            SELECT booking_call_id, COUNT(*) AS n_preceding FROM led GROUP BY booking_call_id
+        )
+        SELECT
+          t.complete_call_id,
+          tx.transaction_id,
+          {dt_sql}                         AS call_datetime,
+          t.phone_raw,
+          -- Blueprint patient name when the call has an associated appointment,
+          -- OR when it led to a booking (same patient who booked) — those are
+          -- confident patient matches; else the Matthew-stated name.
+          COALESCE(
+            IF(IFNULL(appt_agg.appointment_count, 0) > 0 OR led.complete_call_id IS NOT NULL,
+               bp_name.name, NULL),
+            mx.caller_name
+          )                                AS caller_name,
+          tx.city, tx.region,
+          tx.marketing_channel,
+          NULLIF(NULLIF(tx.utm_campaign, 'nan'), '') AS utm_campaign,
+          tx.duration, tx.connect_duration,
+          -- Outcome = booking RESULT for connected calls (new/existing and
+          -- looking-to-book are their own orthogonal columns now, so
+          -- existing-customer is NOT an outcome value anymore).
+          CASE
+            WHEN t.no_transcript THEN 'no_transcript'
+            WHEN t.spam          THEN 'spam'
+            WHEN t.is_wrong      THEN 'wrong_number'
+            WHEN t.connected_raw AND t.reconciled THEN 'booked'
+            WHEN t.connected_raw AND t.existing   THEN 'existing_patient'
+            WHEN t.connected_raw AND led.complete_call_id IS NOT NULL THEN 'led_to_booking'
+            WHEN t.connected_raw AND t.looking_to_book THEN 'qualified_no_conversion'
+            WHEN t.connected_raw                  THEN 'other'
+            ELSE 'no_conversation'
+          END                              AS outcome,
+          -- Axis 1: new vs existing patient (genuine connected calls only).
+          CASE WHEN t.genuine AND t.connected_raw THEN IF(t.existing, 'existing', 'new') END AS customer_type,
+          -- Axis 2: booking intent, independent of new/existing and of result.
+          t.looking_to_book                AS looking_to_book,
+          t.reasoning,
+          t.has_content                    AS has_transcript,
+          IFNULL(mx.handled_by_matthew, FALSE) AS handled_by_matthew,
+          mx.matthew_outcome,
+          (pid.patient_id IS NOT NULL)     AS patient_matched,
+          pid.patient_id,
+          IFNULL(appt_agg.appointment_count, 0) AS appointment_count,
+          appt_agg.appointments,
+          IFNULL(inv_agg.invoice_count, 0) AS invoice_count,
+          IFNULL(inv_agg.revenue_total, 0.0)   AS revenue_total,
+          inv_agg.invoices,
+          -- Booking touchpoint history: this call preceded a booking from the
+          -- same number (led_to_booking), the booking it led to, and the episode
+          -- size (touchpoints = preceding calls + the booking call itself).
+          (led.complete_call_id IS NOT NULL)   AS led_to_booking,
+          COALESCE(led.booking_call_id, IF(t.reconciled, t.complete_call_id, NULL)) AS booking_call_id,
+          CASE
+            WHEN t.reconciled THEN 1 + IFNULL(ep_self.n_preceding, 0)
+            WHEN led.complete_call_id IS NOT NULL THEN 1 + IFNULL(ep_led.n_preceding, 0)
+            ELSE 0
+          END                                  AS touchpoints
+        FROM tagged t
+        LEFT JOIN (
+          -- dedupe: transactions can carry duplicate complete_call_id rows;
+          -- one row per call keeps this join from fanning out the table.
+          SELECT complete_call_id, transaction_id, city, region, marketing_channel,
+                 utm_campaign, duration, connect_duration
+          FROM `{_CLINIC_DATA}.transactions`
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY complete_call_id ORDER BY timestamp DESC) = 1
+        ) tx ON tx.complete_call_id = t.complete_call_id
+        LEFT JOIN mx       ON mx.complete_call_id       = t.complete_call_id
+        LEFT JOIN pid      ON pid.complete_call_id      = t.complete_call_id
+        LEFT JOIN bp_name  ON bp_name.complete_call_id  = t.complete_call_id
+        LEFT JOIN appt_agg ON appt_agg.complete_call_id = t.complete_call_id
+        LEFT JOIN inv_agg  ON inv_agg.complete_call_id  = t.complete_call_id
+        LEFT JOIN led      ON led.complete_call_id      = t.complete_call_id
+        LEFT JOIN ep_count ep_self ON ep_self.booking_call_id = t.complete_call_id
+        LEFT JOIN ep_count ep_led  ON ep_led.booking_call_id  = led.booking_call_id
+        ORDER BY t.call_ts DESC
+        LIMIT @limit
+    """
+    params = [
+        bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+        bigquery.ScalarQueryParameter("match_days", "INT64", int(match_days)),
+        bigquery.ScalarQueryParameter("lookback_days", "INT64", int(lookback_days)),
+        bigquery.ScalarQueryParameter("limit", "INT64", int(limit)),
+    ]
+    if clinic_tz:
+        params.append(bigquery.ScalarQueryParameter("clinic_tz", "STRING", clinic_tz))
+    try:
+        rows = list(_client().query(
+            sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
+    except Exception as exc:
+        log.warning("line_item_calls failed clinic=%s: %s", clinic_id, exc)
+        return []
+
+    def _list(v):
+        return [dict(x) for x in v] if v else []
+
+    return [{
+        "call_id":            r.get("complete_call_id"),
+        "transaction_id":     r.get("transaction_id"),
+        "datetime":           r.get("call_datetime"),
+        "caller_phone":       r.get("phone_raw"),
+        "caller_name":        r.get("caller_name"),
+        "location":           ", ".join(x for x in [r.get("city"), r.get("region")] if x),
+        "channel":            r.get("marketing_channel"),
+        "campaign":           r.get("utm_campaign"),
+        "duration_sec":       int(r.get("duration") or 0),
+        "connect_sec":        int(r.get("connect_duration") or 0),
+        "outcome":            r.get("outcome"),
+        "customer_type":      r.get("customer_type"),
+        "looking_to_book":    bool(r.get("looking_to_book")),
+        "reasoning":          r.get("reasoning") or "",
+        "has_transcript":     bool(r.get("has_transcript")),
+        "handled_by_matthew": bool(r.get("handled_by_matthew")),
+        "matthew_outcome":    r.get("matthew_outcome"),
+        "patient_matched":    bool(r.get("patient_matched")),
+        "patient_id":         r.get("patient_id"),
+        "appointment_count":  int(r.get("appointment_count") or 0),
+        "appointments":       _list(r.get("appointments")),
+        "invoice_count":      int(r.get("invoice_count") or 0),
+        "revenue_total":      float(r.get("revenue_total") or 0.0),
+        "invoices":           _list(r.get("invoices")),
+        "led_to_booking":     bool(r.get("led_to_booking")),
+        "booking_call_id":    r.get("booking_call_id"),
+        "touchpoints":        int(r.get("touchpoints") or 0),
+    } for r in rows]
+
+
+_TRANSCRIPTS_BUCKET = "transcripts-json"
+
+
+def get_call_transcript(clinic_id: str, complete_call_id: str) -> dict | None:
+    """Fetch one call's transcript ("what was said") for the leads drill-down.
+
+    PHI: the transcript contains caller identity + health context, so the caller
+    must already be admin/super_admin (gated at the endpoint) and the access is
+    audited there. This verifies the call belongs to ``clinic_id`` (via its
+    ``callscoring`` row) before reading ``gs://transcripts-json/<ccid>.json`` —
+    so a caller can't pull an arbitrary clinic's transcript by guessing an id.
+
+    Returns ``{"complete_call_id", "turns": [{"speaker", "text"}, …]}`` or
+    ``None`` when the call isn't this clinic's or no transcript exists."""
+    owned = list(_client().query(
+        f"""SELECT 1 FROM `{_CLINIC_DATA}.callscoring`
+            WHERE clinic_id = @clinic_id AND complete_call_id = @ccid LIMIT 1""",
+        job_config=bigquery.QueryJobConfig(query_parameters=_params(clinic_id, ccid=complete_call_id)),
+    ).result())
+    if not owned:
+        return None
+
+    from google.cloud import storage
+    try:
+        blob = storage.Client(project="project-demo-2-482101").bucket(
+            _TRANSCRIPTS_BUCKET).blob(f"{complete_call_id}.json")
+        raw = json.loads(blob.download_as_text())
+    except Exception as exc:
+        log.warning("transcript fetch failed clinic=%s ccid=%s: %s", clinic_id, complete_call_id, exc)
+        return None
+
+    # Stored as a list of single-key {speaker: utterance} turns.
+    turns: list[dict] = []
+    for seg in (raw if isinstance(raw, list) else []):
+        if isinstance(seg, dict):
+            for role, text in seg.items():
+                if text:
+                    turns.append({"speaker": str(role), "text": str(text)})
+    return {"complete_call_id": complete_call_id, "turns": turns}
+
+
+def _zoolstra_form_submissions(clinic_id: str, w: "Window") -> tuple[int, int]:
+    """Virsono web-form submissions sourced from CounselEar: appointments tagged
+    ``appt_referral_type = "Referral - Zoolstra"`` (forms book directly into
+    CounselEar). Returns ``(submissions, booked)`` for the window — ``submissions``
+    = distinct such appointments by ``appt_date``; ``booked`` = those with a kept
+    status (Completed/Arrived). Returns ``(0, 0)`` (never raises) for clinics not
+    on CounselEar or when the feed is absent."""
+    booked_in = ", ".join(f"'{s}'" for s in _ZOOLSTRA_BOOKED_STATUSES)
+    try:
+        rows = list(_client().query(f"""
+            SELECT
+              COUNT(DISTINCT appt_id) AS submissions,
+              COUNT(DISTINCT IF(LOWER(status) IN ({booked_in}), appt_id, NULL)) AS booked
+            FROM `{_COUNSELEAR}.appointments`
+            WHERE _clinic_id = @clinic_id
+              AND appt_referral_type = @tag
+              AND {_date_between('appt_date', w)}
+        """, job_config=bigquery.QueryJobConfig(
+            query_parameters=_params(clinic_id, tag=ZOOLSTRA_REFERRAL_TAG))).result())
+    except Exception as exc:
+        log.warning("zoolstra form submissions failed clinic=%s: %s", clinic_id, exc)
+        return 0, 0
+    if not rows:
+        return 0, 0
+    return int(rows[0].submissions or 0), int(rows[0].booked or 0)
+
+
 def form_capture(
     clinic_id: str,
     days: int = 90,
@@ -3023,7 +4455,11 @@ def form_capture(
 ) -> dict[str, Any]:
     """Web-form volume + capture for the window: ``submissions``,
     ``form_bookings`` (submitter matched to a PMS patient with an appointment
-    on/after submission) and ``form_rate`` = form_bookings / submissions."""
+    on/after submission) and ``form_rate`` = form_bookings / submissions.
+
+    Covers two form sources: ``ClinicData.webforms`` (Jotform/relay clinics) and,
+    for CounselEar (Virsono) clinics, ``appt_referral_type = "Referral - Zoolstra"``
+    appointments that booked directly into the PMS. The two are summed."""
     w = _win(window, days)
     out = {"submissions": 0, "form_bookings": 0, "form_rate": None}
     try:
@@ -3059,12 +4495,17 @@ def form_capture(
         """, job_config=bigquery.QueryJobConfig(query_parameters=_params(clinic_id))).result())
     except Exception as exc:
         log.warning("form_capture failed clinic=%s: %s", clinic_id, exc)
-        return out
+        rows = []   # webforms unavailable; still fold in the CounselEar source below
     if rows:
         r = rows[0]
         out["submissions"] = int(r.submissions or 0)
         out["form_bookings"] = int(r.form_bookings or 0)
-        out["form_rate"] = (out["form_bookings"] / out["submissions"]) if out["submissions"] else None
+    # Virsono: web-form submissions book directly into CounselEar as
+    # 'Referral - Zoolstra' appointments. Sum them in (no-op for other clinics).
+    z_sub, z_booked = _zoolstra_form_submissions(clinic_id, w)
+    out["submissions"] += z_sub
+    out["form_bookings"] += z_booked
+    out["form_rate"] = (out["form_bookings"] / out["submissions"]) if out["submissions"] else None
     return out
 
 
@@ -3244,6 +4685,18 @@ def monthly_contact_trend(
     """, _params(clinic_id)):
         if r.mo in labels:
             labels[r.mo]["forms"] = int(r.forms or 0)
+
+    # Virsono: form submissions arrive as CounselEar 'Referral - Zoolstra'
+    # appointments. Add them per month (no-op for non-CounselEar clinics).
+    for r in _run(f"""
+        SELECT FORMAT_DATE('%Y-%m', appt_date) AS mo, COUNT(DISTINCT appt_id) AS forms
+        FROM `{_COUNSELEAR}.appointments`
+        WHERE _clinic_id = @clinic_id AND appt_referral_type = @tag
+          AND {_date_between('appt_date', span)}
+        GROUP BY mo
+    """, _params(clinic_id, tag=ZOOLSTRA_REFERRAL_TAG)):
+        if r.mo in labels:
+            labels[r.mo]["forms"] += int(r.forms or 0)
 
     for r in _run(f"""
         SELECT FORMAT_DATE('%Y-%m', SAFE.PARSE_DATE('%Y-%m-%d', invoice_date)) AS mo,

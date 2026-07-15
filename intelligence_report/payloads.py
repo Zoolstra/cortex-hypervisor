@@ -172,6 +172,7 @@ def build_overview(
     window: Window,
     location_hours: dict | None = None,
     tier: str = "none",
+    pms_type: str = "none",
     with_recommendations: bool = True,
 ) -> dict[str, Any]:
     """Assemble the 5-section Intelligence Overview payload.
@@ -191,12 +192,31 @@ def build_overview(
         "headline": lambda: q.headline_yoy(clinic_id, invoca_campaign_ids, window=w),
         "trend": lambda: q.monthly_contact_trend(clinic_id, invoca_campaign_ids, months=13),
         "lifecycle": lambda: q.lifecycle_summary(clinic_id, window=w),
+        "call_funnel": lambda: q.call_outcomes_funnel(clinic_id, invoca_campaign_ids, window=w),
+        "call_funnel_matthew": lambda: q.call_funnel_matthew_split(clinic_id, invoca_campaign_ids, window=w),
+        "form_submissions": lambda: q.form_submission_outcomes(clinic_id, window=w),
+        "call_outcomes_monthly": lambda: q.connected_outcomes_by_month(clinic_id, invoca_campaign_ids, window=w),
+        "channel_mix": lambda: q.channel_mix(clinic_id, invoca_campaign_ids, window=w),
+        "matthew": lambda: q.matthew_outcomes(clinic_id, invoca_campaign_ids, window=w),
+        "matthew_monthly": lambda: q.matthew_outcomes_by_month([clinic_id], window=w),
+        "pipeline_revenue_monthly": lambda: q.pipeline_revenue_by_month(clinic_id, invoca_campaign_ids, window=w),
+        "ad_campaigns": lambda: q.google_ads_roi(clinic_id, ga_campaign_ids, invoca_campaign_ids, window=w),
     }
     for a in anchors:
         mw = _month_window(a)
         tasks[f"m:{a.isoformat()}"] = (
             lambda mw=mw: _month_metrics(clinic_id, invoca_campaign_ids, ga_campaign_ids, mw, location_hours))
     sections = _parallel(tasks)
+
+    # Tag the call funnel with the clinic's PMS so the UI can name the system the
+    # booking was reconciled against (CounselEar / Blueprint / …), and attach the
+    # per-bucket Matthew (AI receptionist) split when there is one — the tree view
+    # shows how many of each connected outcome Matthew answered vs clinic staff.
+    if sections.get("call_funnel") is not None:
+        sections["call_funnel"]["pms_type"] = pms_type
+        ms = sections.get("call_funnel_matthew")
+        if ms:
+            sections["call_funnel"]["matthew_split"] = ms
 
     months = sorted([v for k, v in sections.items() if k.startswith("m:") and v],
                     key=lambda x: x["month"])
@@ -254,14 +274,35 @@ def build_overview(
             },
         },
         "lifecycle": sections.get("lifecycle"),
+        "call_funnel": sections.get("call_funnel"),
+        # Online form submissions (CounselEar portal) — null when none, so the
+        # section only shows for clinics that use it (Virsono).
+        "form_submissions": (lambda fs: fs if fs and fs.get("submissions") else None)(sections.get("form_submissions")),
+        "call_outcomes_monthly": sections.get("call_outcomes_monthly"),
+        "channel_mix": sections.get("channel_mix"),
+        # Matthew (AI receptionist) outcomes — only for clinics that have Matthew
+        # calls (answered>0); null otherwise so the UI hides the section.
+        "matthew": (lambda mo: mo if mo and mo.get("answered") else None)(sections.get("matthew")),
+        "matthew_monthly": sections.get("matthew_monthly"),
+        "pipeline_revenue_monthly": sections.get("pipeline_revenue_monthly"),
+        "ad_campaigns": sections.get("ad_campaigns"),
         "placeholders": ["cortex_intercept", "review_velocity"],
     }
 
     # The single "one thing that matters" headline sentence + recommendations
-    # both read from the assembled metrics, so run them last.
+    # both read from the assembled metrics, so run them last. Never let a failure
+    # here 500 the whole payload — the page renders fine without them.
     if with_recommendations:
-        payload["headline"]["one_thing"] = _one_thing_sentence(clinic_name, payload)
-        payload["recommendations"] = forward_recommendations(clinic_name, payload)
+        try:
+            payload["headline"]["one_thing"] = _one_thing_sentence(clinic_name, payload)
+        except Exception as exc:                       # pragma: no cover - defensive
+            log.warning("one_thing failed clinic=%s: %s", clinic_name, exc)
+            payload["headline"]["one_thing"] = None
+        try:
+            payload["recommendations"] = forward_recommendations(clinic_name, payload)
+        except Exception as exc:                       # pragma: no cover - defensive
+            log.warning("recommendations failed clinic=%s: %s", clinic_name, exc)
+            payload["recommendations"] = []
     else:
         payload["recommendations"] = []
     return payload
@@ -304,84 +345,6 @@ def _one_thing_sentence(clinic_name: str, payload: dict) -> str | None:
     except Exception as exc:
         log.warning("one_thing sentence failed clinic=%s: %s", clinic_name, exc)
         return None
-
-
-# ── Patient Acquisition ──────────────────────────────────────────────────────
-
-def build_acquisition(
-    *,
-    clinic_id: str,
-    clinic_name: str,
-    invoca_campaign_ids: list[str],
-    ga_campaign_ids: list[str],
-    window: Window,
-    utm_sources: list[str] | None = None,
-    utm_mediums: list[str] | None = None,
-) -> dict[str, Any]:
-    """Assemble the Calling-funnel payload. Top-of-funnel breadth (call traffic,
-    channel mix, regions/keywords, monthly trends, Google Ads ROI) is over the
-    selected window; the **call funnel** and **web forms** are month-over-month —
-    the last complete month in the window vs the month before."""
-    w = window
-    cur_anchor = w.end_excl - _one_day()
-    cur_mw = _month_window(cur_anchor)
-    prev_mw = _month_window(cur_anchor.replace(day=1) - _one_day())
-
-    def _funnel(mw):
-        return q.revenue_funnel(clinic_id, ga_campaign_ids, invoca_campaign_ids,
-                                utm_sources=utm_sources, utm_mediums=utm_mediums, window=mw) if mw else None
-
-    sections = _parallel({
-        "call_traffic": lambda: q.acquisition_call_traffic(clinic_id, invoca_campaign_ids, window=w),
-        "top_regions": lambda: q.top_calling_regions(clinic_id, invoca_campaign_ids, ga_campaign_ids, window=w),
-        "top_keywords": lambda: q.top_keywords(clinic_id, invoca_campaign_ids, ga_campaign_ids, window=w),
-        "spam": lambda: q.spam_calls_summary(clinic_id, invoca_campaign_ids, window=w),
-        "channel_mix": lambda: q.channel_mix(
-            clinic_id, invoca_campaign_ids, utm_sources=utm_sources,
-            utm_mediums=utm_mediums, window=w),
-        "monthly_trends": lambda: q.monthly_trends(clinic_id, invoca_campaign_ids, ga_campaign_ids, window=w),
-        "google_ads_roi": lambda: q.google_ads_roi(clinic_id, ga_campaign_ids, window=w),
-        "utm_sources": lambda: q.funnel_utm_sources(clinic_id, invoca_campaign_ids, window=w),
-        "utm_mediums": lambda: q.funnel_utm_mediums(clinic_id, invoca_campaign_ids, window=w),
-        # Month-over-month: call funnel + web forms (current month vs prior).
-        "revenue_funnel": lambda: _funnel(cur_mw),
-        "revenue_funnel_prev": lambda: _funnel(prev_mw),
-        "webform_funnel": lambda: q.webform_funnel(clinic_id, window=cur_mw) if cur_mw else None,
-        "webform_funnel_prev": lambda: q.webform_funnel(clinic_id, window=prev_mw) if prev_mw else None,
-        "webform_revenue": lambda: q.webform_revenue(clinic_id, window=cur_mw) if cur_mw else None,
-        "webform_revenue_prev": lambda: q.webform_revenue(clinic_id, window=prev_mw) if prev_mw else None,
-    })
-
-    cf, cfp = sections.get("revenue_funnel") or {}, sections.get("revenue_funnel_prev") or {}
-    wf, wfp = sections.get("webform_funnel") or {}, sections.get("webform_funnel_prev") or {}
-    wr, wrp = sections.get("webform_revenue") or {}, sections.get("webform_revenue_prev") or {}
-    mom = {"month": cur_mw.start_date[:7] if cur_mw else None,
-           "prior_month": prev_mw.start_date[:7] if prev_mw else None}
-
-    return {
-        "clinic_id": clinic_id,
-        "clinic_name": clinic_name,
-        "window": {"start": w.start_date, "end": (w.end_excl - _one_day()).isoformat()},
-        "filters": {"utm_sources": utm_sources or [], "utm_mediums": utm_mediums or []},
-        "mom": mom,
-        "funnel_mom": {
-            **mom,
-            "deltas": {
-                "calls": _pct_delta(cf.get("calls"), cfp.get("calls")),
-                "booked": _pct_delta(cf.get("booked"), cfp.get("booked")),
-                "invoiced": _pct_delta(cf.get("invoiced"), cfp.get("invoiced")),
-                "matched_revenue": _pct_delta(cf.get("matched_revenue"), cfp.get("matched_revenue")),
-            },
-        },
-        "webform_mom": {
-            **mom,
-            "deltas": {
-                "submissions": _pct_delta(wf.get("total_submissions"), wfp.get("total_submissions")),
-                "revenue": _pct_delta(wr.get("attributed_revenue"), wrp.get("attributed_revenue")),
-            },
-        },
-        **sections,
-    }
 
 
 def _one_day():

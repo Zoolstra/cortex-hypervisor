@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from api.audit import log_phi_access
 from api.core.db import get_session
-from api.core.orm import Clinic, GoogleAdsCampaign, Instance, InvocaCampaign
+from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, Instance, InvocaCampaign
 from api.deps import require_read_access, require_write_access, verify_token
 
 router = APIRouter()
@@ -357,7 +357,13 @@ def get_intelligence_overview(
         window=window,
         location_hours=hours,
         tier=tier,
+        pms_type=(getattr(clinic, "pms_type", None) or "none"),
     )
+    # So the clinic page can link up to instance-wide Group Intelligence when
+    # this clinic belongs to a multi-location group.
+    payload["instance_id"] = clinic.instance_id
+    payload["group_intelligence"] = bool(
+        getattr(db.get(Instance, clinic.instance_id), "multi_location_group", False))
     _cache_put(key, payload)
     return payload
 
@@ -410,48 +416,58 @@ def get_group_overview(
     return payload
 
 
-@router.get("/intelligence/{clinic_id}/acquisition")
-def get_patient_acquisition(
-    clinic_id: str,
+@router.get("/intelligence/group/{instance_id}/calls")
+def get_group_line_item_calls(
+    instance_id: str,
     start: str | None = None,
     end: str | None = None,
-    days: int = 365,
-    nocache: bool = False,
-    utm_source: list[str] = Query(default=[]),
-    utm_medium: list[str] = Query(default=[]),
+    days: int = 90,
+    limit: int = 20000,
     caller: dict = Depends(verify_token),
     db: Session = Depends(get_session),
 ):
-    """Patient Acquisition payload (JSON) — the React form of the acquisition /
-    funnel report, driven by the global date range and optional UTM filters."""
-    clinic = db.get(Clinic, clinic_id)
-    if not clinic or clinic.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="Clinic not found")
-    require_read_access(clinic.instance_id, caller)
+    """Instance-wide line-item calls — every clinic's calls in one table, each
+    reconciled against ITS OWN clinic's PMS patients (so a caller isn't matched
+    across locations) and tagged with the clinic. Gated by the instance
+    ``multi_location_group`` flag (404 when off) and PHI (admin/super_admin),
+    audited."""
+    instance = db.get(Instance, instance_id)
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    require_write_access(instance_id, caller)
+    if not getattr(instance, "multi_location_group", False):
+        raise HTTPException(status_code=404, detail="Not found")
 
     window = _resolve_window(start, end, days)
-    invoca_ids, gads_ids = _active_campaign_ids(db, clinic_id)
+    limit = max(1, min(int(limit), 50000))
+    clinics = db.execute(
+        select(Clinic.clinic_id, Clinic.clinic_name, ClinicLocationDetails.time_zone)
+        .outerjoin(ClinicLocationDetails, ClinicLocationDetails.clinic_id == Clinic.clinic_id)
+        .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
+    ).all()
 
-    key = ("acquisition", clinic_id, window.start_date, window.end_date_excl,
-           tuple(sorted(utm_source)), tuple(sorted(utm_medium)))
-    if not nocache:
-        cached = _cache_get(key)
-        if cached is not None:
-            return cached
+    from intelligence_report.queries import line_item_calls
 
-    from intelligence_report.payloads import build_acquisition
-
-    payload = build_acquisition(
-        clinic_id=clinic_id,
-        clinic_name=clinic.clinic_name,
-        invoca_campaign_ids=invoca_ids,
-        ga_campaign_ids=gads_ids,
-        window=window,
-        utm_sources=utm_source,
-        utm_mediums=utm_medium,
+    calls: list[dict] = []
+    for clinic_id, clinic_name, tz in clinics:
+        invoca_ids, _ = _active_campaign_ids(db, clinic_id)
+        if not invoca_ids:
+            continue
+        rows = line_item_calls(clinic_id, invoca_ids, window, limit=limit, clinic_tz=tz)
+        for r in rows:
+            r["clinic_id"] = clinic_id
+            r["clinic_name"] = clinic_name
+        calls.extend(rows)
+    calls.sort(key=lambda r: r.get("datetime") or "", reverse=True)
+    calls = calls[:limit]
+    log_phi_access(
+        clinic_id=instance_id,
+        action="group_line_item_calls",
+        actor=caller.get("email") or caller.get("uid") or "unknown",
+        outcome="ok",
+        detail=f"clinics={len(clinics)} n={len(calls)}",
     )
-    _cache_put(key, payload)
-    return payload
+    return {"calls": calls}
 
 
 @router.get("/intelligence/{clinic_id}/active-leads")
@@ -539,6 +555,114 @@ def search_patients(
         detail=f"results={len(results)}",
     )
     return {"clinic_id": clinic_id, "results": results}
+
+
+@router.get("/intelligence/{clinic_id}/leak-calls")
+def get_leak_calls(
+    clinic_id: str,
+    bucket: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 90,
+    limit: int = 500,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Per-call sample rows behind one call-funnel outcome bucket — ``booked``,
+    ``existing_customer``, ``never_connected`` / ``qualified_no_conversion``, or
+    Matthew's non-converted calls (``matthew_no_conversion``) — for the Overview
+    appendix drill-down dropdowns. ``limit`` (1–500) caps the sample size (the
+    dropdowns request a handful). PHI (caller phone + reasoning) —
+    admin/super_admin only, audited."""
+    if bucket not in ("booked", "existing_customer", "never_connected",
+                      "qualified_no_conversion", "matthew_no_conversion"):
+        raise HTTPException(status_code=422, detail="unknown bucket")
+    _phi_clinic(db, clinic_id, caller)
+    window = _resolve_window(start, end, days)
+    limit = max(1, min(int(limit), 500))
+
+    from intelligence_report.queries import booked_sample_calls, leak_calls, matthew_leak_calls
+
+    if bucket == "matthew_no_conversion":
+        invoca_ids, _ = _active_campaign_ids(db, clinic_id)
+        calls = matthew_leak_calls(clinic_id, invoca_ids, window, limit=limit)
+    elif bucket == "booked":
+        # "Booked" rows carry the appointment each call reconciled to.
+        invoca_ids, _ = _active_campaign_ids(db, clinic_id)
+        calls = booked_sample_calls(clinic_id, invoca_ids, window, limit=limit)
+    else:
+        invoca_ids, _ = _active_campaign_ids(db, clinic_id)
+        calls = leak_calls(clinic_id, invoca_ids, bucket, window, limit=limit)
+    log_phi_access(
+        clinic_id=clinic_id,
+        action=f"leak_calls:{bucket}",
+        actor=caller.get("email") or caller.get("uid") or "unknown",
+        outcome="ok",
+        detail=f"n={len(calls)}",
+    )
+    return {"bucket": bucket, "calls": calls}
+
+
+@router.get("/intelligence/{clinic_id}/calls")
+def get_line_item_calls(
+    clinic_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 90,
+    limit: int = 5000,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Full per-call line-item table for the clinic over the window — one row per
+    call with caller, mutually-exclusive outcome (reconciles with the funnel),
+    Matthew handling, and associated PMS appointments + attributed revenue. PHI
+    (caller phone/name, patient id, appointments, invoices) — admin/super_admin
+    only, audited."""
+    clinic = _phi_clinic(db, clinic_id, caller)
+    window = _resolve_window(start, end, days)
+    limit = max(1, min(int(limit), 20000))
+    invoca_ids, _ = _active_campaign_ids(db, clinic_id)
+
+    from intelligence_report.queries import line_item_calls
+
+    _loc = getattr(clinic, "location", None)
+    calls = line_item_calls(clinic_id, invoca_ids, window, limit=limit,
+                            clinic_tz=getattr(_loc, "time_zone", None))
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="line_item_calls",
+        actor=caller.get("email") or caller.get("uid") or "unknown",
+        outcome="ok",
+        detail=f"n={len(calls)}",
+    )
+    return {"calls": calls}
+
+
+@router.get("/intelligence/{clinic_id}/calls/{call_id}/transcript")
+def get_call_transcript_view(
+    clinic_id: str,
+    call_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """The full transcript of one call ("what was said") for the leads
+    drill-down. PHI — admin/super_admin only, audited. The query verifies the
+    call belongs to this clinic before reading it from GCS."""
+    _phi_clinic(db, clinic_id, caller)
+
+    from intelligence_report.queries import get_call_transcript
+
+    result = get_call_transcript(clinic_id, call_id)
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="call_transcript",
+        actor=caller.get("email") or caller.get("uid") or "unknown",
+        patient_id=call_id,
+        outcome="ok" if result else "not_found",
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Transcript not available")
+    return result
 
 
 @router.get("/intelligence/{clinic_id}/patients/{patient_key}/journey")

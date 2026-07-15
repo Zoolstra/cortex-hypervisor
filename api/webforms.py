@@ -96,6 +96,18 @@ def _ensure_table() -> None:
         bigquery.SchemaField("customer_type", "STRING"),
         bigquery.SchemaField("message",       "STRING"),
         bigquery.SchemaField("submitted_at", "TIMESTAMP", mode="REQUIRED"),
+        # Form provenance + lossless capture. Forms differ in layout (a "New/
+        # Returning" radio on one, a service-type radio on another, extra fields
+        # like "preferred contact method" on a third), so the typed columns above
+        # are a best-effort *core*; ``raw_fields`` keeps EVERY field verbatim so
+        # nothing is ever dropped and novel forms need no code change. ``pretty``
+        # is Jotform's human-readable "Label: Value" rendering (labels aren't in
+        # rawRequest). Promote a raw field to its own column later by backfilling
+        # from the JSON.
+        bigquery.SchemaField("form_id",     "STRING"),
+        bigquery.SchemaField("form_title",  "STRING"),
+        bigquery.SchemaField("raw_fields",  "JSON"),
+        bigquery.SchemaField("pretty",      "STRING"),
     ]
     # Check existence first so we don't issue a create — and log a benign
     # "Already Exists" audit error — on every cold start.
@@ -134,6 +146,11 @@ def _store_submission(clinic: Clinic, fields: dict) -> None:
         "customer_type": fields.get("customer_type"),
         "message":       fields.get("message"),
         "submitted_at":  datetime.now(timezone.utc).isoformat(),
+        "form_id":       fields.get("form_id"),
+        "form_title":    fields.get("form_title"),
+        # JSON-typed column: streaming insert expects the value as a JSON string.
+        "raw_fields":    json.dumps(fields["raw_fields"]) if fields.get("raw_fields") else None,
+        "pretty":        fields.get("pretty"),
     }
     errors = bq_client.insert_rows_json(WEBFORMS_TABLE, [row])
     if errors:
@@ -249,6 +266,18 @@ def _parse_jotform(raw_request: str) -> dict:
     message = (pick("message", "comment")
                or pick("textarea", "howcan", "whatcan", "reason", "inquiry", "help"))
 
+    # customer_type: try the field NAME first, then fall back to the VALUE. Field
+    # names are unreliable across forms — one form's ``radio3`` is New/Returning,
+    # another's ``radio3`` is a service-type question — but the *value*
+    # "New Customer" / "Returning Customer" is self-identifying, so a value scan
+    # catches default-named radios without mis-labelling unrelated ones.
+    customer_type = _clean(pick("newor", "returning", "customertype", "newcustomer"))
+    if not customer_type:
+        for v in fields.values():
+            if isinstance(v, str) and re.match(r"(?i)^\s*(new|returning)\b", v):
+                customer_type = v.strip()
+                break
+
     return {
         "first_name":    first,
         "last_name":     last,
@@ -262,8 +291,12 @@ def _parse_jotform(raw_request: str) -> dict:
         "gclid":         _clean(tracking("gclid")),
         "fbclid":        _clean(tracking("fbclid")),
         "landing_page":  _clean(tracking("landing_page")),
-        "customer_type": _clean(pick("newor", "returning", "customertype", "newcustomer")),
+        "customer_type": customer_type,
         "message":       _clean(message),
+        # Lossless capture: the full prefix-stripped field map, so any field the
+        # typed columns don't model (service type, preferred contact, best times…)
+        # is preserved and new form layouts need no parser change.
+        "raw_fields":    fields,
     }
 
 
@@ -294,7 +327,16 @@ async def ingest_jotform_webform(
     log.info("Jotform webhook clinic_id=%s top-level keys=%s", clinic_id, sorted(form.keys()))
     raw_request = form.get("rawRequest") or ""
 
-    _store_submission(clinic, _parse_jotform(raw_request))
+    fields = _parse_jotform(raw_request)
+    # Form provenance travels in the multipart body (not rawRequest): ``formID``
+    # / ``formTitle`` identify which clinic page it came from; ``pretty`` is the
+    # human-readable "Label: Value" rendering that gives raw_fields' cryptic
+    # unique names (radio3, textbox5…) meaning.
+    fields["form_id"] = _clean(form.get("formID"))
+    fields["form_title"] = _clean(form.get("formTitle"))
+    fields["pretty"] = _clean(form.get("pretty"))
+
+    _store_submission(clinic, fields)
     log.info("Stored Jotform submission clinic_id=%s form=%s submission=%s",
              clinic_id, form.get("formID"), form.get("submissionID"))
     return {"status": "accepted"}

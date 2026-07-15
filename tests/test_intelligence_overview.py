@@ -70,7 +70,8 @@ def test_from_days_floors_to_cutoff():
 
 
 def test_floored_returns_none_when_entirely_before_cutoff():
-    assert Window("2025-01-01", "2025-12-31").floored() is None
+    # A window ending before MIN_WINDOW_DATE (2025-12-04) floors to None.
+    assert Window("2024-01-01", "2024-12-31").floored() is None
 
 
 def test_floored_clamps_straddling_window():
