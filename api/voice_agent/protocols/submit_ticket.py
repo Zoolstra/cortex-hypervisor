@@ -33,6 +33,14 @@ class SubmitTicketProtocol(Protocol):
             "url": f"{_CORTEX_BASE}/clinics/{self.clinic_id}/voice_agent/tickets",
             "method": "POST",
             "credentialId": self.credential_id,
+            # NOTE: caller-ID auto-capture is intentionally NOT done via a tool
+            # header. VAPI's apiRequest `headers` is a JsonSchema (LLM-filled,
+            # no constant/template `value` field), and the API rejects a flat
+            # {header: "{{customer.number}}"} map. The server still reads an
+            # X-Vapi-Caller-Number header as a fallback if one is ever present,
+            # but the robust ANI capture path is the VAPI end-of-call webhook
+            # (follow-up) — the agent otherwise collects the callback number in
+            # Stage 4 and passes it as caller_phone.
             "body": {
                 "type": "object",
                 "properties": {

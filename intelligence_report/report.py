@@ -486,6 +486,7 @@ _HEAD = """<!doctype html>
     letter-spacing: 0.06em;
   }}
   section .lede {{ color: var(--cx-text-2); margin: 0 0 18px; font-size: 14px; }}
+  .note {{ color: var(--cx-text-2); margin: 4px 0 12px; font-size: 13px; }}
 
   .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 0 0 18px; }}
   .stat {{
@@ -697,6 +698,10 @@ def _section_acquisition(
     keywords = q.top_keywords(
         clinic_id, invoca_campaign_ids, google_ads_campaign_ids, days=days, top_n=10
     )
+    channels = q.traffic_drivers(clinic_id, invoca_campaign_ids, days=days)
+    paid = q.paid_campaign_drivers(
+        clinic_id, invoca_campaign_ids, google_ads_campaign_ids, days=days, top_n=10
+    )
 
     stats = (
         '<div class="stats">'
@@ -727,8 +732,45 @@ def _section_acquisition(
         [[escape(r["keyword"]), _fmt_int(r["calls"])] for r in keywords],
     )
 
+    # ── Channel mix: every non-spam call bucketed by acquisition channel ──────
+    channel_chart = _bar_chart(
+        [(c["channel"], c["calls"]) for c in channels if c["calls"] > 0]
+    )
+    channel_table = _table(
+        ["Channel", "Calls", "% of calls"],
+        [[escape(c["channel"]), _fmt_int(c["calls"]), f"{c['pct']:.1f}%"]
+         for c in channels],
+    )
+
+    # ── Paid campaigns behind the Paid calls (gclid-tracked slice only) ───────
+    paid_total = next((c["calls"] for c in channels if c["channel"] == "Paid"), 0)
+    attributed = paid["attributed_calls"]
+    campaigns_table = _table(
+        ["Campaign", "Calls"],
+        [[escape(c["campaign_name"]), _fmt_int(c["calls"])] for c in paid["campaigns"]],
+    )
+    # Coverage caption: tap-to-call (Call Extension) paid calls carry no gclid,
+    # so only the website-tracked slice can be tied to a specific campaign.
+    if paid_total:
+        cov_pct = 100.0 * attributed / paid_total
+        coverage = (
+            f'<p class="note">Campaign attribution covers '
+            f'<b>{_fmt_int(attributed)}</b> of <b>{_fmt_int(paid_total)}</b> paid calls '
+            f'({cov_pct:.0f}%) — the website-tracked slice. Tap-to-call ads '
+            f'(Google Call Extensions) carry no click ID, so the remaining paid '
+            f'calls can be counted but not tied to a specific campaign.</p>'
+        )
+    else:
+        coverage = ""
+
     body = (
         stats
+        + '<h3 style="margin-top:24px">Call traffic by channel</h3>'
+        + channel_chart
+        + channel_table
+        + '<h3 style="margin-top:24px">Paid campaigns driving calls</h3>'
+        + coverage
+        + campaigns_table
         + '<h3 style="margin-top:24px">Top 10 calling regions</h3>'
         + regions_table
         + '<h3 style="margin-top:24px">Top 10 keywords</h3>'
@@ -738,8 +780,9 @@ def _section_acquisition(
     return _section(
         1,
         "Acquisition · drivers of call traffic",
-        f"Inbound call volume over the last <b>{days}</b> days. Ad-driven calls "
-        "are phone calls which are linked to a Google click ID.",
+        f"Inbound call volume over the last <b>{days}</b> days, split by "
+        "acquisition channel from click-ID and UTM signals. Paid campaigns are "
+        "resolved for calls that carry a Google click ID (website-tracked calls).",
         body,
     )
 

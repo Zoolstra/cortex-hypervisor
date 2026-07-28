@@ -330,3 +330,116 @@ def test_jotform_garbage_rawrequest_stores_nulls(harness):
     assert row["clinic_id"] == "C1"
     assert row["first_name"] is None and row["email"] is None
     assert row["submitted_at"]  # still stamped
+
+
+# ── Coverage endpoint ──────────────────────────────────────────────────────────
+
+from datetime import datetime, timezone
+
+from api.deps import verify_token
+
+
+class _FakeCoverageDb(_FakeDb):
+    """Extends the clinic-map fake with ``execute`` for the registry select."""
+
+    def __init__(self, clinics=None, registry_rows=None):
+        super().__init__(clinics)
+        self._registry_rows = registry_rows or []
+
+    def execute(self, stmt):
+        rows = self._registry_rows
+        return SimpleNamespace(all=lambda: rows)
+
+
+def _form(clinic_id="C1", form_id="F1", title="Contact", active=True):
+    return SimpleNamespace(
+        clinic_id=clinic_id, jotform_form_id=form_id, form_title=title, active=active
+    )
+
+
+class _FakeBqJob:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def result(self):
+        return self._rows
+
+
+@pytest.fixture
+def coverage_harness(harness, monkeypatch):
+    """Layer BQ-query stubbing and a role-bearing caller onto the base harness."""
+    make_client, _ = harness
+    bq_rows: list[dict] = []
+    caller = {"role": "super_admin", "uid": "U1"}
+
+    monkeypatch.setattr(webforms.bq_client, "query", lambda sql: _FakeBqJob(bq_rows))
+
+    def _make(fake_db):
+        client = make_client(fake_db)
+        client.app.dependency_overrides[verify_token] = lambda: caller
+        return client
+
+    yield _make, bq_rows, caller
+
+
+def test_coverage_requires_super_admin(coverage_harness):
+    make_client, _, caller = coverage_harness
+    caller["role"] = "admin"
+    client = make_client(_FakeCoverageDb())
+
+    assert client.get("/webforms/coverage").status_code == 403
+
+
+def test_coverage_joins_registry_and_bq(coverage_harness):
+    make_client, bq_rows, _ = coverage_harness
+    last = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    bq_rows.extend([
+        # Registered form with traffic.
+        {"clinic_id": "C1", "form_id": "F1", "total": 10, "last_7d": 2,
+         "last_30d": 5, "last_submission_at": last},
+        # NULL form_id (JSON endpoint / pre-provenance rows) — clinic totals only.
+        {"clinic_id": "C1", "form_id": None, "total": 3, "last_7d": 1,
+         "last_30d": 2, "last_submission_at": last},
+        # Unregistered form on an unregistered clinic → drift markers.
+        {"clinic_id": "C2", "form_id": "F9", "total": 4, "last_7d": 0,
+         "last_30d": 4, "last_submission_at": last},
+    ])
+    db = _FakeCoverageDb(
+        clinics={"C1": _clinic("C1", "Alpha"), "C2": _clinic("C2", "Beta")},
+        registry_rows=[(_form("C1", "F1"), "Alpha"),
+                       (_form("C1", "F2", title="Quiet form"), "Alpha")],
+    )
+    client = make_client(db)
+
+    resp = client.get("/webforms/coverage")
+    assert resp.status_code == 200
+    by_id = {c["clinic_id"]: c for c in resp.json()}
+
+    alpha = by_id["C1"]
+    assert alpha["total"] == 13 and alpha["last_7d"] == 3          # includes NULL-form rows
+    forms = {f["jotform_form_id"]: f for f in alpha["forms"]}
+    assert forms["F1"]["total"] == 10
+    assert forms["F2"]["total"] == 0                                # registered, never fired
+    assert forms["F2"]["last_submission_at"] is None
+    assert alpha["unregistered_form_ids"] == []
+
+    beta = by_id["C2"]
+    assert beta["clinic_name"] == "Beta"                            # resolved via db.get
+    assert beta["forms"] == []                                      # data but no registry
+    assert beta["unregistered_form_ids"] == ["F9"]
+    assert beta["total"] == 4
+
+
+def test_coverage_empty_when_no_table_and_no_registry(coverage_harness, monkeypatch):
+    make_client, _, _ = coverage_harness
+
+    def _raise_not_found(sql):
+        from google.cloud.exceptions import NotFound
+        raise NotFound("no table")
+
+    monkeypatch.setattr(webforms.bq_client, "query", _raise_not_found)
+    client = make_client(_FakeCoverageDb())
+
+    resp = client.get("/webforms/coverage")
+    assert resp.status_code == 200
+    assert resp.json() == []

@@ -30,6 +30,7 @@ from api.voice_agent.protocols import (
     Protocol,
     SubmitTicketProtocol,
     VerifyCallerIdentificationProtocol,
+    load_protocol_config,
     unmet_dependencies,
 )
 from api.voice_agent.defaults import (
@@ -92,6 +93,7 @@ def _instantiate_capabilities(
     clinic: Clinic,
     enabled_capability_ids: list[str],
     credential_id: str,
+    db: Session | None = None,
 ) -> list[Protocol]:
     """
     Build the ordered list of Protocol instances for this clinic.
@@ -114,11 +116,25 @@ def _instantiate_capabilities(
     instantiated: list[Protocol] = []
 
     def make(cls: type[Protocol]) -> Protocol:
+        # Load the clinic's stored config for this protocol so config-driven
+        # prompt fragments (e.g. the troubleshooting steps) render. Best-effort:
+        # a load/validation failure falls back to model defaults rather than
+        # dropping the protocol — matches the tolerant handling elsewhere.
+        config = None
+        if db is not None:
+            try:
+                config = load_protocol_config(db, clinic.clinic_id, cls.id)
+            except Exception:
+                log.warning(
+                    "Could not load config for protocol %s clinic_id=%s; using defaults",
+                    cls.id, clinic.clinic_id, exc_info=True,
+                )
         return cls(
             clinic_id=clinic.clinic_id,
             clinic_name=clinic.clinic_name,
             pms_type=clinic.pms_type or "none",
             credential_id=credential_id,
+            config=config,
         )
 
     # Toggleable first, in registry order
@@ -462,10 +478,40 @@ def _render_qualifying_questions(
 def _stage_3a_new_patient(
     buckets: list[ClinicVoiceAgentCallerBucket],
     questions: list[ClinicVoiceAgentQualifyingQuestion] | None = None,
+    lean_intake: bool = False,
 ) -> str:
-    """Stage 3a — New Patient Discovery (only runs if Stage 2 = new)."""
-    rendered_buckets = _render_caller_buckets(buckets)
+    """Stage 3a — New Patient Discovery (only runs if Stage 2 = new).
+
+    In ``lean_intake`` mode the sales-oriented motivation/caller-bucket discovery
+    is dropped: the agent just identifies the need and routes to booking /
+    troubleshooting / take-a-message. Configured qualifying questions, if any,
+    still render (a lean clinic simply tends to have none).
+    """
     rendered_questions = _render_qualifying_questions(questions or [])
+    if lean_intake:
+        out = [
+            "## Stage 3a — New Patient (only if new)",
+            "**Goal**",
+            "1. Find out what the caller needs **[info collection point]**, then "
+            "route: if they want to book, help them book; if it's a "
+            "troubleshooting question you can help with, do that; otherwise take "
+            "a message so a team member can call them back.",
+            "",
+            "**Rules**",
+            "- Keep it brief and warm — this is an after-hours line, not a sales "
+            "conversation. Do NOT probe motivation or qualify the caller.",
+            "- To book or to leave a message, collect the caller's name and a "
+            "callback number **[info collection point]**.",
+        ]
+        if rendered_questions:
+            out.extend([
+                "",
+                "**Screening questions — ask these only if the caller is booking:**",
+                rendered_questions,
+            ])
+        return "\n".join(out)
+
+    rendered_buckets = _render_caller_buckets(buckets)
     out = [
         "## Stage 3a — New Patient Discovery (only if new)",
         "**Goals**",
@@ -618,7 +664,7 @@ def build_system_prompt(
         pms_reference or "",
         _stage_1_greeting_and_reason(clinic, persona),
         _stage_2_identity(caps),
-        _stage_3a_new_patient(buckets, questions),
+        _stage_3a_new_patient(buckets, questions, lean_intake=bool(script and script.lean_intake)),
         _stage_3b_existing_patient(script),
         _stage_4_capture_and_close(),
         *_trailing_capability_blocks(caps, inlined_ids),
@@ -652,11 +698,34 @@ def build_agent_config(db: Session, clinic: Clinic) -> dict:
     accessed inside the same session).
 
     Returns a dict suitable for ``client.assistants.create(**config)``.
+
+    Dispatch: clinics with a non-'general' ``agent_role`` on their voice-agent
+    configuration are built by the matching single-purpose role compiler in
+    ``api/voice_agent/roles.py`` instead of the stage-flow assembly below.
     """
+    # Local import — roles.py reuses this module's helpers, so importing it at
+    # module load would be circular.
+    from api.voice_agent.roles import (  # noqa: PLC0415
+        ROLE_BUILDERS, ROLE_GENERAL, resolve_agent_role,
+    )
+
+    role = resolve_agent_role(clinic)
+    builder = ROLE_BUILDERS.get(role)
+    if builder is not None:
+        return builder(db, clinic)
+    if role != ROLE_GENERAL:
+        # Fail closed: a typo'd / newer-than-code role silently falling back to
+        # the general receptionist would deploy the wrong agent for a clinic
+        # that explicitly opted out of it.
+        raise ValueError(
+            f"Unknown agent_role {role!r} for clinic {clinic.clinic_id} — no "
+            "compiler registered; refusing to fall back to the general assistant."
+        )
+
     locale = resolve_locale(clinic)
     credential_id = _vapi_credential_id()
     enabled_ids = _enabled_capability_ids(db, clinic.clinic_id)
-    caps = _instantiate_capabilities(clinic, enabled_ids, credential_id)
+    caps = _instantiate_capabilities(clinic, enabled_ids, credential_id, db=db)
     script = db.get(ClinicVoiceAgentScript, clinic.clinic_id)
     persona = db.get(ClinicVoiceAgentPersona, clinic.clinic_id)
     caller_buckets = list(db.scalars(

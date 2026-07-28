@@ -134,10 +134,16 @@ class Clinic(Base):
     protocols: Mapped[list["ClinicProtocol"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
     )
+    worklist_taxonomy: Mapped["ClinicWorklistTaxonomy"] = relationship(
+        back_populates="clinic", uselist=False, cascade="all, delete-orphan"
+    )
     google_ads_campaigns: Mapped[list["GoogleAdsCampaign"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
     )
     invoca_campaigns: Mapped[list["InvocaCampaign"]] = relationship(
+        back_populates="clinic", cascade="all, delete-orphan"
+    )
+    jotform_forms: Mapped[list["JotformForm"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
     )
 
@@ -197,6 +203,20 @@ class ClinicVoiceAgentConfiguration(Base):
     )
     vapi_assistant_id: Mapped[str | None] = mapped_column(String(64))
     vapi_phone_number_id: Mapped[str | None] = mapped_column(String(64))
+
+    # Where after-hours "take a message" tickets are pushed so a lead is never
+    # lost. Nullable — an alert is best-effort and skipped when unset. SMS is the
+    # V1 channel (Twilio creds already in SM); email is a forward-compat hook.
+    alert_sms_to: Mapped[str | None] = mapped_column(String(32))
+    alert_email_to: Mapped[str | None] = mapped_column(String(255))
+
+    # Which agent compiler builds this clinic's assistant. 'general' = the
+    # legacy stage-flow factory; other values select a single-purpose role
+    # compiler in api/voice_agent/roles.py (e.g. 'annual_booking' for ACNA's
+    # after-hours booking specialist).
+    agent_role: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="general"
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
@@ -312,6 +332,16 @@ class ClinicVoiceAgentScript(Base):
     # new_patient_intake_prompt (Qualifying Questions governs new-patient
     # inquiries).
     existing_patient_intro: Mapped[str | None] = mapped_column(Text)
+
+    # Lean-intake mode: when true, Stage 3a drops the new-patient motivation /
+    # caller-bucket "discovery" machinery (price-shopper handling etc.) and the
+    # agent just identifies the need and routes to booking / troubleshooting /
+    # take-a-message. Used for the after-hours voicemail-replacement flow where
+    # the sales-oriented daytime discovery is inappropriate. Default off so
+    # existing clinics keep the full flow.
+    lean_intake: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="0"
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
@@ -558,6 +588,48 @@ class InvocaCampaign(Base):
     clinic: Mapped["Clinic"] = relationship(back_populates="invoca_campaigns")
 
 
+# ──────────────────── jotform_forms (N) ────────────────────
+
+class JotformForm(Base):
+    """Registry for the Jotform → webhook → BigQuery lead pipeline.
+
+    A row here means the form SHOULD be delivering submissions to
+    ``POST /webforms/jotform/{clinic_id}`` — it is what lets us distinguish
+    "not set up" from "set up but broken/quiet". ``configure_jotform_webhooks.py``
+    reads this table to provision webhooks; ``GET /webforms/coverage`` joins it
+    against ``ClinicData.webforms`` to surface clinics that have gone silent.
+
+    ``jotform_form_id`` is UNIQUE globally (not per clinic): each form's webhook
+    URL targets exactly one clinic_id, so mapping a form to two clinics would
+    double-ingest every submission.
+    """
+    __tablename__ = "jotform_forms"
+    __table_args__ = (
+        UniqueConstraint("jotform_form_id", name="uq_jotform_form"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    jotform_form_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    form_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="jotform_forms")
+
+
 # ──────────────────── clinic_admins (N) ────────────────────
 
 class ClinicAdmin(Base):
@@ -619,3 +691,36 @@ class ClinicBlueprintEntityNote(Base):
         UniqueConstraint("clinic_id", "entity_kind", "entity_id",
                          name="uq_clinic_entity_note"),
     )
+
+
+# ──────────────────── clinic_worklist_taxonomy (1:1) ────────────────────
+#
+# Per-clinic definition of the reactivation worklist cohorts (tested-not-sold,
+# fitted-not-sold, no-show, …). ``config`` is a JSON blob validated against
+# ``api.account.worklist_taxonomy.WorklistTaxonomyConfig`` on write and hydrated
+# through it on read — same validate-on-write pattern as ClinicProtocol.config.
+# Which appointment event_types / statuses / invoice item_types define each
+# cohort depends on the clinic's Blueprint taxonomy, so it lives per-clinic here
+# rather than as hard-coded constants in intelligence_report/queries.py.
+
+class ClinicWorklistTaxonomy(Base):
+    __tablename__ = "clinic_worklist_taxonomy"
+
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    config: Mapped[dict | None] = mapped_column(JSON)
+    updated_by: Mapped[str | None] = mapped_column(String(255))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="worklist_taxonomy")

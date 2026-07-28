@@ -42,12 +42,13 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.core.db import get_session
-from api.core.orm import Clinic
+from api.core.orm import Clinic, JotformForm
 from api.core.secrets import get_secret
-from api.deps import bq_client
+from api.deps import bq_client, verify_token
 from api.models import WebformSubmission
 
 log = logging.getLogger(__name__)
@@ -340,3 +341,109 @@ async def ingest_jotform_webform(
     log.info("Stored Jotform submission clinic_id=%s form=%s submission=%s",
              clinic_id, form.get("formID"), form.get("submissionID"))
     return {"status": "accepted"}
+
+
+# ── Endpoint: coverage (pipeline health) ──────────────────────────────────────
+
+@router.get("/webforms/coverage")
+def webform_coverage(
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Registry vs. reality for the webform pipeline, per clinic.
+
+    Joins the ``jotform_forms`` registry (which clinics/forms SHOULD be
+    delivering) against what has actually landed in ``ClinicData.webforms``,
+    so "never wired", "wired but silent", and "receiving but unregistered"
+    are all distinguishable. super_admin only — the response spans every
+    instance.
+
+    Per clinic: the registered forms with per-form counts (7d / 30d / total,
+    last submission), clinic-level totals (these also cover rows without a
+    ``form_id`` — the JSON endpoint and pre-provenance history don't stamp
+    one), and ``unregistered_form_ids`` for submissions arriving from forms
+    the registry doesn't know about (drift the provisioning script should
+    reconcile). Clinics that appear in only one side are still listed.
+    """
+    if caller.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    registry = db.execute(
+        select(JotformForm, Clinic.clinic_name)
+        .join(Clinic, Clinic.clinic_id == JotformForm.clinic_id)
+        .where(Clinic.deleted_at.is_(None))
+    ).all()
+
+    # One grouped scan: per-(clinic, form) stats; clinic rollups are summed
+    # client-side so NULL-form_id rows still count toward the clinic totals.
+    try:
+        rows = list(bq_client.query(f"""
+            SELECT
+              clinic_id,
+              form_id,
+              COUNT(*) AS total,
+              COUNTIF(submitted_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY))  AS last_7d,
+              COUNTIF(submitted_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)) AS last_30d,
+              MAX(submitted_at) AS last_submission_at
+            FROM `{WEBFORMS_TABLE}`
+            GROUP BY clinic_id, form_id
+        """).result())
+    except NotFound:  # table not created yet (no submission has ever landed)
+        rows = []
+
+    stats: dict[tuple[str, str | None], dict] = {}
+    for r in rows:
+        stats[(r["clinic_id"], r["form_id"])] = {
+            "total":              r["total"],
+            "last_7d":            r["last_7d"],
+            "last_30d":           r["last_30d"],
+            "last_submission_at": r["last_submission_at"].isoformat() if r["last_submission_at"] else None,
+        }
+
+    clinics: dict[str, dict] = {}
+
+    def _clinic_entry(clinic_id: str, clinic_name: str | None) -> dict:
+        return clinics.setdefault(clinic_id, {
+            "clinic_id":              clinic_id,
+            "clinic_name":            clinic_name,
+            "forms":                  [],
+            "unregistered_form_ids":  [],
+            "total": 0, "last_7d": 0, "last_30d": 0,
+            "last_submission_at":     None,
+        })
+
+    registered_forms = set()
+    for form, clinic_name in registry:
+        entry = _clinic_entry(form.clinic_id, clinic_name)
+        s = stats.get((form.clinic_id, form.jotform_form_id), {})
+        registered_forms.add((form.clinic_id, form.jotform_form_id))
+        entry["forms"].append({
+            "jotform_form_id":    form.jotform_form_id,
+            "form_title":         form.form_title,
+            "active":             bool(form.active),
+            "total":              s.get("total", 0),
+            "last_7d":            s.get("last_7d", 0),
+            "last_30d":           s.get("last_30d", 0),
+            "last_submission_at": s.get("last_submission_at"),
+        })
+
+    for (clinic_id, form_id), s in stats.items():
+        entry = _clinic_entry(clinic_id, None)
+        entry["total"]    += s["total"]
+        entry["last_7d"]  += s["last_7d"]
+        entry["last_30d"] += s["last_30d"]
+        if s["last_submission_at"] and (
+            entry["last_submission_at"] is None
+            or s["last_submission_at"] > entry["last_submission_at"]
+        ):
+            entry["last_submission_at"] = s["last_submission_at"]
+        if form_id and (clinic_id, form_id) not in registered_forms:
+            entry["unregistered_form_ids"].append(form_id)
+
+    # Clinics seen only in BQ have no name from the registry join — resolve it.
+    for clinic_id, entry in clinics.items():
+        if entry["clinic_name"] is None:
+            clinic = db.get(Clinic, clinic_id)
+            entry["clinic_name"] = clinic.clinic_name if clinic else None
+
+    return sorted(clinics.values(), key=lambda c: (c["clinic_name"] or "").lower())

@@ -2,9 +2,15 @@
 Multi-campaign ID management per clinic — backed by Cloud SQL.
 
 The legacy `clinic_campaigns` BQ table (single table, `campaign_type`
-discriminator) has been split into two typed tables:
+discriminator) has been split into typed tables:
     google_ads_campaigns  → (id, clinic_id, google_ads_campaign_id, active)
     invoca_campaigns      → (id, clinic_id, invoca_campaign_id, active)
+    jotform_forms         → (id, clinic_id, jotform_form_id, form_title, active)
+
+`jotform` rows register a clinic on the Jotform → webhook → BigQuery lead
+pipeline (see api/webforms.py). Unlike the other two types a form maps to
+exactly ONE clinic (UNIQUE on jotform_form_id) — the webhook URL is
+clinic-scoped, so a second mapping would double-ingest every submission.
 
 URL shape:
     GET    /campaigns/{instance_id}                  → both types, all clinics
@@ -12,6 +18,11 @@ URL shape:
     POST   /campaigns/{clinic_id}  body{campaign_type, external_campaign_id, active}
     DELETE /campaigns/{campaign_type}/{id}           → explicit type required
 """
+import json
+import logging
+import urllib.parse
+import urllib.request
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -20,16 +31,75 @@ from sqlalchemy.orm import Session
 from api.deps import bq_client, require_read_access, require_write_access, verify_token
 from api.models import ClinicCampaignCreate
 from api.core.db import get_session
-from api.core.orm import Clinic, GoogleAdsCampaign, Instance, InvocaCampaign
+from api.core.orm import Clinic, GoogleAdsCampaign, Instance, InvocaCampaign, JotformForm
+from api.core.secrets import get_secret
 
+log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_CAMPAIGN_TYPES = ("google_ads", "invoca", "jotform")
 
 
 # ── Catalog (BigQuery-backed) ────────────────────────────────────────────────
 
 # Project/dataset that the big-query-ingestion ETL writes the catalogs into.
 _CLINIC_DATA_DATASET = "project-demo-2-482101.ClinicData"
+
+_JOTFORM_API = "https://api.jotform.com"
+
+
+def _jotform_catalog(caller: dict, db: Session) -> list[dict]:
+    """Catalog of Jotform forms, fetched live from the Jotform API.
+
+    There is no per-instance upstream ID for Jotform: all forms live in the
+    shared agency account (150+ forms spanning many businesses), so the
+    listing is gated to super_admins — anyone else gets [] and the admin UI
+    falls back to manual-ID entry. Linkage marking spans ALL clinics (form
+    IDs are globally unique), so a form linked to another instance's clinic
+    shows as taken. Any API failure (missing key, timeout, non-JSON) degrades
+    to [] rather than 500 — the catalog is a convenience, not a dependency.
+    """
+    if caller.get("role") != "super_admin":
+        return []
+
+    api_key = (get_secret("jotform-api-key") or "").strip()
+    if not api_key:
+        return []
+
+    linked_rows = db.execute(
+        select(JotformForm.jotform_form_id, Clinic.clinic_name)
+        .join(Clinic, Clinic.clinic_id == JotformForm.clinic_id)
+        .where(Clinic.deleted_at.is_(None))
+    ).all()
+    linked: dict[str, list[str]] = {}
+    for form_id, clinic_name in linked_rows:
+        linked.setdefault(str(form_id), []).append(clinic_name)
+
+    try:
+        url = f"{_JOTFORM_API}/user/forms?limit=1000&apiKey={urllib.parse.quote(api_key)}"
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=15) as resp:
+            forms = json.loads(resp.read().decode()).get("content") or []
+    except Exception as exc:  # network/auth/parse — degrade to empty catalog
+        log.warning("Jotform catalog fetch failed: %s", exc)
+        return []
+
+    out = []
+    for f in forms:
+        if not isinstance(f, dict) or f.get("status") == "DELETED":
+            continue
+        form_id = str(f.get("id") or "")
+        if not form_id:
+            continue
+        out.append({
+            "external_campaign_id": form_id,
+            "name":                 f.get("title") or form_id,
+            "status":               f.get("status"),
+            "already_linked":       form_id in linked,
+            "linked_clinic_names":  linked.get(form_id, []),
+        })
+    out.sort(key=lambda r: (r["name"] or "").lower())
+    return out
 
 
 @router.get("/campaigns_catalog/{campaign_type}/{instance_id}")
@@ -51,20 +121,25 @@ def get_campaigns_catalog(
         the instance's ``google_ads_customer_id``.
       - invoca → BQ ``ClinicData.invoca_campaigns_catalog`` filtered by the
         instance's ``invoca_profile_id``.
+      - jotform → live Jotform API listing of the shared agency account
+        (super_admin only — see ``_jotform_catalog``).
 
     Returns an empty list if the instance has no upstream account configured
     or the catalog has no matching rows yet.
     """
     require_read_access(instance_id, caller)
-    if campaign_type not in ("google_ads", "invoca"):
+    if campaign_type not in _CAMPAIGN_TYPES:
         raise HTTPException(
             status_code=400,
-            detail="campaign_type must be 'google_ads' or 'invoca'",
+            detail=f"campaign_type must be one of {', '.join(_CAMPAIGN_TYPES)}",
         )
 
     instance = db.get(Instance, instance_id)
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found")
+
+    if campaign_type == "jotform":
+        return _jotform_catalog(caller, db)
 
     # Existing linkages (per-clinic) — used to mark already-linked entries.
     if campaign_type == "google_ads":
@@ -161,6 +236,19 @@ def _invoca_dict(c: InvocaCampaign) -> dict:
     }
 
 
+def _jotform_dict(c: JotformForm) -> dict:
+    # ``name`` rides along so the UI can label the opaque form ID even when the
+    # live Jotform catalog is unavailable (non-super_admin or API failure).
+    return {
+        "id": c.id,
+        "clinic_id": c.clinic_id,
+        "campaign_type": "jotform",
+        "external_campaign_id": c.jotform_form_id,
+        "name": c.form_title,
+        "active": bool(c.active),
+    }
+
+
 @router.get("/campaigns/{instance_id}")
 def list_campaigns_for_instance(
     instance_id: str,
@@ -180,8 +268,15 @@ def list_campaigns_for_instance(
         .join(Clinic, Clinic.clinic_id == InvocaCampaign.clinic_id)
         .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
     ).all()
+    jotform = db.scalars(
+        select(JotformForm)
+        .join(Clinic, Clinic.clinic_id == JotformForm.clinic_id)
+        .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
+    ).all()
 
-    return [_gads_dict(c) for c in gads] + [_invoca_dict(c) for c in invoca]
+    return ([_gads_dict(c) for c in gads]
+            + [_invoca_dict(c) for c in invoca]
+            + [_jotform_dict(c) for c in jotform])
 
 
 @router.get("/campaigns/{instance_id}/{clinic_id}")
@@ -204,8 +299,13 @@ def list_campaigns_for_clinic(
     invoca = db.scalars(
         select(InvocaCampaign).where(InvocaCampaign.clinic_id == clinic_id)
     ).all()
+    jotform = db.scalars(
+        select(JotformForm).where(JotformForm.clinic_id == clinic_id)
+    ).all()
 
-    return [_gads_dict(c) for c in gads] + [_invoca_dict(c) for c in invoca]
+    return ([_gads_dict(c) for c in gads]
+            + [_invoca_dict(c) for c in invoca]
+            + [_jotform_dict(c) for c in jotform])
 
 
 @router.post("/campaigns/{clinic_id}")
@@ -227,10 +327,16 @@ def add_campaign(
             google_ads_campaign_id=body.external_campaign_id,
             active=body.active,
         )
-    else:  # invoca
+    elif body.campaign_type == "invoca":
         row = InvocaCampaign(
             clinic_id=clinic_id,
             invoca_campaign_id=body.external_campaign_id,
+            active=body.active,
+        )
+    else:  # jotform
+        row = JotformForm(
+            clinic_id=clinic_id,
+            jotform_form_id=body.external_campaign_id,
             active=body.active,
         )
 
@@ -238,8 +344,15 @@ def add_campaign(
     try:
         db.flush()
     except IntegrityError:
-        # UNIQUE(clinic_id, external_id) — already linked.
-        raise HTTPException(status_code=409, detail="Campaign already associated with this clinic")
+        # google_ads/invoca: UNIQUE(clinic_id, external_id) — already linked here.
+        # jotform: UNIQUE(jotform_form_id) — the form is mapped to SOME clinic
+        # (possibly another one); a second mapping would double-ingest.
+        detail = (
+            "Jotform form already mapped to a clinic (a form can feed only one clinic)"
+            if body.campaign_type == "jotform"
+            else "Campaign already associated with this clinic"
+        )
+        raise HTTPException(status_code=409, detail=detail)
 
     return {"status": "success", "id": row.id, "campaign_type": body.campaign_type}
 
@@ -251,15 +364,17 @@ def remove_campaign(
     caller: dict = Depends(verify_token),
     db: Session = Depends(get_session),
 ):
-    """Remove a campaign association. Type must be 'google_ads' or 'invoca'."""
+    """Remove a campaign association. Type must be a member of _CAMPAIGN_TYPES."""
     if campaign_type == "google_ads":
         row = db.get(GoogleAdsCampaign, campaign_id)
     elif campaign_type == "invoca":
         row = db.get(InvocaCampaign, campaign_id)
+    elif campaign_type == "jotform":
+        row = db.get(JotformForm, campaign_id)
     else:
         raise HTTPException(
             status_code=400,
-            detail="campaign_type must be 'google_ads' or 'invoca'",
+            detail=f"campaign_type must be one of {', '.join(_CAMPAIGN_TYPES)}",
         )
 
     if row is None:

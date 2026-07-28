@@ -2,7 +2,7 @@
 
 ## Overview
 
-REST API for clinic and user management. All persistent data lives in Google BigQuery — there is no traditional database. Firebase handles authentication; BigQuery is the only data store.
+REST API for clinic and user management. Account/config data lives in **Cloud SQL (MySQL 8, SQLAlchemy + Alembic)** — the `clinics` table and its per-clinic config children (`clinic_blueprint_config`, `clinic_counselear_config`, `clinic_worklist_taxonomy`, voice-agent tables, …). BigQuery is used for analytics/PHI reads (ETL-written `ClinicData.*`, `Blueprint_PHI.*`) and the `Users.phi_access_log` audit trail. Firebase handles authentication. (Historical note: the config store was migrated off BigQuery to Cloud SQL — ignore older "BigQuery is the only data store" phrasing.)
 
 ## Commands
 
@@ -50,6 +50,7 @@ api/
 | users | `/users/{instance_id}`, `/users/{uid}` |
 | appointment_types | `/appointment_types/{instance_id}`, `/appointment_types/{appointment_type_id}` |
 | review_snapshots | `/review_snapshots/{instance_id}` |
+| worklist_taxonomy (`api/account/worklist_taxonomy.py`) | `GET/PUT /clinics/{clinic_id}/worklist-taxonomy` — per-clinic reactivation cohort config (JSON on `clinic_worklist_taxonomy`, validated by `WorklistTaxonomyConfig`). Consumed by `api/worklists.py`: `/worklists/cohorts`, `/worklists/cohort/{key}`, `/worklists/cohort/{key}/export.csv` (contact CSV, super_admin+admin, PHI-audit-logged), `/worklists/pms-taxonomy` (discovery). |
 
 `websites.router` is imported and registered but the router is empty — remove it (see Pending Work 2-E).
 

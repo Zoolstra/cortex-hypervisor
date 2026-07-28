@@ -103,9 +103,8 @@ class VerifyCallerIdentificationProtocol(Protocol):
    d. Call `verify_caller_identification` with the confirmed first_name,
       last_name, and last4_phone.
    e. If the result is `matched`, note the returned `patient_id` — you'll
-      need it for any downstream protocols (Locate Appointment, Book
-      Appointment, Cancel Appointment, Reschedule Appointment) and for the
-      ticket.
+      need it for every downstream tool that acts on this patient (looking
+      up, deciding, or booking appointments) and for the ticket.
    f. If the result is `ambiguous`, ask for the caller's date of birth and
       retry with the `dob` field.
    g. If the result is `unmatched` after your best effort, treat the caller

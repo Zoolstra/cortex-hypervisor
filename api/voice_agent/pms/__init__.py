@@ -100,6 +100,38 @@ class AvailabilityResult:
 
 
 @dataclass(frozen=True)
+class PlaceholderSlot:
+    """One bookable time in the placeholder-grid availability model.
+
+    ``providers`` is the list of provider names whose placeholder at this
+    time is still free (no real appointment consuming it). Empty means the
+    time exists in the grid but every space is taken.
+    """
+
+    time: str                 # "HH:MM" (clinic-local)
+    providers: list[str]      # free provider names at this time
+
+
+@dataclass(frozen=True)
+class PlaceholderAvailabilityDay:
+    date: str                       # YYYY-MM-DD
+    slots: list[PlaceholderSlot]
+
+
+@dataclass(frozen=True)
+class PlaceholderAvailabilityResult:
+    """Grid-derived availability for a placeholder/real appointment-type pair.
+
+    Used by clinics (e.g. ACNA) whose bookable capacity is encoded as
+    placeholder appointments in the schedule grid rather than Blueprint
+    online-booking availability blocks — see
+    ``BlueprintAdapter.find_placeholder_availability``.
+    """
+
+    days: list[PlaceholderAvailabilityDay]
+
+
+@dataclass(frozen=True)
 class Appointment:
     """An existing appointment as seen by the voice agent.
 

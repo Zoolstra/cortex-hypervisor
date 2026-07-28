@@ -139,7 +139,7 @@ class ProvisionRequest(BaseModel):
 # ── Campaigns ─────────────────────────────────────────────────────────────────
 
 class ClinicCampaignCreate(BaseModel):
-    campaign_type: Literal["google_ads", "invoca"]
+    campaign_type: Literal["google_ads", "invoca", "jotform"]
     external_campaign_id: str
     active: bool = True
 

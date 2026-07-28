@@ -191,16 +191,19 @@ def build_overview(
     tasks: dict[str, Any] = {
         "headline": lambda: q.headline_yoy(clinic_id, invoca_campaign_ids, window=w),
         "trend": lambda: q.monthly_contact_trend(clinic_id, invoca_campaign_ids, months=13),
-        "lifecycle": lambda: q.lifecycle_summary(clinic_id, window=w),
         "call_funnel": lambda: q.call_outcomes_funnel(clinic_id, invoca_campaign_ids, window=w),
         "call_funnel_matthew": lambda: q.call_funnel_matthew_split(clinic_id, invoca_campaign_ids, window=w),
         "form_submissions": lambda: q.form_submission_outcomes(clinic_id, window=w),
+        "webforms": lambda: q.webform_appointments(clinic_id, window=w),
         "call_outcomes_monthly": lambda: q.connected_outcomes_by_month(clinic_id, invoca_campaign_ids, window=w),
         "channel_mix": lambda: q.channel_mix(clinic_id, invoca_campaign_ids, window=w),
         "matthew": lambda: q.matthew_outcomes(clinic_id, invoca_campaign_ids, window=w),
         "matthew_monthly": lambda: q.matthew_outcomes_by_month([clinic_id], window=w),
         "pipeline_revenue_monthly": lambda: q.pipeline_revenue_by_month(clinic_id, invoca_campaign_ids, window=w),
         "ad_campaigns": lambda: q.google_ads_roi(clinic_id, ga_campaign_ids, invoca_campaign_ids, window=w),
+        "paid_attribution": lambda: q.paid_call_revenue(clinic_id, invoca_campaign_ids, window=w),
+        "ad_click_attribution": lambda: q.ad_click_attribution(
+            clinic_id, invoca_campaign_ids, ga_campaign_ids, window=w),
     }
     for a in anchors:
         mw = _month_window(a)
@@ -273,11 +276,18 @@ def build_overview(
                 "series": leak_series,
             },
         },
-        "lifecycle": sections.get("lifecycle"),
+        # Lifecycle Performance section removed from the Overview 2026-07-23
+        # (worklist sizes live on the Leads page); key kept for payload-shape
+        # stability, no longer computed.
+        "lifecycle": None,
         "call_funnel": sections.get("call_funnel"),
         # Online form submissions (CounselEar portal) — null when none, so the
         # section only shows for clinics that use it (Virsono).
         "form_submissions": (lambda fs: fs if fs and fs.get("submissions") else None)(sections.get("form_submissions")),
+        # Website/Jotform web-form submissions reconciled to PMS appointments —
+        # null when the clinic had none in the window, so the section hides for
+        # clinics without webforms set up.
+        "webforms": (lambda wf: wf if wf and wf.get("submissions") else None)(sections.get("webforms")),
         "call_outcomes_monthly": sections.get("call_outcomes_monthly"),
         "channel_mix": sections.get("channel_mix"),
         # Matthew (AI receptionist) outcomes — only for clinics that have Matthew
@@ -286,6 +296,17 @@ def build_overview(
         "matthew_monthly": sections.get("matthew_monthly"),
         "pipeline_revenue_monthly": sections.get("pipeline_revenue_monthly"),
         "ad_campaigns": sections.get("ad_campaigns"),
+        # §04 headline attribution: all Paid calls (same classifier as
+        # traffic_drivers) → invoices on/after each matched patient's first
+        # paid call. The per-campaign rows in ad_campaigns keep the looser
+        # name-match convention — they're a split, not the headline.
+        "paid_attribution": sections.get("paid_attribution"),
+        # Ad clicks → calls: Paid calls split by how far each traces back to a
+        # Google Ads campaign via gclid. null when the clinic has no Paid calls,
+        # so the section hides for clinics with no paid search.
+        "ad_click_attribution": (
+            lambda a: a if a and a.get("paid_calls") else None
+        )(sections.get("ad_click_attribution")),
         "placeholders": ["cortex_intercept", "review_velocity"],
     }
 
@@ -478,3 +499,78 @@ def build_group_overview(
     else:
         payload["recommendations"] = []
     return payload
+
+
+def build_biweekly(
+    *,
+    clinic_id: str,
+    clinic_name: str,
+    invoca_campaign_ids: list[str],
+    ga_campaign_ids: list[str] | None = None,
+    window: Window,
+    pms_type: str = "none",
+) -> dict[str, Any]:
+    """Condensed biweekly report payload.
+
+    Reuses the SAME readers as the Overview (every metric here reconciles with
+    its Overview counterpart for the same window) — only the shape is smaller.
+    v1 blocks:
+
+    * ``appointments`` — grand-total PMS appointments OCCURRING in the window
+      (``start_time``, all statuses; not attribution-gated).
+    * ``calls`` — call-traffic totals + ``booked`` (PMS-reconciled §01 funnel:
+      appointment created within ``match_days`` of a genuine connected call).
+    * ``webforms`` — submissions reconciled to appointments created on/after
+      each submission (null when the clinic has no webforms in the window).
+    * ``ad_clicks`` — click volume + keyword distribution for the linked
+      Google Ads campaigns (null when no campaigns / no clicks).
+
+    More blocks land as the biweekly requirements firm up.
+    """
+    w = window
+    tasks: dict[str, Any] = {
+        "appointments": lambda: q.appointment_outcomes(clinic_id, window=w),
+        "call_funnel": lambda: q.call_outcomes_funnel(clinic_id, invoca_campaign_ids, window=w),
+        "webforms": lambda: q.webform_appointments(clinic_id, window=w),
+        "ad_clicks": lambda: q.ad_clicks_keywords(
+            ga_campaign_ids or [], invoca_campaign_ids, window=w),
+        # Paid-classifier call count ("ad-driven calls") for the Ad clicks
+        # section — same population as §04's Paid calls KPI.
+        "paid": lambda: q.paid_call_revenue(clinic_id, invoca_campaign_ids, window=w),
+    }
+    sections = _parallel(tasks)
+    appts = sections.get("appointments") or {}
+    cf = sections.get("call_funnel") or {}
+    # Tag the funnel with the clinic's PMS (same as build_overview) so the
+    # shared CallFunnel component can name the reconciliation system.
+    if cf:
+        cf["pms_type"] = pms_type
+    return {
+        "clinic_id": clinic_id,
+        "clinic_name": clinic_name,
+        "pms_type": pms_type,
+        "window": {"start": w.start_date, "end": (w.end_excl - _one_day()).isoformat()},
+        "appointments": {
+            "total": appts.get("total", 0),
+            "by_status": appts.get("by_status", {}),
+        },
+        "calls": {
+            "total": cf.get("total", 0),
+            "genuine": cf.get("genuine", 0),
+            "connected": cf.get("connected", 0),
+            "booked": cf.get("booked", 0),
+            "booked_method": cf.get("booked_method", "pms_reconciled"),
+            "match_days": cf.get("match_days", 3),
+        },
+        # Full §01 funnel (total → spam/wrong/no-transcript filtered → genuine
+        # → missed vs connected → scoring outcomes) for the funnel visual.
+        "call_funnel": cf or None,
+        # Ad-click volume + keyword distribution — null when the clinic has no
+        # linked Google Ads campaigns or no clicks in the window. Carries the
+        # paid-call count ("ad-driven calls") alongside the click volume.
+        "ad_clicks": (lambda ac: (
+            {**ac, "paid_calls": (sections.get("paid") or {}).get("paid_calls", 0)}
+            if ac and ac.get("clicks") else None
+        ))(sections.get("ad_clicks")),
+        "webforms": (lambda wf: wf if wf and wf.get("submissions") else None)(sections.get("webforms")),
+    }

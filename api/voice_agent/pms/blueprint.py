@@ -45,6 +45,9 @@ from api.voice_agent.pms import (
     JournalEntry,
     Location,
     PatientMatchResult,
+    PlaceholderAvailabilityDay,
+    PlaceholderAvailabilityResult,
+    PlaceholderSlot,
     PMSAdapter,
     Provider,
 )
@@ -287,6 +290,101 @@ class BlueprintAdapter(PMSAdapter):
             ))
         return entries
 
+    # ── Appointment-decision inputs (BQ — PHI) ────────────────────────────────
+
+    def get_decision_inputs(
+        self, *, patient_id: str, clinician_names: list[str],
+    ) -> dict:
+        """Load the appointment-type decision inputs for one patient.
+
+        Single BigQuery round trip (latency-sensitive: called mid-call by the
+        voice agent). The ``_clinic_id`` filter is **mandatory and
+        non-negotiable** on every subquery — same PHI-isolation rule as
+        ``find_patient``.
+
+        Returns::
+
+            {
+              "care_plan_name": str | None,      # latest-expiry plan on file
+              "care_plan_expiry": date | None,
+              "active_insurer_names": [str],     # active=truthy insurer rows
+              "last_hearing_test_date": date | None,   # max Audiograms.entry_date
+              "last_clinician_visit_date": date | None # max completed appt with a
+            }                                          # practitioner in clinician_names
+
+        Feed columns are strings; SAFE_CAST drops unparseable rows rather than
+        erroring. ``active`` in ClientInsurerCanada is matched loosely
+        ('true'/'1'/'yes') because the CSV feed's boolean rendering isn't
+        contractual.
+        """
+        sql = f"""
+        WITH pat AS (
+          SELECT COUNT(*) > 0 AS ok
+          FROM `{PROJECT}.Blueprint_PHI.ClientDemographics`
+          WHERE _clinic_id = @clinic_id
+            AND CAST(client_id AS STRING) = @patient_id
+        ),
+        plan AS (
+          SELECT TRIM(service_plan_name) AS name,
+                 SAFE_CAST(service_plan_expiry_date AS DATE) AS expiry
+          FROM `{PROJECT}.Blueprint_PHI.ClientAids`
+          WHERE _clinic_id = @clinic_id
+            AND CAST(client_id AS STRING) = @patient_id
+            AND service_plan_name IS NOT NULL AND TRIM(service_plan_name) != ''
+          ORDER BY expiry DESC
+          LIMIT 1
+        ),
+        insurers AS (
+          SELECT ARRAY_AGG(DISTINCT insurer_name IGNORE NULLS) AS names
+          FROM `{PROJECT}.Blueprint_PHI.ClientInsurerCanada`
+          WHERE _clinic_id = @clinic_id
+            AND CAST(client_id AS STRING) = @patient_id
+            AND LOWER(CAST(active AS STRING)) IN ('true', '1', 'yes', 'y')
+        ),
+        last_test AS (
+          SELECT MAX(SAFE_CAST(entry_date AS DATE)) AS d
+          FROM `{PROJECT}.Blueprint_PHI.Audiograms`
+          WHERE _clinic_id = @clinic_id
+            AND CAST(client_id AS STRING) = @patient_id
+        ),
+        last_clin AS (
+          -- start_time is 'YYYY-MM-DD HH:MM:SS' (clinic-local); completed_time
+          -- carries tz-offset timestamps that SAFE_CAST(... AS DATE) rejects.
+          -- The appointment's local DATE is what the rule needs — take the
+          -- date prefix of start_time.
+          SELECT MAX(SAFE_CAST(SUBSTR(start_time, 1, 10) AS DATE)) AS d
+          FROM `{PROJECT}.Blueprint_PHI.Appointments`
+          WHERE _clinic_id = @clinic_id
+            AND CAST(client_id AS STRING) = @patient_id
+            AND LOWER(status) LIKE '%complete%'
+            AND practitioner IN UNNEST(@clinicians)
+        )
+        SELECT
+          (SELECT ok     FROM pat)       AS patient_exists,
+          (SELECT name   FROM plan)      AS care_plan_name,
+          (SELECT expiry FROM plan)      AS care_plan_expiry,
+          (SELECT names  FROM insurers)  AS active_insurer_names,
+          (SELECT d      FROM last_test) AS last_hearing_test_date,
+          (SELECT d      FROM last_clin) AS last_clinician_visit_date
+        """
+        params = [
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", self.clinic_id),
+            bigquery.ScalarQueryParameter("patient_id", "STRING", str(patient_id)),
+            bigquery.ArrayQueryParameter("clinicians", "STRING", clinician_names or []),
+        ]
+        row = list(bq_client.query(
+            sql, job_config=bigquery.QueryJobConfig(query_parameters=params),
+        ).result())[0]
+
+        return {
+            "patient_exists": bool(row["patient_exists"]),
+            "care_plan_name": row["care_plan_name"],
+            "care_plan_expiry": row["care_plan_expiry"],
+            "active_insurer_names": list(row["active_insurer_names"] or []),
+            "last_hearing_test_date": row["last_hearing_test_date"],
+            "last_clinician_visit_date": row["last_clinician_visit_date"],
+        }
+
     # ── Appointment types ─────────────────────────────────────────────────────
 
     def list_appointment_types(self) -> list[AppointmentType]:
@@ -317,6 +415,27 @@ class BlueprintAdapter(PMSAdapter):
             for t in data.get("appointmentTypes", [])
             if t.get("name")
         ]
+
+    def _raw_event_type(self, event_type_id: int) -> dict | None:
+        """Return the raw clinicConfiguration appointmentTypes entry by id.
+
+        Unlike ``list_appointment_types`` this does NOT drop null-named /
+        non-online-booking types, so callers can resolve an event type's
+        duration + name even when it isn't flagged for online booking. Returns
+        None if the id isn't in the pool.
+        """
+        config = self._require_http_config()
+        base = _blueprint_base(config)
+        resp = httpx.get(
+            f"{base}/clinicConfiguration/",
+            params={"apiKey": config["api_key"]},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        for t in resp.json().get("appointmentTypes", []):
+            if t.get("id") == event_type_id:
+                return t
+        return None
 
     def list_locations(self) -> list[Location]:
         """Pull bookable locations from Blueprint clinicConfiguration.
@@ -734,6 +853,49 @@ class BlueprintAdapter(PMSAdapter):
             location_id=location_id,
         )
 
+        return self._post_appointment(
+            event_type_id=event_type_id,
+            type_name=matching.name,
+            start_date=start_date,
+            start_time=start_time,
+            end_time=end_time,
+            location_id=location_id,
+            provider_id=provider_id,
+            patient_id=patient_id,
+            first_name=first_name,
+            last_name=last_name,
+            phone=phone,
+            notes=notes,
+        )
+
+    def _post_appointment(
+        self,
+        *,
+        event_type_id: int,
+        type_name: str,
+        start_date: str,
+        start_time: str,
+        end_time: str,
+        location_id: int,
+        provider_id: int,
+        patient_id: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        phone: str | None = None,
+        notes: str | None = None,
+        allow_calendar_double_booking: bool = False,
+    ) -> BookingResult:
+        """Write path shared by ``book`` and ``book_into_placeholder``.
+
+        Callers resolve ``provider_id`` + ``end_time`` in whatever way suits
+        their availability model (native availability endpoint vs. placeholder
+        grid); this helper only builds the Blueprint create-appointment payload,
+        POSTs it, and normalizes the result. It performs NO slot re-validation —
+        the caller owns that.
+        """
+        config = self._require_http_config()
+        base = _blueprint_base(config)
+
         # "User creating the appointment" — a configured service-account user
         # if set, else the booking provider (always a valid Blueprint user).
         # Never default to a hardcoded id: Blueprint 400s an unknown userId.
@@ -760,6 +922,14 @@ class BlueprintAdapter(PMSAdapter):
             "locationId": location_id,
             "providerId": provider_id,
         }
+        if allow_calendar_double_booking:
+            # Placeholder-grid bookings deliberately create the real
+            # appointment BESIDE the capacity placeholder (same provider +
+            # time) — Blueprint's default (ignoreDoubleBookingAllowedSetting
+            # = TRUE) rejects ANY overlap regardless of the calendar's own
+            # double-booking setting. FALSE defers to the calendar setting,
+            # which is how clinic staff create the same coexistence daily.
+            payload["ignoreDoubleBookingAllowedSetting"] = False
         # Always stamp the booking as voice-agent-originated with the key facts,
         # then append whatever the agent passed (e.g. new-patient screening
         # answers). Gives clinic staff immediate provenance + context.
@@ -767,7 +937,7 @@ class BlueprintAdapter(PMSAdapter):
         patient_kind = "Existing patient" if patient_id else "New patient"
         note_lines = [
             f"Booked via CORTEX voice agent on {booked_on}.",
-            f"{patient_kind}. {matching.name} on {start_date} at {start_time}.",
+            f"{patient_kind}. {type_name} on {start_date} at {start_time}.",
         ]
         if notes and notes.strip():
             note_lines.append(notes.strip())
@@ -827,6 +997,257 @@ class BlueprintAdapter(PMSAdapter):
     def _combine_local(date_str: str, hhmm: str, tz: ZoneInfo) -> datetime:
         """Combine a clinic-local YYYY-MM-DD + HH:MM into a tz-aware datetime."""
         return datetime.strptime(f"{date_str} {hhmm}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+
+    # ── Placeholder-grid availability (e.g. ACNA) ─────────────────────────────
+    #
+    # Some clinics don't publish Blueprint online-booking availability blocks;
+    # their bookable capacity is encoded as *placeholder appointments* in the
+    # schedule grid. Each placeholder is an appointment of a dedicated
+    # "placeholder" event type (never linked to a patient) that names a provider
+    # and occupies a physical room. A real appointment of the paired "real"
+    # event type, booked for the same provider at the same start time, consumes
+    # that placeholder. The native ``/availability/`` endpoint is useless for
+    # these clinics (it reads provider schedules, which they don't maintain), so
+    # availability is derived here from the appointment-search grid instead.
+
+    @staticmethod
+    def _to_local_hhmm(raw: str | None, tz: ZoneInfo) -> tuple[str, str] | None:
+        """Parse a Blueprint appointment time → (clinic-local YYYY-MM-DD, HH:MM).
+
+        Blueprint returns UTC-labelled strings like "2026-07-21 17:00:00 +0000"
+        or "... GMT". We parse the real instant and convert to the clinic's
+        timezone (17:00Z → 11:00 for America/Edmonton). Returns None if unparseable.
+        """
+        if not raw:
+            return None
+        s = raw.strip().replace(" GMT", " +0000").replace(" UTC", " +0000")
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S %z")
+        except ValueError:
+            return None
+        local = dt.astimezone(tz)
+        return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+
+    @staticmethod
+    def _provider_matches(preference: str, provider_name: str) -> bool:
+        """Loose match of a caller's provider preference to a grid provider name.
+
+        Grid names are "Last, First". A caller says "Lewchuk" or "Larena" or
+        "Dr. Lewchuk" — match if any alphabetic token of the preference (len ≥ 3)
+        appears in the provider name, case-insensitive.
+        """
+        pref = preference.lower()
+        name = provider_name.lower()
+        tokens = [t for t in re.split(r"[^a-z]+", pref) if len(t) >= 3]
+        return any(t in name for t in tokens) if tokens else False
+
+    def find_placeholder_availability(
+        self,
+        *,
+        placeholder_event_type_id: int,
+        real_event_type_id: int,
+        start_date: str,
+        end_date: str,
+        provider_name: str | None = None,
+        excluded_providers: list[str] | None = None,
+    ) -> PlaceholderAvailabilityResult:
+        """Grid-derived bookable slots for a placeholder/real type pair.
+
+        Reads the appointment-search grid over the window and, for each
+        placeholder appointment (``eventTypeId == placeholder_event_type_id``,
+        no patient), treats its (provider, exact start time) as available unless
+        a patient-linked appointment for the SAME provider starts at the SAME
+        time (any type — the provider is busy). ``real_event_type_id`` is not
+        used for filtering here (it's what a booking will create); it's accepted
+        so the signature reads as a pair and to keep the router symmetric.
+
+        When ``provider_name`` is given, only that provider's free slots are
+        returned. Days/times are clinic-local.
+        """
+        config = self._require_http_config()
+        tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz)
+        end_dt = (
+            datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        ).replace(tzinfo=tz)
+
+        rows = self._search_appointments_raw(start_dt=start_dt, end_dt=end_dt)
+
+        # (provider, raw_start_time) of every ACTIVE patient-linked appointment
+        # — these consume a placeholder for that provider at that instant.
+        # Cancelled rows stay in Blueprint's search results but must not block
+        # a genuinely re-opened slot.
+        consumed: set[tuple[str | None, str | None]] = {
+            (r.get("provider"), r.get("start_time"))
+            for r in rows
+            if r.get("patient_id") is not None
+            and r.get("status") != _STATUS_CANCELLED
+        }
+
+        # Group free placeholders by (local_date, local_hhmm) → set of providers.
+        by_slot: dict[tuple[str, str], list[str]] = {}
+        for r in rows:
+            if r.get("eventTypeId") != placeholder_event_type_id:
+                continue
+            if r.get("patient_id") is not None:
+                continue  # a placeholder is never patient-linked
+            if r.get("status") == _STATUS_CANCELLED:
+                continue  # a cancelled placeholder is not capacity
+            prov = r.get("provider")
+            if excluded_providers and prov in excluded_providers:
+                continue  # pseudo-providers can't be booked via the API
+            if (prov, r.get("start_time")) in consumed:
+                continue  # a real appt for this provider consumes this space
+            if provider_name and not (prov and self._provider_matches(provider_name, prov)):
+                continue
+            local = self._to_local_hhmm(r.get("start_time"), tz)
+            if local is None:
+                continue
+            day, hhmm = local
+            # Blueprint's appointment search returns rows past the requested
+            # endTime, so clamp to the caller's window client-side — otherwise
+            # a "just Monday" query leaks the following days' slots.
+            if day < start_date or day > end_date:
+                continue
+            by_slot.setdefault((day, hhmm), [])
+            if prov and prov not in by_slot[(day, hhmm)]:
+                by_slot[(day, hhmm)].append(prov)
+
+        # Assemble → sorted days, each with sorted times.
+        days_map: dict[str, list[PlaceholderSlot]] = {}
+        for (day, hhmm), provs in sorted(by_slot.items()):
+            days_map.setdefault(day, []).append(
+                PlaceholderSlot(time=hhmm, providers=sorted(provs))
+            )
+        days = [
+            PlaceholderAvailabilityDay(date=day, slots=slots)
+            for day, slots in sorted(days_map.items())
+        ]
+
+        log.info(
+            "find_placeholder_availability clinic_id=%s placeholder=%s real=%s "
+            "window=%s..%s rows=%d kept_days=%d slots=%d provider_pref=%s",
+            self.clinic_id, placeholder_event_type_id, real_event_type_id,
+            start_date, end_date, len(rows), len(days),
+            sum(len(d.slots) for d in days), bool(provider_name),
+        )
+        return PlaceholderAvailabilityResult(days=days)
+
+    def book_into_placeholder(
+        self,
+        *,
+        placeholder_event_type_id: int,
+        real_event_type_id: int,
+        start_date: str,
+        start_time: str,
+        provider_name: str | None = None,
+        patient_id: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        phone: str | None = None,
+        notes: str | None = None,
+        excluded_providers: list[str] | None = None,
+    ) -> BookingResult:
+        """Book a real appointment into a free placeholder space.
+
+        Re-reads the grid for ``start_date``, finds a placeholder at
+        ``start_time`` whose provider is still free (honouring ``provider_name``
+        if given, else first free), recovers that provider's ``provider_id`` and
+        the booking ``location_id`` from the placeholder row, then creates a real
+        appointment of ``real_event_type_id`` at the same slot. The end time is
+        derived from the real type's configured duration.
+
+        Raises 409 if no free placeholder matches (slot just taken / bad time /
+        unknown provider preference) — the caller should fall back to a ticket.
+        """
+        config = self._require_http_config()
+        tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
+        day_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz)
+        rows = self._search_appointments_raw(
+            start_dt=day_start, end_dt=day_start + timedelta(days=1),
+        )
+
+        consumed = {
+            (r.get("provider"), r.get("start_time"))
+            for r in rows
+            if r.get("patient_id") is not None
+            and r.get("status") != _STATUS_CANCELLED
+        }
+
+        # Candidate free placeholders at this exact clinic-local start time.
+        candidates: list[dict] = []
+        for r in rows:
+            if r.get("eventTypeId") != placeholder_event_type_id:
+                continue
+            if r.get("patient_id") is not None:
+                continue
+            if r.get("status") == _STATUS_CANCELLED:
+                continue
+            if excluded_providers and r.get("provider") in excluded_providers:
+                continue
+            if (r.get("provider"), r.get("start_time")) in consumed:
+                continue
+            local = self._to_local_hhmm(r.get("start_time"), tz)
+            if local is None or local[0] != start_date or local[1] != start_time:
+                continue
+            if provider_name and not (
+                r.get("provider") and self._provider_matches(provider_name, r["provider"])
+            ):
+                continue
+            candidates.append(r)
+
+        if not candidates:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"No free placeholder for event type {real_event_type_id} at "
+                    f"{start_date} {start_time}"
+                    + (f" with provider matching {provider_name!r}" if provider_name else "")
+                    + " — the slot may have just been taken."
+                ),
+            )
+
+        chosen = candidates[0]
+        provider_id = chosen.get("provider_id")
+        location_id = chosen.get("location_id") or _int_field(config, "location_id")
+        if not provider_id or not location_id:
+            raise HTTPException(
+                status_code=502,
+                detail="Placeholder row is missing provider_id/location_id — cannot book.",
+            )
+
+        # End time from the real type's configured duration. Read the full
+        # type pool (not list_appointment_types) so this doesn't depend on the
+        # real type being flagged for online booking.
+        raw_type = self._raw_event_type(real_event_type_id)
+        duration = raw_type.get("duration") if raw_type else None
+        if not duration:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Real event type {real_event_type_id} has no known duration "
+                    "in Blueprint — cannot derive end time."
+                ),
+            )
+        type_name = (raw_type.get("name") or f"Appointment (eventType={real_event_type_id})")
+        end_time = self._add_minutes(start_time, duration)
+
+        return self._post_appointment(
+            event_type_id=real_event_type_id,
+            type_name=type_name,
+            start_date=start_date,
+            start_time=start_time,
+            end_time=end_time,
+            location_id=location_id,
+            provider_id=provider_id,
+            patient_id=patient_id,
+            first_name=first_name,
+            last_name=last_name,
+            phone=phone,
+            notes=notes,
+            # The real appointment coexists with the placeholder by design.
+            allow_calendar_double_booking=True,
+        )
 
     # ── Cancel ────────────────────────────────────────────────────────────────
 

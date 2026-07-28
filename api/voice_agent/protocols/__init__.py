@@ -29,6 +29,14 @@ system prompt.
 """
 from __future__ import annotations
 
+from api.voice_agent.protocols.acna_appointment_decision import (
+    ACNADetermineAppointmentProtocol,
+)
+from api.voice_agent.protocols.acna_placeholder import (
+    ACNABookAppointmentProtocol,
+    ACNASearchAvailabilityProtocol,
+)
+from api.voice_agent.protocols.acna_troubleshooting import ACNATroubleshootingProtocol
 from api.voice_agent.protocols.base import EmptyConfig, Protocol
 from api.voice_agent.protocols.book_appointment import BookAppointmentProtocol
 from api.voice_agent.protocols.cancel_appointment import CancelAppointmentProtocol
@@ -58,6 +66,12 @@ PROTOCOL_REGISTRY: dict[str, type[Protocol]] = {
     BookAppointmentProtocol.id:               BookAppointmentProtocol,
     CancelAppointmentProtocol.id:             CancelAppointmentProtocol,
     RescheduleAppointmentProtocol.id:         RescheduleAppointmentProtocol,
+    # Clinic-scoped (ACNA placeholder-grid availability/booking, decision,
+    # troubleshooting).
+    ACNASearchAvailabilityProtocol.id:        ACNASearchAvailabilityProtocol,
+    ACNABookAppointmentProtocol.id:           ACNABookAppointmentProtocol,
+    ACNADetermineAppointmentProtocol.id:      ACNADetermineAppointmentProtocol,
+    ACNATroubleshootingProtocol.id:           ACNATroubleshootingProtocol,
 }
 
 
@@ -73,6 +87,10 @@ PROTOCOL_METADATA: list[type[Protocol]] = [
     BookAppointmentProtocol,
     CancelAppointmentProtocol,
     RescheduleAppointmentProtocol,
+    ACNASearchAvailabilityProtocol,
+    ACNABookAppointmentProtocol,
+    ACNADetermineAppointmentProtocol,
+    ACNATroubleshootingProtocol,
     SubmitTicketProtocol,
 ]
 
@@ -96,6 +114,22 @@ def is_pms_compatible(
     if proto.supported_pms is None:
         return True
     return (pms_type or "none") in proto.supported_pms
+
+
+def is_clinic_compatible(
+    proto: type[Protocol] | Protocol,
+    clinic_id: str | None,
+) -> bool:
+    """True if the protocol is allowed for this ``clinic_id``.
+
+    Clinic-agnostic protocols (``supported_clinics is None``) allow all
+    clinics. Clinic-scoped protocols (e.g. ACNA's placeholder-grid ones)
+    only allow clinics in the set — used to hide them from the dashboard
+    for other clinics and to gate instantiation in the factory.
+    """
+    if proto.supported_clinics is None:
+        return True
+    return clinic_id in proto.supported_clinics
 
 
 def toggleable_protocols() -> list[type[Protocol]]:
@@ -172,10 +206,15 @@ __all__ = [
     "CancelAppointmentProtocol",
     "RescheduleAppointmentProtocol",
     "RetrievePatientContextProtocol",
+    "ACNASearchAvailabilityProtocol",
+    "ACNABookAppointmentProtocol",
+    "ACNADetermineAppointmentProtocol",
+    "ACNATroubleshootingProtocol",
     "PROTOCOL_REGISTRY",
     "PROTOCOL_METADATA",
     "PROTOCOL_METADATA_BY_ID",
     "is_pms_compatible",
+    "is_clinic_compatible",
     "load_protocol_config",
     "toggleable_protocols",
     "unmet_dependencies",

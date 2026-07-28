@@ -368,6 +368,48 @@ def get_intelligence_overview(
     return payload
 
 
+@router.get("/intelligence/{clinic_id}/biweekly")
+def get_intelligence_biweekly(
+    clinic_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 14,
+    nocache: bool = False,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Condensed biweekly report payload (JSON). Same date-range contract as
+    the Overview (``?start=&end=`` inclusive, falling back to ``?days=`` —
+    default a trailing fortnight); reuses the Overview's readers so every
+    metric reconciles with the Overview for the same window."""
+    clinic = db.get(Clinic, clinic_id)
+    if not clinic or clinic.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+    require_read_access(clinic.instance_id, caller)
+
+    window = _resolve_window(start, end, days)
+    invoca_ids, gads_ids = _active_campaign_ids(db, clinic_id)
+
+    key = ("biweekly", clinic_id, window.start_date, window.end_date_excl)
+    if not nocache:
+        cached = _cache_get(key)
+        if cached is not None:
+            return cached
+
+    from intelligence_report.payloads import build_biweekly
+
+    payload = build_biweekly(
+        clinic_id=clinic_id,
+        clinic_name=clinic.clinic_name,
+        invoca_campaign_ids=invoca_ids,
+        ga_campaign_ids=gads_ids,
+        window=window,
+        pms_type=(getattr(clinic, "pms_type", None) or "none"),
+    )
+    _cache_put(key, payload)
+    return payload
+
+
 @router.get("/intelligence/group/{instance_id}/overview")
 def get_group_overview(
     instance_id: str,
@@ -636,6 +678,53 @@ def get_line_item_calls(
         detail=f"n={len(calls)}",
     )
     return {"calls": calls}
+
+
+class _OutcomeOverrideBody(BaseModel):
+    outcome: str | None = None   # None clears the override (revert to AI label)
+
+
+@router.put("/intelligence/{clinic_id}/calls/{call_id}/outcome")
+def set_call_outcome(
+    clinic_id: str,
+    call_id: str,
+    body: _OutcomeOverrideBody,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Manually relabel one call's outcome (or clear a prior relabel with
+    ``outcome: null``). The override is stored append-only in
+    ``ClinicData.call_outcome_overrides`` and joined into the shared call-tagging
+    CTE, so the calls table, funnel, and drill-downs all reflect it. Only
+    scoring-derived labels are assignable — ``booked``/``led_to_booking`` remain
+    PMS-reconciliation facts. admin/super_admin only, audited."""
+    from intelligence_report.queries import (
+        RELABEL_OUTCOMES, call_belongs_to_clinic, set_call_outcome_override)
+
+    if body.outcome is not None and body.outcome not in RELABEL_OUTCOMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"outcome must be one of {sorted(RELABEL_OUTCOMES)} or null")
+    _phi_clinic(db, clinic_id, caller)
+    invoca_ids, _ = _active_campaign_ids(db, clinic_id)
+    if not call_belongs_to_clinic(invoca_ids, call_id):
+        raise HTTPException(status_code=404, detail="Call not found for this clinic")
+
+    actor = caller.get("email") or caller.get("uid") or "unknown"
+    set_call_outcome_override(clinic_id, call_id, body.outcome, actor)
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="call_outcome_relabel",
+        actor=actor,
+        patient_id=call_id,
+        outcome="ok",
+        detail=body.outcome or "cleared",
+    )
+    # Cached JSON payloads (overview funnels etc.) now embed a stale outcome —
+    # drop the whole in-process cache rather than reverse-engineering which
+    # clinic/instance keys are affected (relabels are rare; TTL is 5 min).
+    _json_cache.clear()
+    return {"call_id": call_id, "outcome": body.outcome}
 
 
 @router.get("/intelligence/{clinic_id}/calls/{call_id}/transcript")

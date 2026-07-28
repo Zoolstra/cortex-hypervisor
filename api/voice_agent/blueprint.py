@@ -21,6 +21,7 @@ BigQuery directly — that PHI table stays in BQ.
 
 Blueprint API base URL: https://{server}/{clinic_slug}/rest/
 """
+import json
 from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -480,6 +481,340 @@ def find_available_slots(
             {"date": d.date, "available_times": d.available_times}
             for d in result.days
         ],
+    }
+
+
+# ── ACNA placeholder-grid availability + booking ──────────────────────────────
+#
+# For clinics whose bookable capacity is encoded as placeholder appointments in
+# the schedule grid (see api/voice_agent/pms/blueprint.py). The placeholder↔real
+# type pairing is per-clinic config on the acna_search_availability protocol; we
+# resolve it server-side so the agent only ever deals with real_event_type_ids.
+
+
+def _placeholder_pairs(db: Session, clinic_id: str) -> dict[int, "TypePair"]:
+    """Map real_event_type_id → TypePair from the clinic's protocol config.
+
+    Reads the config on the SEARCH protocol (the book protocol shares it).
+    Falls back to the config model's defaults (seeded with the Annual pair)
+    when no row exists yet.
+    """
+    from api.voice_agent.protocols import load_protocol_config
+    from api.voice_agent.protocols.acna_placeholder import (
+        ACNASearchAvailabilityProtocol,
+        TypePair,
+    )
+
+    cfg = load_protocol_config(db, clinic_id, ACNASearchAvailabilityProtocol.id)
+    return {p.real_event_type_id: p for p in cfg.type_pairs}
+
+
+def _resolve_pair(db: Session, clinic_id: str, real_event_type_id: int) -> "TypePair":
+    pairs = _placeholder_pairs(db, clinic_id)
+    pair = pairs.get(real_event_type_id)
+    if pair is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"real_event_type_id={real_event_type_id} is not a configured "
+                "placeholder-grid appointment type for this clinic"
+            ),
+        )
+    return pair
+
+
+def _excluded_providers(db: Session, clinic_id: str) -> list[str]:
+    """Pseudo-providers whose placeholder slots can't be booked via the API
+    (no availability schedule → BOOKING_OUTSIDE_AVAILABILITY). From the search
+    protocol's config."""
+    from api.voice_agent.protocols import load_protocol_config
+    from api.voice_agent.protocols.acna_placeholder import (
+        ACNASearchAvailabilityProtocol,
+    )
+
+    cfg = load_protocol_config(db, clinic_id, ACNASearchAvailabilityProtocol.id)
+    return list(cfg.excluded_placeholder_providers or [])
+
+
+class PlaceholderFindRequest(BaseModel):
+    real_event_type_id: int
+    start_date: str          # YYYY-MM-DD (clinic-local)
+    end_date: str            # YYYY-MM-DD (clinic-local, inclusive)
+    provider_name: str | None = None
+
+
+class PlaceholderBookRequest(BaseModel):
+    real_event_type_id: int
+    start_date: str          # YYYY-MM-DD (clinic-local)
+    start_time: str          # HH:MM (clinic-local)
+    provider_name: str | None = None
+    patient_id: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    phone: str | None = None
+    notes: str | None = None
+
+
+@router.post("/{clinic_id}/placeholder/appointment-types")
+def placeholder_appointment_types(
+    clinic_id: str,
+    _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
+):
+    """List the clinic's placeholder-grid bookable types (config-driven).
+
+    Returns {real_event_type_id, name, duration_minutes}. ``name`` is the
+    config display name (what the agent matches against); duration comes from
+    Blueprint when the real type is known there.
+    """
+    pairs = _placeholder_pairs(db, clinic_id)
+    adapter = BlueprintAdapter(clinic_id=clinic_id)
+    adapter.load_http_config(db)
+    durations = {t.id: t.duration_minutes for t in adapter.list_appointment_types()}
+    return {
+        "appointment_types": [
+            {
+                "real_event_type_id": p.real_event_type_id,
+                "name": p.display_name,
+                "duration_minutes": durations.get(p.real_event_type_id),
+            }
+            for p in pairs.values()
+        ],
+    }
+
+
+@router.post("/{clinic_id}/placeholder/availability/find")
+def placeholder_find_availability(
+    clinic_id: str,
+    body: PlaceholderFindRequest,
+    _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
+):
+    """Grid-derived bookable slots for a placeholder/real type pair.
+
+    Availability is computed from the schedule grid's placeholder appointments
+    (not Blueprint online-booking availability). Response is
+    {days: [{date, slots: [{time, providers: [...]}]}]}.
+    """
+    pair = _resolve_pair(db, clinic_id, body.real_event_type_id)
+    adapter = BlueprintAdapter(clinic_id=clinic_id)
+    adapter.load_http_config(db)
+    result = adapter.find_placeholder_availability(
+        placeholder_event_type_id=pair.placeholder_event_type_id,
+        real_event_type_id=pair.real_event_type_id,
+        start_date=body.start_date,
+        end_date=body.end_date,
+        provider_name=body.provider_name,
+        excluded_providers=_excluded_providers(db, clinic_id),
+    )
+    return {
+        "days": [
+            {
+                "date": d.date,
+                "slots": [
+                    {"time": s.time, "providers": s.providers} for s in d.slots
+                ],
+            }
+            for d in result.days
+        ],
+    }
+
+
+@router.post(
+    "/{clinic_id}/placeholder/appointments/book",
+    response_model=BookingResultResponse,
+)
+def placeholder_book_appointment(
+    clinic_id: str,
+    body: PlaceholderBookRequest,
+    _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
+):
+    """Book a real appointment into a free placeholder space.
+
+    Resolves the provider + room from the grid; end time is derived from the
+    real type's duration. Returns 409 (surfaced to the agent) when no free
+    placeholder matches so the agent can fall back to a ticket.
+    """
+    pair = _resolve_pair(db, clinic_id, body.real_event_type_id)
+    adapter = BlueprintAdapter(clinic_id=clinic_id)
+    adapter.load_http_config(db)
+    result = adapter.book_into_placeholder(
+        placeholder_event_type_id=pair.placeholder_event_type_id,
+        real_event_type_id=pair.real_event_type_id,
+        start_date=body.start_date,
+        start_time=body.start_time,
+        provider_name=body.provider_name,
+        patient_id=body.patient_id,
+        first_name=body.first_name,
+        last_name=body.last_name,
+        phone=body.phone,
+        notes=body.notes,
+        excluded_providers=_excluded_providers(db, clinic_id),
+    )
+    if body.patient_id:
+        log_phi_access(
+            clinic_id=clinic_id,
+            action="appointment_book",
+            patient_id=body.patient_id,
+            outcome=result.status,
+            detail=f"event_type={pair.real_event_type_id}",
+        )
+    return BookingResultResponse(
+        status=result.status,
+        appointment_id=result.appointment_id,
+        summary=result.summary,
+        start_time=result.start_time,
+        end_time=result.end_time,
+        warning=result.warning,
+    )
+
+
+# ── ACNA appointment-type decision ─────────────────────────────────────────────
+
+
+class AppointmentDecisionRequest(BaseModel):
+    patient_id: str
+    # Caller's answer after a need_payer round-trip; omit on the first call.
+    payer_type: Literal["WCB", "Veterans Affairs", "Other"] | None = None
+
+
+@router.post("/{clinic_id}/appointment-decision")
+def appointment_decision(
+    clinic_id: str,
+    body: AppointmentDecisionRequest,
+    _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
+):
+    """Run the clinic's deterministic appointment-type decision for an existing
+    patient. See ``api/voice_agent/appointment_decision.py`` for the rule spec.
+
+    Responses:
+      {status:"need_payer", options:[...]} — multiple funded payers on file;
+        the agent asks the caller and retries with ``payer_type``.
+      {status:"decided", outcome, reason, real_event_type_id, bookable, trace}
+        — ``bookable`` is true only when the outcome maps to a
+        real_event_type_id that also has a placeholder pair configured.
+    """
+    from api.voice_agent.appointment_decision import (
+        DecisionInputs, DecisionRules, decide, resolve_payer,
+    )
+    from api.voice_agent.protocols import load_protocol_config
+    from api.voice_agent.protocols.acna_appointment_decision import (
+        ACNADetermineAppointmentProtocol,
+    )
+
+    if not (body.patient_id or "").strip():
+        raise HTTPException(status_code=400, detail="patient_id is required")
+
+    cfg = load_protocol_config(db, clinic_id, ACNADetermineAppointmentProtocol.id)
+
+    adapter = BlueprintAdapter(clinic_id=clinic_id)
+    adapter.load_http_config(db)
+    inputs_raw = adapter.get_decision_inputs(
+        patient_id=body.patient_id.strip(),
+        clinician_names=cfg.clinician_names,
+    )
+
+    # An unknown patient must NOT fall through as "no history → due for an
+    # annual" — empty subquery results would look exactly like a never-tested
+    # patient. Fail loudly; the agent's error handling routes to a message.
+    if not inputs_raw["patient_exists"]:
+        log_phi_access(
+            clinic_id=clinic_id,
+            action="appointment_decision",
+            patient_id=body.patient_id,
+            outcome="patient_not_found",
+            detail="",
+        )
+        raise HTTPException(
+            status_code=404,
+            detail="Patient not found for this clinic — re-verify the caller's identity.",
+        )
+
+    payer, options = resolve_payer(
+        inputs_raw["active_insurer_names"], stated_payer=body.payer_type,
+    )
+    if payer is None:
+        log_phi_access(
+            clinic_id=clinic_id,
+            action="appointment_decision",
+            patient_id=body.patient_id,
+            outcome="need_payer",
+            detail=f"options={options}",
+        )
+        return {
+            "status": "need_payer",
+            "options": options,
+            "question_hint": (
+                "Ask which program this visit falls under, e.g. "
+                f"{' or '.join(options)}, otherwise 'Other'."
+            ),
+        }
+
+    tz = ZoneInfo(adapter._require_http_config().get("timezone") or "America/Vancouver")
+    today = datetime.now(tz).date()
+    expiry = inputs_raw["care_plan_expiry"]
+
+    decision = decide(
+        DecisionInputs(
+            today=today,
+            patient_is_existing=True,  # endpoint requires a matched patient_id
+            care_plan_name=inputs_raw["care_plan_name"],
+            care_plan_active=bool(expiry and expiry >= today),
+            payer_type=payer,
+            last_hearing_test_date=inputs_raw["last_hearing_test_date"],
+            last_clinician_visit_date=inputs_raw["last_clinician_visit_date"],
+        ),
+        DecisionRules(
+            qualifying_plan_names=tuple(cfg.qualifying_plan_names),
+            non_qualifying_plan_names=tuple(cfg.non_qualifying_plan_names),
+            unknown_plan_allows_annual=cfg.unknown_plan_allows_annual,
+            payer_min_years=dict(cfg.payer_min_years),
+            clinician_visit_threshold_years=cfg.clinician_visit_threshold_years,
+        ),
+    )
+
+    real_id = cfg.outcome_booking.get(decision.outcome)
+    bookable = real_id is not None and real_id in _placeholder_pairs(db, clinic_id)
+
+    # The full rule trace goes to the audit log, NOT the tool response — the
+    # response lands in the LLM transcript, which should carry only what the
+    # agent needs. ``patient_context`` is the deliberate exception: a curated,
+    # patient-facing set of facts about the VERIFIED caller's own record (plan
+    # name, last test, next funded due date) so the agent can answer "when am
+    # I due?" / "what's my plan?" instead of stonewalling. Rule internals and
+    # anything beyond these fields stay out.
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="appointment_decision",
+        patient_id=body.patient_id,
+        outcome=decision.outcome,
+        detail=f"payer={payer} bookable={bookable} trace={json.dumps(decision.trace)}",
+    )
+    expiry = inputs_raw["care_plan_expiry"]
+    last_test = inputs_raw["last_hearing_test_date"]
+    return {
+        "status": "decided",
+        "outcome": decision.outcome,
+        "reason": decision.reason,
+        "real_event_type_id": real_id if bookable else None,
+        "bookable": bookable,
+        "patient_context": {
+            "care_plan": inputs_raw["care_plan_name"],
+            "care_plan_active": bool(expiry and expiry >= today),
+            "annual_covered_by_plan": decision.annual_covered_by_plan,
+            "last_hearing_test": last_test.isoformat() if last_test else None,
+            "next_annual_due": (
+                decision.next_annual_due.isoformat()
+                if decision.next_annual_due else None
+            ),
+            "payer_program": payer,
+            "funded_test_interval_years": (
+                cfg.payer_min_years.get(payer)
+                or cfg.payer_min_years.get("Other", 1.0)
+            ),
+        },
     }
 
 

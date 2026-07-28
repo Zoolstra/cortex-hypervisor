@@ -23,13 +23,14 @@ from typing import Literal
 
 log = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from google.cloud import bigquery
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.deps import bq_client, bq_table, require_read_access, require_write_access, verify_token
+from api.services import notify
 from api.voice_agent import vapi as vapi_client
 from api.voice_agent.blueprint import verify_vapi_secret
 from api.core.db import get_session
@@ -42,6 +43,7 @@ from api.core.orm import (
 from api.voice_agent.protocols import (
     PROTOCOL_METADATA as CAPABILITY_METADATA,
     PROTOCOL_METADATA_BY_ID as CAPABILITY_METADATA_BY_ID,
+    is_clinic_compatible,
     is_pms_compatible,
     unmet_dependencies,
 )
@@ -320,18 +322,27 @@ def submit_ticket(
     body: TicketSubmitRequest,
     _: None = Depends(verify_vapi_secret),
     db: Session = Depends(get_session),
+    x_vapi_caller_number: str | None = Header(default=None),
 ):
     """
     Called by VAPI's submit_ticket tool at the end of a voice call.
 
     Validates the clinic exists in Cloud SQL, then appends one row to
     `Users.voice_agent_tickets` in BigQuery (analytics store, intentionally
-    separate from the operational config in Cloud SQL).
+    separate from the operational config in Cloud SQL). Finally fires a
+    best-effort staff alert so an after-hours message is never a lost lead.
+
+    Callback number resolution: the agent-transcribed ``caller_phone`` is
+    preferred (the caller may give a different callback number than they're
+    calling from), falling back to VAPI's caller-ID (the ``X-Vapi-Caller-Number``
+    header, populated from the ``{{customer.number}}`` template on the tool) so a
+    number is captured even when the agent didn't get one verbally.
     """
     clinic = db.get(Clinic, clinic_id)
     if not clinic or clinic.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Clinic not found")
 
+    callback_number = body.caller_phone or x_vapi_caller_number
     ticket_id = str(uuid.uuid4())
     details_json = json.dumps(body.details) if body.details is not None else None
 
@@ -351,7 +362,7 @@ def submit_ticket(
             bigquery.ScalarQueryParameter("ticket_id", "STRING", ticket_id),
             bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
             bigquery.ScalarQueryParameter("vapi_call_id", "STRING", body.vapi_call_id),
-            bigquery.ScalarQueryParameter("caller_phone", "STRING", body.caller_phone),
+            bigquery.ScalarQueryParameter("caller_phone", "STRING", callback_number),
             bigquery.ScalarQueryParameter("caller_name", "STRING", body.caller_name),
             bigquery.ScalarQueryParameter("patient_match_status", "STRING", body.patient_match_status),
             bigquery.ScalarQueryParameter("blueprint_patient_id", "STRING", body.blueprint_patient_id),
@@ -363,6 +374,23 @@ def submit_ticket(
             bigquery.ScalarQueryParameter("urgency", "STRING", body.urgency),
         ])
     ).result()
+
+    # Best-effort staff alert so an after-hours message is a captured lead, not
+    # a fire-and-forget BigQuery row. Never allowed to fail the ticket write.
+    try:
+        va = db.get(ClinicVoiceAgentConfiguration, clinic_id)
+        notify.notify_new_ticket(
+            clinic_name=clinic.clinic_name,
+            alert_sms_to=va.alert_sms_to if va else None,
+            alert_email_to=va.alert_email_to if va else None,
+            caller_name=body.caller_name,
+            callback_number=callback_number,
+            intent_category=body.intent_category,
+            summary=body.summary,
+            urgency=body.urgency,
+        )
+    except Exception:
+        log.exception("submit_ticket: staff alert failed for clinic_id=%s", clinic_id)
 
     return TicketSubmitResponse(ticket_id=ticket_id)
 
@@ -396,6 +424,11 @@ class CapabilityItem(BaseModel):
     # Current per-clinic config (validated against config_schema on
     # write). Defaults from the model when no row / null column.
     config: dict = {}
+    # True when the clinic's agent_role hard-requires this protocol — the
+    # role compiler includes it unconditionally, so its toggle is locked
+    # (disable would be a silent no-op on the live agent). The UI should
+    # render it as always-on-for-this-clinic.
+    locked_by_role: bool = False
     # Populated only on write operations (toggle). Indicates whether the
     # change propagated to the live VAPI assistant. Absent on list reads.
     vapi_sync: dict | None = None
@@ -434,6 +467,9 @@ def list_capabilities(
     clinic = _get_clinic_or_404(db, clinic_id)
     require_write_access(clinic.instance_id, caller)  # read gated by write
 
+    from api.voice_agent.roles import role_required_protocol_ids  # noqa: PLC0415
+    locked_ids = role_required_protocol_ids(clinic)
+
     pms_type = clinic.pms_type or "none"
 
     # Read from clinic_protocols — the new source of truth as of step 3 of the
@@ -452,6 +488,10 @@ def list_capabilities(
     items: list[CapabilityItem] = []
     for cap in CAPABILITY_METADATA:
         if cap.always_on:
+            continue
+        # Clinic-scoped protocols (e.g. ACNA's placeholder-grid ones) only
+        # surface for the clinics they're restricted to.
+        if not is_clinic_compatible(cap, clinic_id):
             continue
         row = state.get(cap.id)
         # Effective config = persisted row (if any) merged through the
@@ -477,6 +517,7 @@ def list_capabilities(
             unmet_dependencies=unmet_dependencies(cap.id, enabled_ids),
             config_schema=cap.config_model.model_json_schema(),
             config=cfg_obj.model_dump(),
+            locked_by_role=cap.id in locked_ids,
         ))
 
     return CapabilitiesListResponse(clinic_id=clinic_id, pms_type=pms_type, capabilities=items)
@@ -507,6 +548,31 @@ def toggle_capability(
 
     clinic = _get_clinic_or_404(db, clinic_id)
     require_write_access(clinic.instance_id, caller)
+
+    # Clinic-scoped protocols may only be toggled for the clinics they're
+    # restricted to. Guard even on disable so a stray row can't be created
+    # for the wrong clinic. Treated as 404 — the protocol doesn't exist for
+    # this clinic, matching the list endpoint hiding it.
+    if not is_clinic_compatible(cap, clinic_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown capability: {capability_id}",
+        )
+
+    # Role-required protocols can't be disabled: the clinic's role compiler
+    # includes them unconditionally, so a disable would write enabled=0 and
+    # report success while changing nothing on the live agent. Config edits
+    # (enabled=True + config) remain allowed.
+    from api.voice_agent.roles import role_required_protocol_ids  # noqa: PLC0415
+    if not body.enabled and capability_id in role_required_protocol_ids(clinic):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Capability {capability_id} is required by this clinic's agent "
+                "role and cannot be disabled. Change the clinic's agent_role to "
+                "'general' first if you need to turn it off."
+            ),
+        )
 
     pms_type = clinic.pms_type or "none"
     if body.enabled and not is_pms_compatible(cap, pms_type):

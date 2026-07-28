@@ -72,6 +72,13 @@ class Protocol:
     # PMS-agnostic. Empty tuple = unusable. Runtime compatibility gate.
     supported_pms: ClassVar[tuple[str, ...] | None] = None
 
+    # Tuple of clinic_ids this protocol is restricted to, or None for
+    # all clinics. Used for clinic-specific protocols whose behaviour only
+    # makes sense for one clinic's workflow (e.g. ACNA's placeholder-grid
+    # availability). The dashboard hides clinic-scoped protocols from
+    # clinics not in the set, and the factory refuses to instantiate them.
+    supported_clinics: ClassVar[tuple[str, ...] | None] = None
+
     # PMS adapter the protocol's HTTP-backed tools expect. None = no PMS
     # dependency. Reserved for the future type-based gate; ignored at
     # runtime in step 2.
@@ -111,6 +118,15 @@ class Protocol:
             raise ValueError(
                 f"{type(self).__name__} does not support pms_type={self.pms_type!r} "
                 f"(supported: {self.supported_pms})"
+            )
+
+        if (
+            self.supported_clinics is not None
+            and self.clinic_id not in self.supported_clinics
+        ):
+            raise ValueError(
+                f"{type(self).__name__} is restricted to clinics "
+                f"{self.supported_clinics} — not clinic_id={self.clinic_id!r}"
             )
 
     # ── Subclass surface ──────────────────────────────────────────────────────
