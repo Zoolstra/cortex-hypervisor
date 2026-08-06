@@ -32,12 +32,16 @@ KEY = "test-datafeed-key"
 INSTANCE_ID = "9e59f7fa-dcf5-4308-bdff-7c1b56ae7a1a"
 
 
-def _instance(instance_id=INSTANCE_ID, ads="9751756815", invoca="202527"):
+def _instance(instance_id=INSTANCE_ID, ads="9751756815", invoca="202527", clinics=None):
+    if clinics is None:
+        clinics = [SimpleNamespace(clinic_id="CL1", deleted_at=None),
+                   SimpleNamespace(clinic_id="CL2", deleted_at=None)]
     return SimpleNamespace(
         instance_id=instance_id,
         instance_name="Virsono Hearing Centres",
         google_ads_customer_id=ads,
         invoca_profile_id=invoca,
+        clinics=clinics,
     )
 
 
@@ -228,9 +232,133 @@ def test_transactions_withholds_tracking_and_qa_columns(harness):
         "call_sentiment_overall", "call_sentiment_overall_label",
         "signal_name", "signal_occurred_at", "signal_source", "signal_partner_unique_id",
         "revenue", "has_transcript",
+        # BAA gate: withheld until the per-instance flag secret is set
+        "calling_phone_number",
     ):
         assert col in except_clause, col
     assert "gclid" not in except_clause.replace("fbclid", "")  # join key stays
+
+
+def test_transactions_ships_caller_number_when_flag_enabled(harness, monkeypatch):
+    """The BAA flag secret (truthy value) removes calling_phone_number from the
+    EXCEPT list; everything else stays withheld."""
+    make_client, queries = harness
+
+    def _secrets(name, *a, **k):
+        if name == f"datafeed-caller-number-enabled-{INSTANCE_ID}":
+            return "1"
+        return KEY
+
+    monkeypatch.setattr(datafeed, "get_secret", _secrets)
+    resp = make_client().get(
+        f"/datafeed/v1/{INSTANCE_ID}/invoca/transactions",
+        headers={"X-API-Key": KEY},
+    )
+    assert resp.status_code == 200
+    sql, _ = queries.calls[0]
+    except_clause = sql.split("EXCEPT", 1)[1].split(")", 1)[0]
+    assert "calling_phone_number" not in except_clause
+    assert "repeat_calling_phone_number" in except_clause  # rest still withheld
+
+
+def test_caller_number_flag_requires_truthy_value(harness, monkeypatch):
+    """A flag secret that exists but isn't truthy (e.g. '0') keeps the gate shut."""
+    make_client, queries = harness
+
+    def _secrets(name, *a, **k):
+        if name == f"datafeed-caller-number-enabled-{INSTANCE_ID}":
+            return "0"
+        return KEY
+
+    monkeypatch.setattr(datafeed, "get_secret", _secrets)
+    resp = make_client().get(
+        f"/datafeed/v1/{INSTANCE_ID}/invoca/transactions",
+        headers={"X-API-Key": KEY},
+    )
+    assert resp.status_code == 200
+    sql, _ = queries.calls[0]
+    assert "calling_phone_number" in sql.split("EXCEPT", 1)[1].split(")", 1)[0]
+
+
+# ── Callscoring (settled layer) ───────────────────────────────────────────────
+
+def test_callscoring_scopes_and_serializes(harness):
+    make_client, queries = harness
+    queries.results.append([
+        {"complete_call_id": "C1",
+         "call_started_at": datetime(2026, 7, 1, 12, 30, tzinfo=timezone.utc),
+         "market": "Greenville", "classification": "appointment_booked",
+         "verified_outcome": "appointment_booked", "booked_verified": True,
+         "reasoning": "Caller booked a hearing test.",
+         "scored_as_of": datetime(2026, 7, 2, 7, 0, tzinfo=timezone.utc)},
+    ])
+    resp = make_client().get(
+        f"/datafeed/v1/{INSTANCE_ID}/invoca/callscoring",
+        params={"start_date": "2026-07-01", "end_date": "2026-07-07"},
+        headers={"X-API-Key": KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rows"][0]["booked_verified"] is True
+    assert body["rows"][0]["scored_as_of"] == "2026-07-02T07:00:00+00:00"
+
+    sql, params = queries.calls[0]
+    assert params["profile"] == 202527
+    assert params["clinic_ids"] == ["CL1", "CL2"]  # instance's clinics only
+    assert params["match_days"] == 3
+    assert "call_outcome_overrides" in sql   # relabels applied
+    assert "patient_contacts" in sql         # PMS reconciliation present
+
+
+def test_callscoring_empty_without_clinics(harness):
+    make_client, queries = harness
+    db = _FakeDb({INSTANCE_ID: _instance(clinics=[])})
+    resp = make_client(db).get(
+        f"/datafeed/v1/{INSTANCE_ID}/invoca/callscoring",
+        headers={"X-API-Key": KEY},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["rows"] == []
+    assert queries.calls == []
+
+
+# ── Dictionary ────────────────────────────────────────────────────────────────
+
+def test_dictionary_serves_versioned_definitions(harness):
+    make_client, _ = harness
+    resp = make_client().get(
+        f"/datafeed/v1/{INSTANCE_ID}/dictionary",
+        headers={"X-API-Key": KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["schema_version"] == datafeed.SCHEMA_VERSION
+    assert set(body["layers"]) == {"settled", "operational_mirror"}
+    assert "/invoca/callscoring" in body["layers"]["settled"]["endpoints"]
+    assert "booked_verified" in body["field_definitions"]["/invoca/callscoring"]
+    assert body["caller_number_enabled"] is False  # default OFF
+    assert body["booked_match_days"] == 3
+
+
+def test_dictionary_requires_key(harness):
+    make_client, _ = harness
+    assert make_client().get(f"/datafeed/v1/{INSTANCE_ID}/dictionary").status_code == 403
+
+
+def test_clicks_envelope_carries_settled_through(harness):
+    """settled_through = today − CLICKS_SETTLE_DAYS; the additive-pull anchor.
+    Rows dated on/before it are final (outside the ETL's restatement window)."""
+    from datetime import date, timedelta
+
+    make_client, queries = harness
+    queries.results.append([])
+    resp = make_client().get(
+        f"/datafeed/v1/{INSTANCE_ID}/google-ads/clicks",
+        headers={"X-API-Key": KEY},
+    )
+    assert resp.status_code == 200
+    expected = (date.today() - timedelta(days=datafeed._CLICKS_SETTLE_DAYS)).isoformat()
+    assert resp.json()["settled_through"] == expected
 
 
 def test_missing_ads_link_returns_empty_without_querying(harness):

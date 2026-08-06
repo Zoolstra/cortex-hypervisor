@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from api.deps import bq_client, require_read_access, require_write_access, verify_token
 from api.models import ClinicCreate, ClinicUpdate
 from api.core.db import get_session
-from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, InvocaCampaign
+from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, Instance, InvocaCampaign
 from api.account.provisioning import provision_clinic
 
 
@@ -245,6 +245,26 @@ def get_etl_status(
             out["transcripts"]["error"] = f"{type(e).__name__}: {e}"
 
     return out
+
+
+# Like etl_status above, this must stay BEFORE /clinics/{instance_id}/{clinic_id}.
+@router.get("/clinics/{clinic_id}/instance")
+def get_clinic_instance(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Resolve a clinic to its owning instance — a cheap lookup for callers
+    that only know the clinic_id (e.g. the sidebar deciding whether to show
+    the Group Analytics link on /intelligence/{clinicId} pages)."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
+    instance = db.get(Instance, clinic.instance_id)
+    return {
+        "instance_id": clinic.instance_id,
+        "instance_name": getattr(instance, "instance_name", None),
+        "multi_location_group": bool(getattr(instance, "multi_location_group", False)),
+    }
 
 
 @router.get("/clinics/{instance_id}/{clinic_id}")

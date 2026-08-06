@@ -587,6 +587,62 @@ class InvocaCampaign(Base):
 
     clinic: Mapped["Clinic"] = relationship(back_populates="invoca_campaigns")
 
+    promo_numbers: Mapped[list["InvocaPromoNumber"]] = relationship(
+        back_populates="campaign", cascade="all, delete-orphan"
+    )
+
+
+# ──────────────────── invoca_promo_numbers (N) ────────────────────
+
+class InvocaPromoNumber(Base):
+    """Registry of Invoca promo (call-tracking) numbers per campaign.
+
+    Campaign attribution for calls rests on "this number belongs to that
+    campaign" — an invariant neither Google Ads nor Invoca enforces (numbers
+    have historically been cross-wired across campaigns). This table models it
+    so it can be audited: ``promo_number`` is UNIQUE globally, so a number
+    routing to two campaigns is a constraint violation rather than silent
+    misattribution. Synced from the Invoca API (the source of truth) and
+    audited against Google Ads call assets by ``configure_promo_numbers.py``;
+    not edited by hand or via the admin UI.
+
+    ``media_type`` separates ad-extension numbers ("Google Call Extension")
+    from GMB-listing / website-pool numbers; ``adwords_account_id`` is Invoca's
+    record of the Google Ads account the number serves (cross-checked against
+    the instance's ``google_ads_customer_id`` by the audit).
+    """
+    __tablename__ = "invoca_promo_numbers"
+    __table_args__ = (
+        UniqueConstraint("promo_number", name="uq_promo_number"),
+        UniqueConstraint("invoca_promo_id", name="uq_invoca_promo_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    invoca_campaign_row_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("invoca_campaigns.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    invoca_promo_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Digits-only NANP number as Invoca returns it (e.g. "2525761487").
+    promo_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    media_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    promo_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    adwords_account_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    campaign: Mapped["InvocaCampaign"] = relationship(back_populates="promo_numbers")
+
 
 # ──────────────────── jotform_forms (N) ────────────────────
 
@@ -702,6 +758,51 @@ class ClinicBlueprintEntityNote(Base):
 # Which appointment event_types / statuses / invoice item_types define each
 # cohort depends on the clinic's Blueprint taxonomy, so it lives per-clinic here
 # rather than as hard-coded constants in intelligence_report/queries.py.
+
+class CustomerIOEnrollment(Base):
+    """Send-once log for the Customer.io database-reactivation pipeline.
+
+    One row per (clinic, patient, cohort) — the daily sync skips any patient
+    already present, so a person is enrolled into a given campaign at most
+    once regardless of how many sync runs see them. ``status`` records why a
+    row exists without a send: consent-blocked and no-contact patients are
+    logged too, so reruns don't re-evaluate them and the pilot's funnel
+    (eligible → sent) is auditable. ``dry_run`` rows are NOT written — a dry
+    run must leave no state behind.
+    """
+    __tablename__ = "customerio_enrollments"
+    __table_args__ = (
+        UniqueConstraint("clinic_id", "client_id", "cohort_key",
+                         name="uq_cio_enroll_clinic_client_cohort"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    client_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    cohort_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        Enum("sent", "blocked_consent", "no_contact",
+             name="cio_enrollment_status_enum"),
+        nullable=False,
+    )
+    enrolled_by: Mapped[str | None] = mapped_column(String(255))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship()
+
 
 class ClinicWorklistTaxonomy(Base):
     __tablename__ = "clinic_worklist_taxonomy"

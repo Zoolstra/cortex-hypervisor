@@ -62,5 +62,12 @@ def hello():
 # worklists_router is registered before account_routers for the same reason as
 # voice-agent: its literal "/clinics/{id}/worklists/..." routes are more
 # specific than account's wildcard "/clinics/{instance_id}/{clinic_id}".
-for r in voice_agent_routers + [worklists_router] + account_routers + [intelligence_router, webforms_router, datafeed_router]:
+# The /v2 router is registered FIRST. Its prefix is an all-literal "/v2", so it
+# cannot swallow anything; putting it ahead of the wildcard routers also means no
+# future /v2/... path can be captured by their root-level GET /{clinic_id}/...
+# patterns (which would bind clinic_id="v2"). See api/v2/__init__.py.
+from api.v2 import router as v2_router  # noqa: E402
+
+for r in ([v2_router] + voice_agent_routers + [worklists_router] + account_routers
+          + [intelligence_router, webforms_router, datafeed_router]):
     app.include_router(r)

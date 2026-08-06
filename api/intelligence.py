@@ -6,7 +6,10 @@ returns a fully-rendered HTML document built from Blueprint_PHI + ClinicData.
 The report module is stdlib-only (no pandas/plotly) so it can live inside the
 hypervisor container without bloating the image.
 """
+import logging
+import os
 import time
+import datetime as _dt
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
@@ -17,6 +20,8 @@ from api.audit import log_phi_access
 from api.core.db import get_session
 from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, Instance, InvocaCampaign
 from api.deps import require_read_access, require_write_access, verify_token
+
+log = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -87,10 +92,58 @@ def _group_ga_campaigns(db: Session, instance_id: str) -> dict[str, list[str]]:
     return out
 
 
-# Small in-process TTL cache for the (expensive, LLM-bearing) JSON payloads.
-# Keyed on everything that changes the result; mirrors the HTML report's cache.
-_JSON_TTL = 300.0
+# In-process cache for the (expensive, LLM-bearing) JSON payloads.
+#
+# The TTL used to be 300s, which was the wrong instrument: these payloads only
+# change when new data lands (hourly ETL / daily PHI sync), so a 5-minute expiry
+# threw away valid results and left the first visitor after any idle gap paying
+# the full cold cost — measured at ~39s against ~0.45s warm.
+#
+# Now keyed on `data_version` instead, exactly as the HTML report cache is
+# (report.py:2078-2080): a new ETL load or a date rollover mints a new key, so
+# stale entries can never be served and no short TTL is needed. The remaining
+# TTL is only a memory bound, and is long because correctness comes from the key
+# — the same reasoning as the report cache's 6h L1.
+_JSON_TTL = 21_600.0  # 6h; safe because the key is data-versioned
 _json_cache: dict[tuple, tuple[float, dict]] = {}
+
+# data_version is per-clinic and needs a BigQuery read, so memoize it rather than
+# paying for it on every request. Staleness is bounded by this memo plus the UTC
+# date component of the version string — the same trade report.py makes.
+_DATA_VERSION_TTL = 600.0
+_data_version_cache: dict[str, tuple[float, str]] = {}
+
+
+def _data_version(clinic_id: str) -> str:
+    """The cache-invalidation key: the PMS snapshot date when we have one.
+
+    Deliberately NOT `<snapshot>|<today>` (which report.py uses). Including the
+    date makes every clinic's cache expire simultaneously at 00:00 UTC, turning a
+    smooth miss rate into a daily cliff where the first visitors all pay the full
+    ~40-60s cold cost at once. Keying on the snapshot alone means a cache entry
+    lives until new data actually lands, which is the real invalidation signal.
+
+    BUT a clinic with no PMS feed has no snapshot, and a constant version would
+    then never rotate — the shared GCS tier has no TTL (existence == validity), so
+    it would serve indefinitely. Those clinics therefore keep a dated version, so
+    they still invalidate daily. Measured: 6 of 13 clinics have no PMS booking
+    data, and they are the cheap ones to rebuild.
+    """
+    now = time.monotonic()
+    hit = _data_version_cache.get(clinic_id)
+    if hit and (now - hit[0]) < _DATA_VERSION_TTL:
+        return hit[1]
+    today = _dt.date.today().isoformat()
+    try:
+        from intelligence_report import queries as _q
+        snapshot = _q.blueprint_snapshot_date(clinic_id)
+    except Exception:  # noqa: BLE001 — degrade to daily invalidation
+        snapshot = None
+    # Snapshot present -> rotate only when new data lands. Absent -> fall back to
+    # daily rotation so the untimed shared tier cannot serve forever.
+    version = str(snapshot) if snapshot else f"nodata|{today}"
+    _data_version_cache[clinic_id] = (now, version)
+    return version
 
 
 def _cache_get(key: tuple):
@@ -102,6 +155,97 @@ def _cache_get(key: tuple):
 
 def _cache_put(key: tuple, value: dict):
     _json_cache[key] = (time.monotonic(), value)
+
+# ── Shared (cross-instance) cache layer ──────────────────────────────────────
+# The in-process dict above only helps the instance that populated it, and
+# Cloud Run runs --workers 1 per instance and scales to zero — so a cold start
+# or a second instance pays full price, and an external prewarm job could only
+# ever warm whichever instance happened to serve it.
+#
+# This adds a GCS-backed layer with the same design the HTML report cache
+# already uses (report.py:1984-2045): the object name embeds a hash of the
+# data-versioned key, so an object's existence IS its validity — no TTL. The
+# bucket's lifecycle rule sweeps orphans from rotated versions.
+#
+# Every operation is fail-safe: a cache problem must never fail a request.
+_SHARED_CACHE_BUCKET = "project-demo-2-482101-report-cache"  # same bucket, own prefix
+_SHARED_CACHE_PREFIX = "json-cache"
+_storage_client = None
+
+# Kill switch, checked per call so it can be monkeypatched.
+#
+# Two purposes. Operationally: disable the shared tier without a redeploy if GCS
+# misbehaves, falling back to in-process only. For tests: a unit test must not
+# reach GCS — objects written by an earlier run would otherwise leak in as cache
+# hits and make results order- and environment-dependent (which is exactly how
+# this was found).
+_SHARED_CACHE_ENABLED = os.environ.get("PAYLOAD_SHARED_CACHE", "1") != "0"
+
+
+def _shared_blob(key: tuple, clinic_id: str):
+    global _storage_client
+    import hashlib
+    from google.cloud import storage
+    if _storage_client is None:
+        _storage_client = storage.Client()
+    digest = hashlib.sha256(repr(key).encode()).hexdigest()
+    return (_storage_client.bucket(_SHARED_CACHE_BUCKET)
+            .blob(f"{_SHARED_CACHE_PREFIX}/{clinic_id}/{digest}.json"))
+
+
+def _shared_get(key: tuple, clinic_id: str) -> dict | None:
+    if not _SHARED_CACHE_ENABLED:
+        return None
+    try:
+        blob = _shared_blob(key, clinic_id)
+        if not blob.exists():
+            return None
+        import json as _json
+        return _json.loads(blob.download_as_bytes())
+    except Exception as exc:  # noqa: BLE001 — cache miss, never an error
+        log.warning("shared json-cache read failed: %s", exc)
+        return None
+
+
+def _shared_put(key: tuple, clinic_id: str, payload: dict) -> None:
+    if not _SHARED_CACHE_ENABLED:
+        return
+    try:
+        import json as _json
+        _shared_blob(key, clinic_id).upload_from_string(
+            _json.dumps(payload, default=str), content_type="application/json")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shared json-cache write failed: %s", exc)
+
+
+def _cache_lookup(key: tuple, clinic_id: str, *,
+                  use_cache: bool = True) -> dict | None:
+    """L1 in-process, then L2 shared. A shared hit is promoted into L1 so the
+    next request on this instance skips the GCS round trip.
+
+    `use_cache=False` bypasses BOTH tiers. Callers must pass one flag covering
+    every bypass reason (`nocache`, `skip_llm`): gating only L1 let the shared
+    layer serve a payload the caller had explicitly opted out of.
+    """
+    if not use_cache:
+        return None
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    shared = _shared_get(key, clinic_id)
+    if shared is not None:
+        _cache_put(key, shared)
+    return shared
+
+
+def _cache_store(key: tuple, clinic_id: str, payload: dict, *,
+                 use_cache: bool = True) -> None:
+    """Write through to both tiers, or neither."""
+    if not use_cache:
+        return
+    _cache_put(key, payload)
+    _shared_put(key, clinic_id, payload)
+
 
 
 @router.get("/intelligence/{clinic_id}/report.html")
@@ -325,12 +469,20 @@ def get_intelligence_overview(
     end: str | None = None,
     days: int = 365,
     nocache: bool = False,
+    skip_llm: bool = False,
     caller: dict = Depends(verify_token),
     db: Session = Depends(get_session),
 ):
     """5-section Intelligence Overview payload (JSON), driven by the global
     date range (``?start=&end=`` inclusive ``YYYY-MM-DD``; falls back to
-    ``?days=``)."""
+    ``?days=``).
+
+    ``?skip_llm=1`` skips the two Claude calls (``one_thing`` → null,
+    ``recommendations`` → []) and bypasses the JSON cache in BOTH directions,
+    so a copy-less payload is never cached for (or served to) real users.
+    Added for the dashboard-rework parity harness (see
+    resources/dashboard-rework-plan.md §1.3); no behavior change unless
+    passed."""
     clinic = db.get(Clinic, clinic_id)
     if not clinic or clinic.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Clinic not found")
@@ -341,9 +493,11 @@ def get_intelligence_overview(
     tier = getattr(clinic, "tier", "none") or "none"
     hours = _location_hours(clinic)
 
-    key = ("overview", clinic_id, window.start_date, window.end_date_excl, tier)
-    if not nocache:
-        cached = _cache_get(key)
+    key = ("overview", clinic_id, window.start_date, window.end_date_excl, tier,
+           _data_version(clinic_id))
+    use_cache = not nocache and not skip_llm
+    if use_cache:
+        cached = _cache_lookup(key, clinic_id, use_cache=use_cache)
         if cached is not None:
             return cached
 
@@ -358,13 +512,15 @@ def get_intelligence_overview(
         location_hours=hours,
         tier=tier,
         pms_type=(getattr(clinic, "pms_type", None) or "none"),
+        with_recommendations=not skip_llm,
     )
     # So the clinic page can link up to instance-wide Group Intelligence when
     # this clinic belongs to a multi-location group.
     payload["instance_id"] = clinic.instance_id
     payload["group_intelligence"] = bool(
         getattr(db.get(Instance, clinic.instance_id), "multi_location_group", False))
-    _cache_put(key, payload)
+    if not skip_llm:
+        _cache_store(key, clinic_id, payload, use_cache=use_cache)
     return payload
 
 
@@ -390,9 +546,11 @@ def get_intelligence_biweekly(
     window = _resolve_window(start, end, days)
     invoca_ids, gads_ids = _active_campaign_ids(db, clinic_id)
 
-    key = ("biweekly", clinic_id, window.start_date, window.end_date_excl)
-    if not nocache:
-        cached = _cache_get(key)
+    key = ("biweekly", clinic_id, window.start_date, window.end_date_excl,
+           _data_version(clinic_id))
+    use_cache = not nocache
+    if use_cache:
+        cached = _cache_lookup(key, clinic_id, use_cache=use_cache)
         if cached is not None:
             return cached
 
@@ -406,7 +564,7 @@ def get_intelligence_biweekly(
         window=window,
         pms_type=(getattr(clinic, "pms_type", None) or "none"),
     )
-    _cache_put(key, payload)
+    _cache_store(key, clinic_id, payload, use_cache=use_cache)
     return payload
 
 
@@ -417,11 +575,16 @@ def get_group_overview(
     end: str | None = None,
     days: int = 365,
     nocache: bool = False,
+    skip_llm: bool = False,
     caller: dict = Depends(verify_token),
     db: Session = Depends(get_session),
 ):
     """Multi-location "Group Intelligence" payload (JSON) — a leaderboard +
     roll-up across all of an instance's clinics, driven by the global date range.
+
+    ``?skip_llm=1`` skips the recommendations Claude call and bypasses the
+    JSON cache both ways (parity-harness use; no behavior change unless
+    passed — see the overview endpoint's docstring).
 
     Gated by the instance ``multi_location_group`` capability flag: when off, the
     endpoint 404s (not 403) so the whole section is invisible to instances that
@@ -439,9 +602,11 @@ def get_group_overview(
     clinics = _group_clinics(db, instance_id)
     ga_by_clinic = _group_ga_campaigns(db, instance_id)
 
-    key = ("group-overview", instance_id, window.start_date, window.end_date_excl)
-    if not nocache:
-        cached = _cache_get(key)
+    key = ("group-overview", instance_id, window.start_date, window.end_date_excl,
+           _data_version(instance_id))
+    use_cache = not nocache and not skip_llm
+    if use_cache:
+        cached = _cache_lookup(key, instance_id, use_cache=use_cache)
         if cached is not None:
             return cached
 
@@ -453,8 +618,10 @@ def get_group_overview(
         clinics=clinics,
         ga_campaign_ids_by_clinic=ga_by_clinic,
         window=window,
+        with_recommendations=not skip_llm,
     )
-    _cache_put(key, payload)
+    if not skip_llm:
+        _cache_store(key, instance_id, payload, use_cache=use_cache)
     return payload
 
 
@@ -534,8 +701,9 @@ def get_active_leads(
     hours = _location_hours(clinic)
 
     key = ("active-leads", clinic_id, window.start_date, window.end_date_excl)
-    if not nocache:
-        cached = _cache_get(key)
+    use_cache = not nocache
+    if use_cache:
+        cached = _cache_lookup(key, clinic_id, use_cache=use_cache)
         if cached is not None:
             return cached
 
@@ -548,7 +716,7 @@ def get_active_leads(
         window=window,
         location_hours=hours,
     )
-    _cache_put(key, payload)
+    _cache_store(key, clinic_id, payload, use_cache=use_cache)
     return payload
 
 

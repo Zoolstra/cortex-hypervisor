@@ -15,6 +15,10 @@ RUN pip install -r requirements.txt
 
 COPY api ./api
 COPY intelligence_report ./intelligence_report
+# scripts/ ships in the image so the same build can run as a Cloud Run JOB with
+# an overridden --command (payload prewarm, parity harness) rather than needing a
+# second image to maintain.
+COPY scripts ./scripts
 COPY alembic ./alembic
 COPY alembic.ini .
 

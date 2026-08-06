@@ -272,3 +272,62 @@ def test_patient_journey_admin_ok_and_audited(client, monkeypatch):
     assert audited["action"] == "patient_journey"
     assert audited["patient_id"] == "ABC"
     assert audited["outcome"] == "ok"
+
+
+def _isolate_cache(monkeypatch):
+    """Unit tests must not touch the shared GCS cache tier: objects written by a
+    previous run would leak in as hits, making results depend on run order and
+    on real cloud state. Also clears the in-process tier."""
+    from api import intelligence as _I
+    monkeypatch.setattr(_I, "_SHARED_CACHE_ENABLED", False)
+    _I._json_cache.clear()
+    _I._data_version_cache.clear()
+    monkeypatch.setattr(_I, "_data_version", lambda *_a, **_k: "test-version")
+
+
+def test_overview_skip_llm_disables_recommendations_and_bypasses_cache(client, monkeypatch):
+    """?skip_llm=1 (parity-harness param) must pass with_recommendations=False
+    and never read from or write to the JSON cache — a copy-less payload must
+    not be served to (or poison the cache for) real users."""
+    _isolate_cache(monkeypatch)
+    app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
+    _use_session(_FakeClinic())
+    calls = []
+
+    def _fake_build(**k):
+        calls.append(k)
+        return {"clinic_id": "C_SKIP", "with_recs": k["with_recommendations"]}
+
+    monkeypatch.setattr("intelligence_report.payloads.build_overview", _fake_build)
+
+    # 1. skip_llm request: builder invoked with with_recommendations=False.
+    r = client.get("/intelligence/C_SKIP/overview?days=30&skip_llm=1")
+    assert r.status_code == 200
+    assert calls[-1]["with_recommendations"] is False
+
+    # 2. Its result must NOT have been cached: a normal request rebuilds
+    #    (with_recommendations=True) instead of serving the copy-less payload.
+    r = client.get("/intelligence/C_SKIP/overview?days=30")
+    assert r.status_code == 200
+    assert len(calls) == 2
+    assert calls[-1]["with_recommendations"] is True
+
+    # 3. The normal result IS cached; a skip_llm request must not read it
+    #    (cache bypassed in both directions → builder runs a third time).
+    r = client.get("/intelligence/C_SKIP/overview?days=30&skip_llm=1")
+    assert r.status_code == 200
+    assert len(calls) == 3
+    assert calls[-1]["with_recommendations"] is False
+
+
+def test_overview_default_has_no_skip(client, monkeypatch):
+    """Without ?skip_llm, the endpoint passes with_recommendations=True —
+    the declared 'zero behavior change unless passed' guarantee."""
+    app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
+    _use_session(_FakeClinic())
+    seen = {}
+    monkeypatch.setattr("intelligence_report.payloads.build_overview",
+                        lambda **k: (seen.update(k), {"clinic_id": "C_DEFAULT"})[1])
+    r = client.get("/intelligence/C_DEFAULT/overview?days=30&nocache=1")
+    assert r.status_code == 200
+    assert seen["with_recommendations"] is True

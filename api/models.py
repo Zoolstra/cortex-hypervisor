@@ -168,6 +168,17 @@ class PmsConfigSet(BaseModel):
     secrets: Optional[dict] = None
 
 
+class CustomerIOConfigSet(BaseModel):
+    """Sets a clinic's Customer.io workspace credentials (one workspace per
+    clinic). All fields optional so site ID / API key / region can be rotated
+    independently — blank keeps the existing value. Stored in Secret Manager
+    as ``customerio-site-id-<clinic_id>`` etc.; never in the DB, never
+    returned by any endpoint."""
+    site_id: Optional[str] = None
+    track_api_key: Optional[str] = None
+    region: Optional[Literal["us", "eu"]] = None
+
+
 # ── Webforms ──────────────────────────────────────────────────────────────────
 
 class WebformSubmission(BaseModel):

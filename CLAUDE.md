@@ -147,6 +147,41 @@ pms_type: Literal["none", "blueprint"] = "none"
 | `scripts.py` | Call scripts per clinic per call type |
 | `campaigns.py` | Multi-campaign ID management per clinic (new table, old column kept) |
 
+## Cloud Run Jobs (production)
+
+The **same image** that serves the API also runs as a job with an overridden
+`--command` — `Dockerfile` ships `scripts/` for exactly this reason, so there is
+no second image to keep in sync.
+
+| Job | Command | Schedule (PT) | Purpose |
+|---|---|---|---|
+| `payload-prewarm` | `python scripts/prewarm_payloads.py` | hourly (`20 * * * *`, `payload-prewarm-hourly`) | Warm the intelligence JSON payload cache so the first real visitor after a data-version rotation never pays the cold cost. 13 clinics × (4 windows + biweekly) + 1 group × 4 = **69 requests**; ~15 min fully cold, ~1 min when already warm. |
+
+Why **hourly** and not pinned to `blueprint-sync`: the cache key rotates on the
+PMS snapshot date (see `_data_version` in `api/intelligence.py`), and an hourly
+run is self-healing — it needs no knowledge of when any upstream sync actually
+landed or retried, and a warm run is a cheap no-op because the job hits the same
+data-versioned keys the SPA does.
+
+No env vars or secrets are set on the job: it runs as the same service account as
+the service (`cortex-hypervisor-sa`) and fetches secrets at runtime through
+`api/core/secrets.py`, reaching Cloud SQL through the connector.
+
+```bash
+# Deploy from the current API image (get DIGEST from Artifact Registry):
+gcloud run jobs deploy payload-prewarm \
+  --image="us-docker.pkg.dev/$PROJECT_ID/cortex-hypervisor/cortex-hypervisor@$DIGEST" \
+  --command=python --args=scripts/prewarm_payloads.py \
+  --service-account=cortex-hypervisor-sa@$PROJECT_ID.iam.gserviceaccount.com \
+  --region=us-central1 --task-timeout=3600 --max-retries=1 --memory=1Gi
+
+gcloud run jobs execute payload-prewarm --region=us-central1   # run now
+```
+
+**Redeploy the job after deploying the service** if the prewarm script or the
+cache-key logic changed — the job pins an image digest, so `./dev.sh` alone
+leaves it on the old build.
+
 ## Environment Variables (`.env`)
 
 ```

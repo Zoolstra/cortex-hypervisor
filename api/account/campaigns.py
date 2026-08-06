@@ -227,12 +227,25 @@ def _gads_dict(c: GoogleAdsCampaign) -> dict:
 
 
 def _invoca_dict(c: InvocaCampaign) -> dict:
+    # ``tracking_numbers`` = the campaign's registered Invoca promo numbers
+    # (synced from the Invoca API by configure_promo_numbers.py). Read-only
+    # here; lets the admin UI show which dialed numbers attribute to this
+    # campaign without a second endpoint.
     return {
         "id": c.id,
         "clinic_id": c.clinic_id,
         "campaign_type": "invoca",
         "external_campaign_id": c.invoca_campaign_id,
         "active": bool(c.active),
+        "tracking_numbers": [
+            {
+                "promo_number": p.promo_number,
+                "description": p.description,
+                "media_type": p.media_type,
+                "active": bool(p.active),
+            }
+            for p in c.promo_numbers
+        ],
     }
 
 

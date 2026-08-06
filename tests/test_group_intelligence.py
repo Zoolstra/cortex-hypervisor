@@ -211,3 +211,44 @@ def test_group_overview_bad_date_range_422(client, monkeypatch):
     monkeypatch.setattr("intelligence_report.payloads.build_group_overview", lambda **k: {"ok": True})
     r = client.get("/intelligence/group/INST/overview?start=2026-06-10&end=2026-06-01")
     assert r.status_code == 422
+
+
+def _isolate_cache(monkeypatch):
+    """Unit tests must not touch the shared GCS cache tier: objects written by a
+    previous run would leak in as hits, making results depend on run order and
+    on real cloud state. Also clears the in-process tier."""
+    from api import intelligence as _I
+    monkeypatch.setattr(_I, "_SHARED_CACHE_ENABLED", False)
+    _I._json_cache.clear()
+    _I._data_version_cache.clear()
+    monkeypatch.setattr(_I, "_data_version", lambda *_a, **_k: "test-version")
+
+
+def test_group_overview_skip_llm_disables_recommendations_and_bypasses_cache(client, monkeypatch):
+    """?skip_llm=1 on the group overview: with_recommendations=False and the
+    JSON cache is bypassed in both directions (mirrors the clinic overview)."""
+    _isolate_cache(monkeypatch)
+    app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
+    _use_session(_FakeInstance(flag=True))
+    calls = []
+
+    def _fake_build(**k):
+        calls.append(k)
+        return {"instance_id": "INST_SKIP", "with_recs": k["with_recommendations"]}
+
+    monkeypatch.setattr("intelligence_report.payloads.build_group_overview", _fake_build)
+
+    r = client.get("/intelligence/group/INST_SKIP/overview?days=30&skip_llm=1")
+    assert r.status_code == 200
+    assert calls[-1]["with_recommendations"] is False
+
+    # Not cached: the following normal request rebuilds with recommendations.
+    r = client.get("/intelligence/group/INST_SKIP/overview?days=30")
+    assert r.status_code == 200
+    assert len(calls) == 2
+    assert calls[-1]["with_recommendations"] is True
+
+    # Normal result is cached, but skip_llm must not read it.
+    r = client.get("/intelligence/group/INST_SKIP/overview?days=30&skip_llm=1")
+    assert r.status_code == 200
+    assert len(calls) == 3

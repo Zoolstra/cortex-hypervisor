@@ -46,6 +46,7 @@ from typing import Iterator
 
 import pymysql
 from google.cloud.sql.connector import Connector, IPTypes
+from google.oauth2.credentials import Credentials as _UserCredentials
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -57,6 +58,31 @@ DB_NAME = "clients"
 # Final fallback when neither CLOUD_SQL_IAM_USER is set nor ADC resolves to a
 # service account. Matches the prod Cloud Run service identity.
 _DEFAULT_IAM_USER = "cortex-hypervisor-sa@project-demo-2-482101.iam"
+
+def _gcloud_active_account() -> str | None:
+    """The `account` from gcloud's active configuration, or None.
+
+    Used only to resolve the IAM DB username for a developer running with a
+    plain user ADC; production resolves via the metadata server long before
+    this is reached.
+    """
+    import configparser
+    from pathlib import Path
+
+    cfg_dir = Path(os.environ.get("CLOUDSDK_CONFIG",
+                                  Path.home() / ".config" / "gcloud"))
+    name = "default"
+    active = cfg_dir / "active_config"
+    if active.is_file():
+        name = active.read_text().strip() or "default"
+    path = cfg_dir / "configurations" / f"config_{name}"
+    if not path.is_file():
+        return None
+    parser = configparser.ConfigParser()
+    parser.read(path)
+    acct = parser.get("core", "account", fallback="").strip()
+    return acct or None
+
 
 _METADATA_SA_URL = (
     "http://metadata.google.internal/computeMetadata/v1/instance/"
@@ -106,6 +132,20 @@ def _resolve_iam_user() -> str:
         sa_email = getattr(creds, "service_account_email", None)
         if sa_email and "@" in sa_email:
             return sa_email.removesuffix(".gserviceaccount.com")
+        # Plain user ADC (`gcloud auth application-default login` with no
+        # impersonation): the IAM DB user is the developer's own email. Falling
+        # through to the SA default presents the user's credentials under the
+        # SA's username, which Cloud SQL rejects with a bare "1045 Access
+        # denied" that reads like a privilege problem rather than an identity
+        # mismatch — it has cost debugging time twice.
+        #
+        # google.auth does not expose the email for user credentials
+        # (`creds.account` is ''), so fall back to gcloud's own active config.
+        # Local-dev only: on Cloud Run the metadata branch above already won.
+        if isinstance(creds, _UserCredentials):
+            acct = _gcloud_active_account()
+            if acct:
+                return acct
     except Exception:
         pass
 

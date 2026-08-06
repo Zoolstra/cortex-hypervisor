@@ -58,6 +58,14 @@ ZOOLSTRA_REFERRAL_TAG = "Referral - Zoolstra"
 # CounselEar appointment statuses that count as a kept / converted visit.
 _ZOOLSTRA_BOOKED_STATUSES = ("completed", "arrived")
 
+# Sentinel campaign key used by :func:`google_ads_roi` for the remainder row —
+# paid calls that neither a GCLID nor a campaign-name match could tie to one of
+# the clinic's linked Google Ads campaigns. Carrying them as an explicit row is
+# what makes the per-campaign table sum EXACTLY to the §04 headline
+# (:func:`paid_call_revenue`) instead of silently undershooting it.
+UNATTRIBUTED_CAMPAIGN_ID = "__unattributed__"
+UNATTRIBUTED_CAMPAIGN_NAME = "Unattributed paid calls"
+
 
 def _client() -> bigquery.Client:
     return bigquery.Client(project="project-demo-2-482101")
@@ -444,19 +452,37 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
     The call population is the clinic's PAID calls — the same classifier
     (:func:`_channel_case_sql`), spam filter, and per-``complete_call_id`` dedup
     as :func:`paid_call_revenue` / :func:`traffic_drivers` — so these rows are a
-    per-campaign SPLIT of the §04 headline numbers. Paid calls whose Invoca
-    campaign name matches no linked Ads campaign appear in the headline but in
-    no row, so column sums can undershoot (never overshoot) the headline.
+    per-campaign SPLIT of the §04 headline numbers. Every paid call lands in
+    exactly one row, so ``calls`` and ``booked`` sum EXACTLY to the §04 headline
+    (:func:`paid_call_revenue`) — see the remainder row below.
 
-    Paid calls are attributed to a campaign by **normalized campaign name** —
-    NOT by GCLID (GCLID coverage is sparse, which collapsed the per-campaign
-    numbers toward zero; Call Extension calls never carry one). Each Google Ads
-    campaign name (``ad_clicks_v2.campaign_name``, e.g. "Beta Princeton") is
-    normalized — leading "Beta " stripped, trimmed, lower-cased — and matched to
-    the Invoca campaign name on each call
-    (``transactions.advertiser_campaign_name``, e.g. "Princeton"). Calls are
-    scoped to the clinic's own Invoca campaigns first, so a name shared across
-    clinics can't cross-attribute.
+    Paid calls are attributed to a campaign by a two-tier **cascade**:
+
+    1. **GCLID** — the call's ``transactions.gclid`` joins
+       ``ad_clicks_v2.click_view_gclid`` for one of the clinic's linked
+       campaigns. Campaign-exact, hard evidence; wins whenever present.
+    2. **Normalized campaign name** — each Google Ads campaign name
+       (``ad_clicks_v2.campaign_name``, e.g. "Beta Princeton") is normalized
+       (leading "Beta " stripped, trimmed, lower-cased) and compared to the
+       Invoca campaign name on the call
+       (``transactions.advertiser_campaign_name``, e.g. "Princeton").
+
+    Neither tier alone is sufficient, which is why both are used. GCLID coverage
+    is sparse (~25% of paid calls carry one; Call Extension tap-to-call never
+    does), so GCLID alone collapses the per-campaign numbers toward zero. But
+    name matching only works where the client names its Invoca campaigns after
+    its Ads campaigns (Virsono's "Beta <Location>" ↔ "<Location>"); a client that
+    names Invoca campaigns per LOCATION while its Ads campaigns are named
+    anything else (e.g. Hope Hearing: Invoca "Southlake" vs Ads "Hope Hearing TX
+    PPC 8000") name-matches nothing at all. Calls are scoped to the clinic's own
+    Invoca campaigns first, so a name shared across clinics can't cross-attribute.
+
+    Paid calls that neither tier resolves are returned as a single **remainder
+    row** (``campaign_id = UNATTRIBUTED_CAMPAIGN_ID``, ``unattributed=True``,
+    zero clicks/spend) rather than dropped. That is what makes the table
+    reconcile with the headline: the tracking data can't say WHICH campaign
+    drove those calls, but they were paid calls and the report says so out loud
+    instead of quietly losing them.
 
     Per campaign: clicks (``ad_clicks_v2``), spend (``ad_groups`` —
     ``metrics_cost_micros / 1e6``, Google's true billed cost, windowed to the
@@ -467,15 +493,17 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
     no-transcript calls do NOT book, so a coincidental phone match is excluded —
     but patient type is IGNORED: new and existing patients both count), and
     attributed revenue (matched callers phone-joined to their patient →
-    ``InvoiceMaster`` invoices in the window dated on/after the patient's first
-    name-matched paid call, deduped per campaign — the same downstream gate as
-    the §04 headline).
+    every positive ``InvoiceMaster`` invoice in the window, deduped per
+    ``order_id`` — the same revenue rule as the §04 headline
+    (:func:`paid_call_revenue`) and "Revenue from Call traffic"; no
+    on/after-first-call gate).
 
     NOTE: captures ad → *phone call* → booking only; CounselEar web-portal
-    conversions (no call) are not linked here. Returns one dict per campaign with
-    derived ratios (CPC, cost-per-call, cost-per-booking, ROAS). With no linked
-    Invoca campaigns the call/booked/revenue columns are 0 (clicks + spend still
-    report). Skips clinics with no linked Google Ads campaigns.
+    conversions (no call) are not linked here. Returns one dict per campaign
+    (plus the remainder row when there is one) with derived ratios (CPC,
+    cost-per-call, cost-per-booking, ROAS). With no linked Invoca campaigns the
+    call/booked/revenue columns are 0 and there is no remainder row (clicks +
+    spend still report). Skips clinics with no linked Google Ads campaigns.
     """
     if not ga_campaign_ids:
         return []
@@ -505,6 +533,27 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
                    {_norm("campaign_name")} AS norm
             FROM ga
         ),
+        ga_name_map AS (
+            -- name → ONE campaign. Two linked campaigns can normalize to the
+            -- same name; picking one deterministically keeps a call from being
+            -- credited to both (which would break the sum-to-headline property).
+            SELECT norm, MIN(google_ads_campaign_id) AS google_ads_campaign_id
+            FROM ga_norm
+            WHERE norm != ''
+            GROUP BY norm
+        ),
+        gclid_clicks AS (
+            -- Tier 1 of the attribution cascade: GCLID → campaign, restricted to
+            -- the clinic's linked campaigns so a click from an unlinked campaign
+            -- falls through to the name match instead of inventing a row.
+            SELECT click_view_gclid AS gclid,
+                   MIN(google_ads_campaign_id) AS google_ads_campaign_id
+            FROM `{_CLINIC_DATA}.ad_clicks_v2`
+            WHERE google_ads_campaign_id IN {ga_in}
+              AND click_view_gclid IS NOT NULL
+              AND click_view_gclid NOT IN ('nan', '')
+            GROUP BY click_view_gclid
+        ),
         spend AS (
             -- Accurate billed spend straight from Google Ads
             -- (metrics_cost_micros, in micros → /1e6). ``ad_groups`` is ingested
@@ -522,9 +571,12 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
         calls AS (
             -- Clinic's PAID calls (same classifier + spam filter + per-call
             -- dedup as paid_call_revenue / traffic_drivers, so this table is a
-            -- per-campaign split of the §04 headline population), tagged with a
-            -- normalized campaign name.
-            SELECT call_id, call_ts, phone_norm, norm, genuine
+            -- per-campaign split of the §04 headline population), tagged with
+            -- both attribution keys: the real gclid and the normalized campaign
+            -- name. Aliased ``gclid_real`` (not ``gclid``) so it can't be
+            -- confused with the raw column the channel CASE below reads.
+            SELECT call_id, call_ts, phone_norm, norm, genuine,
+                   IF(gclid IS NOT NULL AND gclid NOT IN ('nan', ''), gclid, NULL) AS gclid_real
             FROM (
                 SELECT
                   t.complete_call_id AS call_id,
@@ -549,10 +601,17 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
             WHERE NOT is_spam AND ({_channel_case_sql()}) = 'Paid'
         ),
         call_camp AS (
-            -- Attach each paid call to a Google Ads campaign by normalized name.
-            SELECT c.call_id, c.call_ts, c.phone_norm, c.genuine, g.google_ads_campaign_id
+            -- Attach each paid call to a Google Ads campaign: GCLID first, then
+            -- normalized campaign name, then the explicit remainder bucket. Every
+            -- paid call appears exactly once, so per-campaign calls/booked sum to
+            -- the §04 headline.
+            SELECT c.call_id, c.call_ts, c.phone_norm, c.genuine,
+                   COALESCE(gk.google_ads_campaign_id,
+                            gn.google_ads_campaign_id,
+                            '{UNATTRIBUTED_CAMPAIGN_ID}') AS google_ads_campaign_id
             FROM calls c
-            JOIN ga_norm g ON g.norm = c.norm AND c.norm != ''
+            LEFT JOIN gclid_clicks gk ON gk.gclid = c.gclid_real
+            LEFT JOIN ga_name_map gn  ON gn.norm  = c.norm AND c.norm != ''
         ),
         patients AS (
             SELECT DISTINCT client_id, phone_norm
@@ -561,8 +620,11 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
         ),
         booked_calls AS (
             -- One row per PMS appointment, credited to the MOST RECENT genuine,
-            -- connected, name-matched call (same rule as §01
-            -- ``call_outcomes_funnel``). We then count DISTINCT booked CALLS per
+            -- connected PAID call (same rule as §01 ``call_outcomes_funnel``).
+            -- ``call_camp`` spans EVERY paid call — attributed and unattributed
+            -- alike — so this ranking sees the same population
+            -- ``paid_call_revenue`` ranks over and the per-campaign booked counts
+            -- add up to its total. We then count DISTINCT booked CALLS per
             -- campaign (``gads_booked`` below) — the SAME unit §01 reports — so
             -- per-campaign booked reconciles with, and never exceeds, the §01
             -- total (counting distinct appointments here would over-count a call
@@ -594,8 +656,13 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
             SELECT google_ads_campaign_id, COUNT(DISTINCT call_id) AS booked
             FROM booked_calls GROUP BY google_ads_campaign_id
         ),
-        -- Earliest name-matched paid call per (campaign, patient) — gates which
-        -- invoices count, mirroring the §04 headline (paid_call_revenue).
+        -- Paid patients per campaign — identifies whose invoices count for the
+        -- row (the §04 headline matches the same way, minus the campaign
+        -- split). Revenue is the one column whose rows can still sum ABOVE the
+        -- headline: a patient touched by two campaigns is credited to both,
+        -- while the headline dedups them. Both are deliberate — the row answers
+        -- "what did this campaign's callers transact", the headline answers
+        -- "what did paid callers transact".
         campaign_first_call AS (
             SELECT cc.google_ads_campaign_id, p.client_id, MIN(cc.call_ts) AS first_call_ts
             FROM call_camp cc
@@ -604,22 +671,38 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
             GROUP BY cc.google_ads_campaign_id, p.client_id
         ),
         campaign_revenue AS (
-            -- Downstream-only: invoices in the window dated on/after the
-            -- patient's first paid call matched to this campaign — same gate as
-            -- the §04 headline, so the rows are a split of it, not a different
-            -- convention.
+            -- Same revenue rule as the §04 headline (paid_call_revenue) and
+            -- "Revenue from Call traffic": every positive invoice in the
+            -- window for a matched patient, deduped per order_id — no
+            -- on/after-first-call gate — so the rows are a split of the
+            -- headline, not a different convention.
             SELECT
-              cfc.google_ads_campaign_id,
-              SUM(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS revenue,
-              COUNT(DISTINCT im.order_id) AS invoice_count
-            FROM campaign_first_call cfc
-            JOIN `{_BP}.InvoiceMaster` im
-              ON im._clinic_id = @clinic_id
-             AND im.client_id = cfc.client_id
-            WHERE SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
-              AND {_date_between("SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)", w)}
-              AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date) >= DATE(cfc.first_call_ts)
-            GROUP BY cfc.google_ads_campaign_id
+              google_ads_campaign_id,
+              SUM(amt)                  AS revenue,
+              COUNT(DISTINCT order_id)  AS invoice_count
+            FROM (
+              SELECT cfc.google_ads_campaign_id, im.order_id,
+                     MAX(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS amt
+              FROM campaign_first_call cfc
+              JOIN `{_BP}.InvoiceMaster` im
+                ON im._clinic_id = @clinic_id
+               AND im.client_id = cfc.client_id
+              WHERE SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
+                AND {_date_between("SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)", w)}
+              GROUP BY cfc.google_ads_campaign_id, im.order_id
+            )
+            GROUP BY google_ads_campaign_id
+        ),
+        base AS (
+            -- One row per linked campaign, plus the remainder row when any paid
+            -- call went unattributed (suppressed when there are none, so clinics
+            -- with clean tracking don't grow an empty row).
+            SELECT google_ads_campaign_id, campaign_name, clicks FROM ga_norm
+            UNION ALL
+            SELECT '{UNATTRIBUTED_CAMPAIGN_ID}', CAST(NULL AS STRING), 0
+            FROM (SELECT COUNT(*) AS n FROM call_camp
+                  WHERE google_ads_campaign_id = '{UNATTRIBUTED_CAMPAIGN_ID}')
+            WHERE n > 0
         )
         SELECT
           g.google_ads_campaign_id AS campaign_id,
@@ -630,7 +713,7 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
           COALESCE(s.spend, 0)      AS spend,
           COALESCE(cr.revenue, 0)   AS revenue,
           COALESCE(cr.invoice_count, 0) AS invoice_count
-        FROM ga_norm g
+        FROM base g
         LEFT JOIN spend s USING (google_ads_campaign_id)
         LEFT JOIN gads_calls gc USING (google_ads_campaign_id)
         LEFT JOIN gads_booked gb USING (google_ads_campaign_id)
@@ -657,9 +740,12 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
         rev_per_book = (revenue / booked) if booked else 0.0
         click_to_call = (calls  / clicks) * 100 if clicks else 0.0
         call_to_book  = (booked / calls)  * 100 if calls  else 0.0
+        unattributed  = r.campaign_id == UNATTRIBUTED_CAMPAIGN_ID
         out.append({
             "campaign_id":       r.campaign_id,
-            "campaign_name":     r.campaign_name or r.campaign_id,
+            "campaign_name":     (UNATTRIBUTED_CAMPAIGN_NAME if unattributed
+                                  else (r.campaign_name or r.campaign_id)),
+            "unattributed":      unattributed,
             "clicks":            clicks,
             "calls":             calls,
             "booked":            booked,
@@ -1879,14 +1965,18 @@ def paid_call_revenue(
     deduped per ``complete_call_id`` — so ``paid_calls`` reconciles with those
     sections. Paid callers are phone-matched (last-10-digit) to
     ``PMS_Unified.patient_contacts``; each matched patient's positive
-    ``InvoiceMaster`` invoices dated ON/AFTER that patient's first paid call —
-    and inside the window — are summed once per patient.
+    ``InvoiceMaster`` invoices dated inside the window are summed, deduped per
+    ``order_id`` (MAX amount per order).
 
-    This is the §04 headline "Attributed revenue": downstream-only, unlike
-    :func:`google_ads_roi`'s per-campaign revenue (any in-window invoice for a
-    name-matched caller, no on/after-call gate), which remains the per-campaign
-    split. Correlational, not causal: it credits paid callers who later
-    transacted.
+    This is the §04 headline "Attributed revenue". The revenue rule is the
+    SAME as "Revenue from Call traffic" (:func:`pipeline_revenue_by_month`) and
+    the other revenue paths: any positive invoice in the window for a touched
+    patient — there is deliberately NO "dated on/after the first paid call"
+    gate, so the §04 headline, the per-campaign rows
+    (:func:`google_ads_roi`), and the §01 pipeline chart all speak the same
+    unit and differ only in POPULATION (paid callers vs all call traffic).
+    Correlational, not causal: it credits paid callers who also transacted in
+    the window.
 
     ``booked_calls`` is PMS-reconciled, NOT callscoring-flag based: one row per
     ``Appointments`` row CREATED within ``match_days`` of a genuine connected
@@ -1969,23 +2059,31 @@ def paid_call_revenue(
           )
           WHERE rn = 1
         ),
-        -- Earliest paid call per matched patient gates which invoices count.
+        -- Distinct matched patients (paid callers with a PMS record).
         paid_first_call AS (
           SELECT client_id, MIN(call_ts) AS first_call_ts
           FROM paid_x_patient
           GROUP BY client_id
         ),
+        -- Same revenue rule as pipeline_revenue_by_month ("Revenue from Call
+        -- traffic"): every positive invoice in the window for a matched
+        -- patient, deduped per order_id (MAX amount per order) — no
+        -- on/after-first-call gate.
         rev AS (
           SELECT
-            COUNT(DISTINCT im.client_id) AS invoiced_patients,
-            COUNT(DISTINCT im.order_id)  AS invoice_count,
-            COALESCE(SUM(SAFE_CAST(im.order_total_with_tax AS NUMERIC)), 0) AS revenue
-          FROM `{_BP}.InvoiceMaster` im
-          JOIN paid_first_call pfc USING (client_id)
-          WHERE im._clinic_id = @clinic_id
-            AND SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
-            AND {_date_between("SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)", w)}
-            AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date) >= DATE(pfc.first_call_ts)
+            COUNT(DISTINCT client_id) AS invoiced_patients,
+            COUNT(DISTINCT order_id)  AS invoice_count,
+            COALESCE(SUM(amt), 0)     AS revenue
+          FROM (
+            SELECT im.client_id, im.order_id,
+                   MAX(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS amt
+            FROM `{_BP}.InvoiceMaster` im
+            JOIN paid_first_call pfc USING (client_id)
+            WHERE im._clinic_id = @clinic_id
+              AND SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
+              AND {_date_between("SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)", w)}
+            GROUP BY im.client_id, im.order_id
+          )
         )
         SELECT
           (SELECT COUNT(*) FROM paid)            AS paid_calls,
