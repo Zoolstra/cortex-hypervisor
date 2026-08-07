@@ -14,8 +14,9 @@ which is why api/__init__.py carries a comment about registration order.
 """
 from fastapi import APIRouter
 
-from api.v2 import auth, intelligence
+from api.v2 import admin_users, auth, intelligence
 
 router = APIRouter(prefix="/v2", tags=["v2"])
 router.include_router(intelligence.router)
 router.include_router(auth.router)
+router.include_router(admin_users.router)

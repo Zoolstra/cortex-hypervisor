@@ -10,8 +10,8 @@ Behaviour is a deliberate byte-for-byte port of the Next route so that the two
 frontends can run in parallel and assign identical roles. In particular:
 
   * `@zoolstra.com` -> `super_admin`.
-  * An existing `admin` or `viewer` claim is PRESERVED, never downgraded — those
-    are assigned by hand and must survive every sign-in.
+  * ANY existing role claim is PRESERVED, never downgraded — those are assigned
+    by hand and must survive every sign-in.
   * Everyone else -> `viewer`.
   * `updated` reports whether a write actually happened, so the client knows
     whether it must force-refresh its ID token to see the new claim.
@@ -29,6 +29,11 @@ from api.deps import verify_token
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 SUPER_ADMIN_DOMAIN = "zoolstra.com"
+
+# Every role a super_admin can hand out via PATCH /v2/admin/users/{uid}/role.
+# Kept in sync with admin_users.ROLES by the test suite rather than imported, so
+# an auth-critical constant does not depend on an admin router's import graph.
+ASSIGNABLE_ROLES = ("super_admin", "admin", "viewer")
 
 
 @router.post("/set-claims")
@@ -52,9 +57,12 @@ def set_claims(caller: dict = Depends(verify_token)) -> dict:
         fb_auth.set_custom_user_claims(uid, {"role": "super_admin"})
         return {"role": "super_admin", "updated": True}
 
-    # Non-Zoolstra users: preserve manually-assigned admin/viewer roles.
+    # Non-Zoolstra users: preserve ANY manually-assigned role, super_admin
+    # included. Listing only admin/viewer here silently demoted every external
+    # super_admin to viewer on their next sign-in — the claim was written
+    # correctly by the admin UI and then clobbered before the dashboard loaded.
     # Only set viewer for brand-new users with no role yet.
-    if current in ("admin", "viewer"):
+    if current in ASSIGNABLE_ROLES:
         return {"role": current, "updated": False}
 
     fb_auth.set_custom_user_claims(uid, {"role": "viewer"})

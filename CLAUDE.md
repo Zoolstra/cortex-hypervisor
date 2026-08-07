@@ -75,12 +75,71 @@ get_instance_id_for_uid(uid)
 
 ## Auth & Roles
 
-Firebase custom claims control access:
-- `super_admin` — all instances, all operations
-- `admin` — write access to their instance only
-- `viewer` — read access to their instance only
+Access is **two independent things**, and conflating them causes real bugs:
 
-Every route that touches instance data must call `require_read_access` or `require_write_access` — never skip this.
+1. **`role` — a Firebase custom claim.** The capability level. It is GLOBAL:
+   an `admin` claim means "may write", not "may write to instance X".
+2. **Instance membership — rows in Cloud SQL.** The scope. A non-super_admin
+   reaches an instance only via `instances.primary_contact_uid` (ownership) or a
+   `clinic_admins(uid, instance_id)` row.
+
+So `admin` + no membership can do nothing, and that state is easy to create by
+accident. Any user-facing permissions UI must show both.
+
+| role | read | write |
+|---|---|---|
+| `super_admin` | all instances, unconditional | all instances, unconditional |
+| `admin` | member instances only | member instances only |
+| `viewer` | member instances only | denied |
+
+Every route that touches instance data must call `require_read_access` or
+`require_write_access` (`deps.py`) — never skip this.
+
+**Scope is per-INSTANCE, never per-clinic.** `clinic_admins` has no `clinic_id`
+and `deps.py` never references one; clinic routes authorise via
+`clinic.instance_id`. A user granted a multi-location instance therefore sees ALL
+of its clinics. Per-clinic visibility would need a schema change plus a new check
+in `require_read_access` — do not assume it exists.
+
+### Claim assignment
+
+| Route | Who | Effect |
+|---|---|---|
+| `POST /v2/auth/set-claims` | any signed-in user, self only | `@zoolstra.com` → `super_admin`; others → `viewer` on first sign-in; any existing hand-assigned role (`super_admin`/`admin`/`viewer`) is preserved. Takes no body — accepting a uid or role would make it an escalation endpoint. |
+| `GET /v2/admin/users` | super_admin | Every user with role + effective instance scope (union of ownership and grants). |
+| `POST /v2/admin/users` | super_admin | Creates the account, sets the role, applies grants. Validates everything *before* calling Firebase — a late failure would leave an account with no role and no scope. Omit `password` to get back a `password_reset_link`; there is no SMTP here, so the admin forwards it. Grants are dropped for `super_admin`, which is not scope-limited. |
+| `PATCH /v2/admin/users/{uid}/role` | super_admin | Sets the claim. Refuses self-demotion (that would lock you out of the endpoint that undoes it). |
+| `PUT /v2/admin/users/{uid}/instances` | super_admin | Replaces the `clinic_admins` grant set. Does NOT touch `primary_contact_uid` — ownership is a different relationship. |
+| `DELETE /v2/admin/users/{uid}` | super_admin | Removes grants, then the Firebase user (that order leaves recoverable orphan rows on failure rather than grants pointing at a reusable uid). Refuses self-deletion, and refuses any user who is an instance's `primary_contact_uid` — reassign ownership first. |
+
+The SPA surfaces all of this at `/admin/users` (`cortex-spa/src/routes/AdminUsers.tsx`),
+reachable from a super-admin-only button on `/`. The client-side role check is
+convenience; every call is gated server-side.
+
+### Running tests without live ADC
+
+`api/core/secrets.py` builds its client at import time and `deps.py` fetches the
+Firebase SA at import time, so `pytest` normally needs working ADC
+(`gcloud auth application-default login`) and hits Secret Manager on every run.
+When ADC is stale, a pytest plugin that replaces
+`secretmanager.SecretManagerServiceClient` in `pytest_configure` (plugins load
+before collection) unblocks the suite — the fake must return a service account
+whose `private_key` is a real generated RSA key, or
+`credentials.Certificate(...)` rejects it.
+
+`set_custom_user_claims` REPLACES the whole custom-claims object, so `role` must
+remain the only custom claim; adding a second without merging silently drops it.
+
+A claim change only takes effect when the user's **ID token refreshes** (≤1h, or
+immediately on sign-out/in) — role changes are not instant.
+
+> **KNOWN GAP.** The `@zoolstra.com` → `super_admin` rule reads `email` without
+> checking `email_verified`, and the project has `disabledUserSignup: false` with
+> no blocking functions. Anyone can self-register an unowned `@zoolstra.com`
+> address and be granted super_admin over every instance and all PHI. Requiring
+> `email_verified` is NOT a safe unilateral fix: 3 of the 4 current Zoolstra
+> accounts are unverified `password` accounts and would drop to `viewer`. Close
+> it by disabling self-signup, or verify those 3 accounts first.
 
 ## BigQuery Tables
 
