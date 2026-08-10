@@ -305,7 +305,7 @@ def test_callscoring_scopes_and_serializes(harness):
     sql, params = queries.calls[0]
     assert params["profile"] == 202527
     assert params["clinic_ids"] == ["CL1", "CL2"]  # instance's clinics only
-    assert params["match_days"] == 3
+    assert params["match_days"] == datafeed._MATCH_DAYS
     assert "call_outcome_overrides" in sql   # relabels applied
     assert "patient_contacts" in sql         # PMS reconciliation present
 
@@ -337,7 +337,7 @@ def test_dictionary_serves_versioned_definitions(harness):
     assert "/invoca/callscoring" in body["layers"]["settled"]["endpoints"]
     assert "booked_verified" in body["field_definitions"]["/invoca/callscoring"]
     assert body["caller_number_enabled"] is False  # default OFF
-    assert body["booked_match_days"] == 3
+    assert body["booked_match_days"] == datafeed._MATCH_DAYS
 
 
 def test_dictionary_requires_key(harness):

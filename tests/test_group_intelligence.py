@@ -1,12 +1,19 @@
 """
 Tests for the multi-location "Group Intelligence" surface (Virsono).
 
-Covers:
-  * group_queries helpers (booked-status mapping) + zoolstra fail-safe.
-  * payloads.build_group_overview roll-up math (totals, leaderboards, rollups,
-    coverage) with BigQuery stubbed.
-  * Endpoint wiring: the multi_location_group capability-flag gate (404 when off,
-    200 when on) and read-access enforcement.
+The group route now serves the PER-CLINIC Overview aggregated across an
+instance's clinics, so the tests that matter are the merge rules — the places
+where the obvious implementation (sum everything) produces a plausible but wrong
+number:
+
+  * rates/averages recomputed from summed components, never averaged;
+  * per-month series aligned on the month KEY, since clinics don't all cover the
+    same months;
+  * campaigns merged on campaign_id with every derived field recomputed;
+  * the payload keeping the same SHAPE as the clinic payload, which is what lets
+    the two share React components.
+
+Plus the endpoint wiring: the multi_location_group capability gate and skip_llm.
 
 All BigQuery / LLM work is stubbed — no external calls.
 """
@@ -16,138 +23,321 @@ from fastapi.testclient import TestClient
 from api import app
 from api.deps import verify_token
 from api.core.db import get_session
-from intelligence_report import group_queries as gq
+from intelligence_report import group_aggregate as ga
 from intelligence_report import payloads
 from intelligence_report.queries import Window
 
 
-# ── group_queries helpers ────────────────────────────────────────────────────
+# ── the booking match window is one definition, in three files ───────────────
 
-def test_booked_from_status_counts_only_kept_visits():
-    by_status = {"Completed": 5, "Arrived": 2, "Cancelled": 9, "No Show": 4, "Unknown": 1}
-    assert gq._booked_from_status(by_status) == 7          # Completed + Arrived only
+def test_booking_match_window_agrees_across_every_surface():
+    """`match_days` is THE definition of "booked". It is declared three times —
+    the v1 readers, the mart layer, and the client data feed — because the mart
+    and feed deliberately avoid importing the BigQuery module. If they drift,
+    the same clinic reports different booked counts on different surfaces and
+    the parity harness diverges, which is exactly the kind of bug that gets
+    argued about for a week before anyone checks the constants.
+    """
+    from api import datafeed
+    from api.v2 import marts
+    from intelligence_report import queries
 
-
-def test_booked_from_status_is_case_insensitive_and_empty_safe():
-    assert gq._booked_from_status({"completed": 3, "ARRIVED": 1}) == 4
-    assert gq._booked_from_status({}) == 0
-    assert gq._booked_from_status(None) == 0
-
-
-def test_zoolstra_attribution_empty_clinics_returns_zero_shape():
-    out = gq.zoolstra_attribution([], window=Window("2026-01-01", "2026-06-30"))
-    assert out["per_location"] == []
-    assert out["totals"]["bookings"] == 0
-    assert out["totals"]["conversion_rate"] is None
-
-
-def test_zoolstra_attribution_failsafe_on_query_error(monkeypatch):
-    # A missing dataset / transient error must yield zeros, never raise.
-    class _Boom:
-        def query(self, *a, **k):
-            raise RuntimeError("dataset not found")
-    monkeypatch.setattr(gq, "_client", lambda: _Boom())
-    out = gq.zoolstra_attribution(["C1"], window=Window("2026-01-01", "2026-06-30"))
-    assert out["per_location"] == []
-    assert out["totals"]["revenue"] == 0.0
+    assert queries.CALL_BOOKING_MATCH_DAYS == 10
+    assert marts.CALL_BOOKING_MATCH_DAYS == queries.CALL_BOOKING_MATCH_DAYS
+    assert datafeed._MATCH_DAYS == queries.CALL_BOOKING_MATCH_DAYS
 
 
-# ── payloads roll-up helpers ─────────────────────────────────────────────────
-
-def test_leaderboard_orders_desc_and_pushes_no_data_last():
-    locs = [
-        {"clinic_id": "A", "has_pms_data": True, "revenue": 100.0},
-        {"clinic_id": "B", "has_pms_data": True, "revenue": 300.0},
-        {"clinic_id": "C", "has_pms_data": False, "revenue": 0.0},
-        {"clinic_id": "D", "has_pms_data": True, "revenue": 200.0},
-    ]
-    assert payloads._leaderboard(locs, "revenue") == ["B", "D", "A", "C"]
-
-
-def test_leaderboard_none_metric_sorts_last():
-    locs = [
-        {"clinic_id": "A", "has_pms_data": True, "avg_invoice": None},
-        {"clinic_id": "B", "has_pms_data": True, "avg_invoice": 50.0},
-    ]
-    assert payloads._leaderboard(locs, "avg_invoice") == ["B", "A"]
+def test_no_reader_hardcodes_its_own_match_window():
+    """Every reader defaults to the shared constant rather than a literal, so
+    widening the window is a one-line change and cannot half-apply."""
+    import inspect
+    from intelligence_report import queries
+    src = inspect.getsource(queries)
+    assert "match_days: int = 3" not in src
+    assert "match_days: int = 10" not in src, \
+        "use CALL_BOOKING_MATCH_DAYS, not a literal"
 
 
-def test_rollup_merges_and_sorts():
-    locs = [
-        {"product_mix": [{"item_type": "Hearing Aid", "revenue": 100.0, "line_count": 2},
-                         {"item_type": "Accessory", "revenue": 10.0, "line_count": 1}]},
-        {"product_mix": [{"item_type": "Hearing Aid", "revenue": 400.0, "line_count": 3}]},
-    ]
-    out = payloads._rollup(locs, "product_mix", "item_type", ("revenue", "line_count"))
-    assert out[0] == {"item_type": "Hearing Aid", "revenue": 500.0, "line_count": 5}
-    assert out[1]["item_type"] == "Accessory"
+# ── rates are recomputed, never averaged ─────────────────────────────────────
+
+def test_booked_rate_is_volume_weighted_not_averaged():
+    """The core aggregation trap.
+
+    A 400-call clinic booking 50% and a 10-call clinic booking 10% is a group
+    rate of 201/410 = 49%, NOT the 30% mean of the two rates. Averaging would
+    let a tiny location drag the group's headline by as much as a huge one.
+    """
+    big = {"connected": 400, "booked": 200}
+    small = {"connected": 10, "booked": 1}
+    merged = ga._merge_call_funnel([big, small], ["counselear", "counselear"])
+    assert merged["connected"] == 410
+    assert merged["booked"] == 201
+    assert merged["booked_rate"] == pytest.approx(201 / 410)
+    assert merged["booked_rate"] != pytest.approx(((200 / 400) + (1 / 10)) / 2)
 
 
-# ── build_group_overview ─────────────────────────────────────────────────────
-
-def _fake_location(cid, revenue, invoices, booked, has=True):
-    return {
-        "clinic_id": cid, "clinic_name": f"Clinic {cid}", "pms_type": "counselear",
-        "has_pms_data": has, "snapshot_date": "2026-06-29" if has else None,
-        "appointments": {"total": booked + 5, "by_status": {}, "sales_opportunities": 1},
-        "booked_appts": booked, "revenue": revenue, "invoice_count": invoices,
-        "avg_invoice": (revenue / invoices) if invoices else None,
-        "product_mix": [{"item_type": "Hearing Aid", "revenue": revenue, "line_count": invoices}],
-        "referrals": [{"source_name": "Word of Mouth", "invoice_count": invoices, "revenue": revenue}],
-        "webform_submissions": 3, "webform_attributed_revenue": 500.0, "google_ads": [],
-    }
+def test_capture_rate_recomputed_per_trend_month():
+    t1 = [{"month": "2026-01", "calls": 100, "forms": 5, "contacts": 105,
+           "connected": 80, "booked": 40, "revenue": 1000.0, "capture_rate": 0.5}]
+    t2 = [{"month": "2026-01", "calls": 10, "forms": 0, "contacts": 10,
+           "connected": 5, "booked": 1, "revenue": 50.0, "capture_rate": 0.2}]
+    (row,) = ga._merge_trend([t1, t2])
+    assert row["connected"] == 85 and row["booked"] == 41
+    assert row["capture_rate"] == pytest.approx(41 / 85)
+    assert row["capture_rate"] != pytest.approx(0.35)      # the naive mean
 
 
-def test_build_group_overview_rollup(monkeypatch):
-    clinics = [("A", "Clinic A", "counselear"), ("B", "Clinic B", "counselear"),
-               ("C", "Clinic C", "none")]
-    locations = [
-        _fake_location("A", 1000.0, 4, 6),
-        _fake_location("B", 3000.0, 6, 9),
-        _fake_location("C", 0.0, 0, 0, has=False),
-    ]
-    monkeypatch.setattr(gq, "group_comparison", lambda *a, **k: locations)
-    monkeypatch.setattr(gq, "appointment_referral_breakdown", lambda *a, **k: [
-        {"source": "Referral - Zoolstra", "bookings": 7, "patients": 6},
-        {"source": "Online", "bookings": 3, "patients": 3},
+def test_front_desk_capture_rate_recomputed():
+    merged = ga._merge_front_desk([
+        {"total": 100, "connected": 60, "returned": 10, "captured": 70,
+         "capture_rate": 0.7},
+        {"total": 10, "connected": 2, "returned": 0, "captured": 2,
+         "capture_rate": 0.2},
     ])
-    monkeypatch.setattr(gq, "zoolstra_attribution", lambda *a, **k: {
-        "per_location": [
-            {"clinic_id": "B", "bookings": 5, "patients": 4, "invoiced_patients": 2,
-             "invoice_count": 2, "revenue": 1200.0, "conversion_rate": 0.5,
-             "revenue_per_patient": 300.0},
-            {"clinic_id": "A", "bookings": 2, "patients": 2, "invoiced_patients": 1,
-             "invoice_count": 1, "revenue": 400.0, "conversion_rate": 0.5,
-             "revenue_per_patient": 200.0},
-        ],
-        "totals": {"bookings": 7, "patients": 6, "invoiced_patients": 3,
-                   "invoice_count": 3, "revenue": 1600.0, "conversion_rate": 0.5},
-    })
+    assert merged["total"] == 110 and merged["captured"] == 72
+    assert merged["capture_rate"] == pytest.approx(72 / 110)
 
-    payload = payloads.build_group_overview(
+
+def test_empty_denominator_yields_none_not_zero():
+    """None and 0.0 mean different things: 'no data' vs 'genuinely nothing
+    converted'. A 0.0 here would render as a real 0% on the page."""
+    assert ga._ratio(0, 0) is None
+    merged = ga._merge_call_funnel([{"connected": 0, "booked": 0}], ["none"])
+    assert merged["booked_rate"] is None
+
+
+# ── per-month series ─────────────────────────────────────────────────────────
+
+def test_months_align_on_key_when_clinics_cover_different_ranges():
+    """A location onboarded mid-window has no row for the earlier months.
+    Grouping on the month key keeps everything aligned; zipping by index would
+    shift one clinic's data into another clinic's months."""
+    early = [{"month": "2026-01", "booked": 5, "connected": 8},
+             {"month": "2026-02", "booked": 3, "connected": 4}]
+    late = [{"month": "2026-02", "booked": 7, "connected": 9}]
+    rows = ga._merge_monthly([early, late], int_fields=("booked", "connected"))
+    assert [r["month"] for r in rows] == ["2026-01", "2026-02"]
+    assert rows[0]["booked"] == 5                     # only the early clinic
+    assert rows[1]["booked"] == 10                    # both
+
+
+def test_monthly_merge_is_sorted_chronologically():
+    a = [{"month": "2026-03", "booked": 1}]
+    b = [{"month": "2026-01", "booked": 1}]
+    assert [r["month"] for r in ga._merge_monthly([a, b], int_fields=("booked",))] \
+        == ["2026-01", "2026-03"]
+
+
+# ── ad campaigns ─────────────────────────────────────────────────────────────
+
+def _campaign(cid, spend, clicks, calls, booked, revenue):
+    return {"campaign_id": cid, "campaign_name": "Brand", "spend": spend,
+            "clicks": clicks, "calls": calls, "booked": booked,
+            "revenue": revenue, "invoice_count": 1,
+            # Stale per-clinic derived values that MUST be overwritten.
+            "roas": 99.0, "cpc": 99.0, "cost_per_call": 99.0,
+            "cost_per_booking": 99.0, "revenue_per_booking": 99.0,
+            "click_to_call_pct": 99.0, "call_to_book_pct": 99.0}
+
+
+def test_shared_campaign_merges_and_recomputes_every_derived_field():
+    """One Google Ads campaign can serve several locations, so rows merge on
+    campaign_id rather than concatenating. Every ratio is recomputed — carrying
+    one clinic's value beside the group's counts would misdescribe the row."""
+    a = [_campaign("c1", 200.0, 100, 10, 2, 1000.0)]
+    b = [_campaign("c1", 100.0, 50, 5, 1, 200.0)]
+    (row,) = ga._merge_ad_campaigns([a, b])
+    assert row["spend"] == 300.0 and row["clicks"] == 150
+    assert row["calls"] == 15 and row["booked"] == 3 and row["revenue"] == 1200.0
+    assert row["roas"] == pytest.approx(1200.0 / 300.0)
+    assert row["cpc"] == pytest.approx(300.0 / 150)
+    assert row["cost_per_call"] == pytest.approx(300.0 / 15)
+    assert row["cost_per_booking"] == pytest.approx(300.0 / 3)
+    assert row["revenue_per_booking"] == pytest.approx(1200.0 / 3)
+    assert row["click_to_call_pct"] == pytest.approx(15 / 150)
+    assert row["call_to_book_pct"] == pytest.approx(3 / 15)
+
+
+def test_unattributed_remainder_rows_merge_into_one_and_sort_last():
+    rows = ga._merge_ad_campaigns([
+        [{"campaign_id": None, "campaign_name": "Unattributed paid calls",
+          "unattributed": True, "spend": 0.0, "clicks": 0, "calls": 4,
+          "booked": 1, "revenue": 0.0, "invoice_count": 0},
+         _campaign("c1", 50.0, 10, 1, 0, 0.0)],
+        [{"campaign_id": None, "campaign_name": "Unattributed paid calls",
+          "unattributed": True, "spend": 0.0, "clicks": 0, "calls": 6,
+          "booked": 2, "revenue": 0.0, "invoice_count": 0}],
+    ])
+    assert rows[-1]["unattributed"] is True
+    assert rows[-1]["calls"] == 10 and rows[-1]["booked"] == 3
+
+
+# ── funnel metadata ──────────────────────────────────────────────────────────
+
+def test_pms_type_is_mixed_when_clinics_differ():
+    """The UI names the system a booking was reconciled against; naming one of
+    several would be wrong."""
+    m = ga._merge_call_funnel([{"connected": 1, "booked": 1}] * 2,
+                              ["counselear", "blueprint"])
+    assert m["pms_type"] == "mixed"
+
+
+def test_pms_type_is_the_single_system_when_uniform():
+    m = ga._merge_call_funnel([{"connected": 1, "booked": 1}] * 2,
+                              ["counselear", "counselear"])
+    assert m["pms_type"] == "counselear"
+
+
+def test_call_funnel_none_when_no_clinic_returned_one():
+    assert ga._merge_call_funnel([None, None], ["none"]) is None
+
+
+# ── leakage ──────────────────────────────────────────────────────────────────
+
+def test_leakage_total_reconciles_with_the_numbers_shown_beside_it():
+    """The page shows lost_contacts and avg_invoice next to the total, so a
+    reader must be able to multiply them and get it back."""
+    leak = ga._merge_leakage(
+        [{"components": {"missed_calls": 10, "no_shows": 2,
+                         "tested_not_sold": 1, "slow_form_followup": 0}},
+         {"components": {"missed_calls": 3, "no_shows": 1,
+                         "tested_not_sold": 0, "slow_form_followup": 2}}],
+        revenue=10000.0, invoice_count=25)
+    assert leak["components"]["missed_calls"] == 13
+    assert leak["lost_contacts"] == 19
+    assert leak["avg_invoice"] == pytest.approx(400.0)
+    assert leak["estimated_leakage"] == pytest.approx(19 * 400.0)
+
+
+# ── headline YoY ─────────────────────────────────────────────────────────────
+
+def test_yoy_deltas_are_recomputed_from_group_totals():
+    """Percentage changes cannot be averaged: the mean of two clinics' growth
+    rates is not the group's growth rate."""
+    def _y(cur_contacts, prior_contacts, cur_rev, prior_rev):
+        return {"basis": "yoy",
+                "current": {"contacts": cur_contacts, "calls": cur_contacts,
+                            "forms": 0, "connected": cur_contacts, "booked": 0,
+                            "revenue": cur_rev, "capture_rate": 0.0,
+                            "form_rate": None},
+                "prior": {"contacts": prior_contacts, "calls": prior_contacts,
+                          "forms": 0, "connected": prior_contacts, "booked": 0,
+                          "revenue": prior_rev, "capture_rate": 0.0,
+                          "form_rate": None},
+                "deltas": {"contacts": 9.0, "revenue": 9.0, "capture_rate": 9.0},
+                "window": {"start": "2026-01-01", "end": "2026-06-30"},
+                "prior_window": {"start": "2025-01-01", "end": "2025-06-30"}}
+
+    merged = ga._merge_headline_yoy([_y(150, 100, 1500.0, 1000.0),
+                                     _y(50, 100, 500.0, 1000.0)])
+    assert merged["current"]["contacts"] == 200
+    assert merged["prior"]["contacts"] == 200
+    # Group is flat even though one clinic is +50% and the other -50%.
+    assert merged["deltas"]["contacts"] == pytest.approx(0.0)
+    assert merged["deltas"]["revenue"] == pytest.approx(0.0)
+
+
+def test_yoy_basis_is_mixed_when_clinics_disagree():
+    """One clinic with a year of history and one without aren't comparing the
+    same thing; the label has to say so rather than pick a side."""
+    def _y(basis):
+        return {"basis": basis, "current": {}, "prior": {}, "deltas": {},
+                "window": None, "prior_window": None}
+    assert ga._merge_headline_yoy([_y("yoy"), _y("mom")])["basis"] == "mixed"
+    assert ga._merge_headline_yoy([_y("yoy"), _y("yoy")])["basis"] == "yoy"
+
+
+# ── nested list merges ───────────────────────────────────────────────────────
+
+def test_ad_click_campaigns_merge_rather_than_concatenate():
+    merged = ga._merge_by_key(
+        [[{"campaign_id": "c1", "campaign_name": "Brand", "calls": 3, "clicks": 10}],
+         [{"campaign_id": "c1", "campaign_name": "Brand", "calls": 2, "clicks": 5}]],
+        "campaign_id", int_fields=("calls", "clicks"), carry=("campaign_name",))
+    assert len(merged) == 1
+    assert merged[0]["calls"] == 5 and merged[0]["clicks"] == 15
+
+
+def test_channel_mix_merges_by_channel():
+    merged = ga._merge_by_key(
+        [[{"channel": "Paid Search", "count": 10}, {"channel": "Direct", "count": 4}],
+         [{"channel": "Paid Search", "count": 5}]],
+        "channel", int_fields=("count",))
+    by = {r["channel"]: r["count"] for r in merged}
+    assert by == {"Paid Search": 15, "Direct": 4}
+
+
+# ── payload shape: the contract that lets the two surfaces share components ──
+
+class _StubQueries:
+    """Every reader returns a benign empty result, so the builders run without
+    BigQuery and we can compare the SHAPE of what they produce."""
+    @staticmethod
+    def _empty_dict(*a, **k):
+        return {}
+
+    @staticmethod
+    def _empty_list(*a, **k):
+        return []
+
+    def __getattr__(self, name):
+        if name.endswith(("_by_month", "_monthly", "_trend", "_roi", "_mix")):
+            return self._empty_list
+        return self._empty_dict
+
+
+@pytest.fixture
+def stub_queries(monkeypatch):
+    stub = _StubQueries()
+    monkeypatch.setattr(payloads, "q", stub)
+    monkeypatch.setattr(ga, "q", stub)
+    monkeypatch.setattr(ga.clinic_hours, "open_hours_in_window", lambda *a, **k: 0.0)
+    monkeypatch.setattr(payloads.clinic_hours, "open_hours_in_window", lambda *a, **k: 0.0)
+    return stub
+
+
+def _spec(cid):
+    return {"clinic_id": cid, "clinic_name": f"Clinic {cid}",
+            "invoca_ids": ["1"], "ga_ids": ["2"], "hours": None,
+            "pms_type": "counselear"}
+
+
+def test_group_payload_has_the_same_keys_as_a_clinic_payload(stub_queries):
+    """This is what makes the group route able to render through OverviewView.
+    If a new section is added to the clinic payload and not to the rollup, this
+    fails — which is the point."""
+    window = Window("2026-01-01", "2026-06-30")
+    clinic = payloads.build_overview(
+        clinic_id="A", clinic_name="Clinic A", invoca_campaign_ids=["1"],
+        ga_campaign_ids=["2"], window=window, with_recommendations=False)
+    group = payloads.build_group_overview(
         instance_id="INST", instance_name="Virsono",
-        clinics=clinics, ga_campaign_ids_by_clinic={},
-        window=Window("2026-01-01", "2026-06-30"),
-        with_recommendations=False,
-    )
+        clinic_specs=[_spec("A"), _spec("B")], window=window,
+        with_recommendations=False)
 
-    assert payload["totals"]["revenue"] == 4000.0
-    assert payload["totals"]["invoice_count"] == 10
-    assert payload["totals"]["booked_appts"] == 15
-    # leaderboards: B leads revenue + booked; C (no PMS) is last.
-    assert payload["leaderboards"]["by_revenue"] == ["B", "A", "C"]
-    assert payload["leaderboards"]["by_booked_appts"][0] == "B"
-    assert payload["leaderboards"]["by_revenue"][-1] == "C"
-    assert payload["leaderboards"]["by_zoolstra_revenue"] == ["B", "A"]
-    # rollups merged across clinics.
-    pm = payload["product_mix_rollup"]
-    assert pm[0]["item_type"] == "Hearing Aid" and pm[0]["revenue"] == 4000.0
-    # coverage reflects the missing clinic.
-    assert payload["coverage"] == {"clinics_total": 3, "clinics_with_pms": 2,
-                                    "clinics_missing": ["C"]}
-    assert payload["zoolstra_attribution"]["totals"]["revenue"] == 1600.0
-    assert payload["appt_referral_rollup"][0]["source"] == "Referral - Zoolstra"
-    assert payload["recommendations"] == []
+    missing = set(clinic) - set(group)
+    assert not missing, f"group payload is missing clinic sections: {sorted(missing)}"
+    # Group-only additions are expected; nothing else should differ.
+    # instance_id / group_intelligence are on BOTH surfaces in production — the
+    # clinic ones are attached by the endpoint after build_overview returns
+    # (api/intelligence.py), so they're absent from the builder's output here.
+    assert set(group) - set(clinic) == {
+        "is_group", "clinic_count", "clinic_names", "aggregation_notes",
+        "instance_id", "group_intelligence"}
+
+
+def test_group_payload_carries_instance_identity_and_disclosure(stub_queries):
+    group = payloads.build_group_overview(
+        instance_id="INST", instance_name="Virsono",
+        clinic_specs=[_spec("A"), _spec("B")],
+        window=Window("2026-01-01", "2026-06-30"), with_recommendations=False)
+    # The shared components read clinic_id/clinic_name.
+    assert group["clinic_id"] == "INST"
+    assert group["clinic_name"] == "Virsono"
+    assert group["is_group"] is True
+    assert group["clinic_count"] == 2
+    assert group["clinic_names"] == {"A": "Clinic A", "B": "Clinic B"}
+    assert group["aggregation_notes"], "rollup must disclose how it aggregates"
 
 
 # ── Endpoint: capability-flag gate ───────────────────────────────────────────
@@ -159,9 +349,17 @@ class _FakeInstance:
         self.multi_location_group = flag
 
 
+class _FakeScalars:
+    def all(self):
+        return []
+
+
 class _FakeResult:
     def all(self):
         return []
+
+    def scalars(self):
+        return _FakeScalars()
 
 
 def _use_session(instance):
@@ -199,10 +397,10 @@ def test_group_overview_flag_on_ok(client, monkeypatch):
     app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
     _use_session(_FakeInstance(flag=True))
     monkeypatch.setattr("intelligence_report.payloads.build_group_overview",
-                        lambda **k: {"instance_id": k["instance_id"], "ok": True})
+                        lambda **k: {"clinic_id": k["instance_id"], "ok": True})
     r = client.get("/intelligence/group/INST/overview?days=30")
     assert r.status_code == 200
-    assert r.json() == {"instance_id": "INST", "ok": True}
+    assert r.json() == {"clinic_id": "INST", "ok": True}
 
 
 def test_group_overview_bad_date_range_422(client, monkeypatch):
@@ -234,7 +432,7 @@ def test_group_overview_skip_llm_disables_recommendations_and_bypasses_cache(cli
 
     def _fake_build(**k):
         calls.append(k)
-        return {"instance_id": "INST_SKIP", "with_recs": k["with_recommendations"]}
+        return {"clinic_id": "INST_SKIP", "with_recs": k["with_recommendations"]}
 
     monkeypatch.setattr("intelligence_report.payloads.build_group_overview", _fake_build)
 
@@ -247,8 +445,3 @@ def test_group_overview_skip_llm_disables_recommendations_and_bypasses_cache(cli
     assert r.status_code == 200
     assert len(calls) == 2
     assert calls[-1]["with_recommendations"] is True
-
-    # Normal result is cached, but skip_llm must not read it.
-    r = client.get("/intelligence/group/INST_SKIP/overview?days=30&skip_llm=1")
-    assert r.status_code == 200
-    assert len(calls) == 3

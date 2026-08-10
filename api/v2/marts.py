@@ -36,7 +36,13 @@ log = logging.getLogger(__name__)
 # (contract §1). Monthly trends pin their start here regardless of the window.
 MIN_WINDOW_DATE = dt.date(2025, 12, 4)
 
-CALL_BOOKING_MATCH_DAYS = 3
+# Must match CALL_BOOKING_MATCH_DAYS in intelligence_report/queries.py — the
+# mart and the v1 readers have to agree on what "booked" means or the parity
+# harness diverges. Duplicated rather than imported for the same reason
+# MIN_WINDOW_DATE above is: importing queries.py pulls the BigQuery client into
+# this SQLAlchemy-only layer. tests/test_group_intelligence.py pins the two
+# together so they cannot drift silently.
+CALL_BOOKING_MATCH_DAYS = 10
 
 # ── Shared tagging CTE ───────────────────────────────────────────────────────
 # Exposes a `tagged` CTE of per-call flags; callers append their own SELECT.

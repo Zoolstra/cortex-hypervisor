@@ -67,29 +67,42 @@ def _active_campaign_ids(db: Session, clinic_id: str) -> tuple[list[str], list[s
 
 # ── Group Intelligence (multi-location, instance-scoped) ─────────────────────
 
-def _group_clinics(db: Session, instance_id: str) -> list[tuple[str, str, str]]:
-    """Active (non-deleted) clinics for the instance as ``(id, name, pms_type)``."""
-    rows = db.execute(
-        select(Clinic.clinic_id, Clinic.clinic_name, Clinic.pms_type).where(
-            Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
-    ).all()
-    return [(r[0], r[1], r[2] or "none") for r in rows]
+def _group_clinic_specs(db: Session, instance_id: str) -> list[dict]:
+    """Everything the group rollup needs per clinic, in one place.
+
+    The aggregate reads the same per-clinic sources the clinic page does, so it
+    needs each clinic's OWN campaign ids and opening hours — not just the ids
+    the old leaderboard payload took. Hours in particular are per-location and
+    feed the revenue-per-clinic-hour denominator; taking one clinic's hours for
+    the group would silently mis-scale that KPI.
+    """
+    clinics = db.execute(
+        select(Clinic).where(Clinic.instance_id == instance_id,
+                             Clinic.deleted_at.is_(None))
+    ).scalars().all()
+    specs = []
+    for c in clinics:
+        invoca_ids, ga_ids = _active_campaign_ids(db, c.clinic_id)
+        specs.append({
+            "clinic_id": c.clinic_id,
+            "clinic_name": c.clinic_name,
+            "invoca_ids": invoca_ids,
+            "ga_ids": ga_ids,
+            "hours": _location_hours(c),
+            "pms_type": getattr(c, "pms_type", None) or "none",
+        })
+    return specs
 
 
-def _group_ga_campaigns(db: Session, instance_id: str) -> dict[str, list[str]]:
-    """{clinic_id: [active google_ads_campaign_id, …]} for every clinic in the
-    instance — one query, grouped in Python."""
-    rows = db.execute(
-        select(GoogleAdsCampaign.clinic_id, GoogleAdsCampaign.google_ads_campaign_id)
-        .join(Clinic, Clinic.clinic_id == GoogleAdsCampaign.clinic_id)
-        .where(Clinic.instance_id == instance_id,
-               Clinic.deleted_at.is_(None),
-               GoogleAdsCampaign.active.is_(True))
-    ).all()
-    out: dict[str, list[str]] = {}
-    for clinic_id, campaign_id in rows:
-        out.setdefault(clinic_id, []).append(str(campaign_id))
-    return out
+def _group_data_version(clinic_ids: list[str]) -> str:
+    """Cache version for a group payload: every member clinic's version.
+
+    The aggregate is only as fresh as its stalest input, so keying on the
+    instance id alone (which has no PMS snapshot of its own, and so degrades to
+    daily rotation) would keep serving a stale rollup for up to a day after new
+    data lands for one of its clinics.
+    """
+    return "|".join(_data_version(cid) for cid in sorted(clinic_ids))
 
 
 # In-process cache for the (expensive, LLM-bearing) JSON payloads.
@@ -579,8 +592,17 @@ def get_group_overview(
     caller: dict = Depends(verify_token),
     db: Session = Depends(get_session),
 ):
-    """Multi-location "Group Intelligence" payload (JSON) — a leaderboard +
-    roll-up across all of an instance's clinics, driven by the global date range.
+    """Multi-location "Group Intelligence" payload (JSON) — the per-clinic
+    Overview aggregated across all of an instance's clinics, driven by the
+    global date range.
+
+    Same payload SHAPE as ``/intelligence/{clinic_id}/overview``, so the group
+    route renders through the same components and every clinic-page metric is
+    present here. Merge rules live in ``intelligence_report.group_aggregate``.
+
+    Cost note: this fans the per-clinic readers across every clinic, so it is
+    roughly Nx a single clinic page. It is cached on the composite data version
+    of its member clinics and is a prewarm target.
 
     ``?skip_llm=1`` skips the recommendations Claude call and bypasses the
     JSON cache both ways (parity-harness use; no behavior change unless
@@ -599,11 +621,10 @@ def get_group_overview(
         raise HTTPException(status_code=404, detail="Not found")
 
     window = _resolve_window(start, end, days)
-    clinics = _group_clinics(db, instance_id)
-    ga_by_clinic = _group_ga_campaigns(db, instance_id)
+    clinic_specs = _group_clinic_specs(db, instance_id)
 
     key = ("group-overview", instance_id, window.start_date, window.end_date_excl,
-           _data_version(instance_id))
+           _group_data_version([c["clinic_id"] for c in clinic_specs]))
     use_cache = not nocache and not skip_llm
     if use_cache:
         cached = _cache_lookup(key, instance_id, use_cache=use_cache)
@@ -615,8 +636,7 @@ def get_group_overview(
     payload = build_group_overview(
         instance_id=instance_id,
         instance_name=instance.instance_name,
-        clinics=clinics,
-        ga_campaign_ids_by_clinic=ga_by_clinic,
+        clinic_specs=clinic_specs,
         window=window,
         with_recommendations=not skip_llm,
     )

@@ -404,98 +404,48 @@ def build_group_overview(
     *,
     instance_id: str,
     instance_name: str,
-    clinics: list[tuple[str, str, str]],
-    ga_campaign_ids_by_clinic: dict[str, list[str]],
+    clinic_specs: list[dict[str, Any]],
     window: Window,
     with_recommendations: bool = True,
 ) -> dict[str, Any]:
-    """Multi-location "Group Intelligence" payload.
+    """Multi-location "Group Intelligence" payload — the per-clinic Overview,
+    rolled up over the instance's clinics.
 
-    ``clinics`` is ``[(clinic_id, clinic_name, pms_type), …]`` (the instance's
-    active clinics). Fans the per-clinic readers across all of them, rolls up the
-    totals, and pre-sorts the leaderboards the UI renders directly. Aggregate-
-    only (no PHI). ``zoolstra_attribution`` is the marketing-ROI headline.
+    Returns the SAME shape as :func:`build_overview` so the group route renders
+    through the same section components; the merge rules (and why summing is
+    wrong for rates and for distinct-people counts) live in
+    ``intelligence_report.group_aggregate``.
+
+    ``clinic_specs`` is one dict per clinic:
+    ``{clinic_id, clinic_name, invoca_ids, ga_ids, hours, pms_type}``.
+
+    Superseded the per-location leaderboard payload (revenue/avg-invoice/booked
+    rankings, Zoolstra attribution, product + referral rollups). That answered
+    "which location is behind?"; this answers "how is the group doing?".
     """
-    from intelligence_report import group_queries as gq
+    from intelligence_report.group_aggregate import build_group_aggregate
 
-    w = window
-    clinic_ids = [c[0] for c in clinics]
-    names = {c[0]: c[1] for c in clinics}
+    payload = build_group_aggregate(
+        instance_id=instance_id,
+        instance_name=instance_name,
+        clinic_specs=clinic_specs,
+        window=window,
+        parallel=_parallel,
+    )
 
-    sections = _parallel({
-        "locations": lambda: gq.group_comparison(
-            clinics, window=w, ga_by_clinic=ga_campaign_ids_by_clinic),
-        "zoolstra": lambda: gq.zoolstra_attribution(clinic_ids, window=w),
-        "appt_referrals": lambda: gq.appointment_referral_breakdown(clinic_ids, window=w),
-    })
-    locations = sections.get("locations") or []
-    zoolstra = sections.get("zoolstra") or {"per_location": [], "totals": {}}
-    appt_referrals = sections.get("appt_referrals") or []
-
-    totals = {
-        "revenue": round(sum(l.get("revenue", 0.0) for l in locations), 2),
-        "invoice_count": sum(l.get("invoice_count", 0) for l in locations),
-        "booked_appts": sum(l.get("booked_appts", 0) for l in locations),
-        "appointments": sum((l.get("appointments") or {}).get("total", 0) for l in locations),
-        "webform_submissions": sum(l.get("webform_submissions", 0) for l in locations),
-        "webform_attributed_revenue": round(
-            sum(l.get("webform_attributed_revenue", 0.0) for l in locations), 2),
-    }
-
-    with_pms = [l for l in locations if l.get("has_pms_data")]
-    coverage = {
-        "clinics_total": len(locations),
-        "clinics_with_pms": len(with_pms),
-        "clinics_missing": [l["clinic_id"] for l in locations if not l.get("has_pms_data")],
-    }
-
-    # zoolstra leaderboard (by attributed revenue), names attached for the UI.
-    z_by_clinic = {z["clinic_id"]: z for z in zoolstra.get("per_location", [])}
-    zoolstra_leaderboard = sorted(
-        zoolstra.get("per_location", []),
-        key=lambda z: z.get("revenue", 0), reverse=True)
-
-    payload: dict[str, Any] = {
-        "instance_id": instance_id,
-        "instance_name": instance_name,
-        "window": {"start": w.start_date, "end": (w.end_excl - _one_day()).isoformat()},
-        "clinic_names": names,
-        "locations": locations,
-        "totals": totals,
-        "leaderboards": {
-            "by_revenue": _leaderboard(locations, "revenue"),
-            "by_avg_invoice": _leaderboard(locations, "avg_invoice"),
-            "by_booked_appts": _leaderboard(locations, "booked_appts"),
-            "by_zoolstra_revenue": [z["clinic_id"] for z in zoolstra_leaderboard],
-        },
-        "product_mix_rollup": _rollup(
-            locations, "product_mix", "item_type", ("revenue", "line_count")),
-        "referral_rollup": _rollup(
-            locations, "referrals", "source_name", ("revenue", "invoice_count")),
-        "appt_referral_rollup": appt_referrals,
-        "zoolstra_attribution": zoolstra,
-        "coverage": coverage,
-    }
-
+    # Same contract as build_overview: the LLM copy reads the assembled metrics,
+    # so it runs last and can never 500 the payload.
     if with_recommendations:
-        rec_facts = {
-            "instance_name": instance_name,
-            "totals": totals,
-            "coverage": coverage,
-            "top_by_revenue": [
-                {"clinic": names.get(cid, cid),
-                 "revenue": z_by_clinic.get(cid, {}).get("revenue")}
-                for cid in payload["leaderboards"]["by_revenue"][:3]
-            ],
-            "leaderboard_revenue": [
-                {"clinic": names.get(l["clinic_id"], l["clinic_id"]),
-                 "revenue": l.get("revenue"), "booked_appts": l.get("booked_appts"),
-                 "avg_invoice": l.get("avg_invoice")}
-                for l in sorted(locations, key=lambda x: x.get("revenue", 0), reverse=True)
-            ],
-            "zoolstra": zoolstra.get("totals"),
-        }
-        payload["recommendations"] = forward_recommendations(instance_name, rec_facts)
+        try:
+            payload["headline"]["one_thing"] = _one_thing_sentence(instance_name, payload)
+        except Exception as exc:                       # pragma: no cover - defensive
+            log.warning("group one_thing failed instance=%s: %s", instance_name, exc)
+            payload["headline"]["one_thing"] = None
+        try:
+            payload["recommendations"] = forward_recommendations(instance_name, payload)
+        except Exception as exc:                       # pragma: no cover - defensive
+            log.warning("group recommendations failed instance=%s: %s", instance_name, exc)
+            payload["recommendations"] = []
     else:
         payload["recommendations"] = []
     return payload
@@ -560,7 +510,7 @@ def build_biweekly(
             "connected": cf.get("connected", 0),
             "booked": cf.get("booked", 0),
             "booked_method": cf.get("booked_method", "pms_reconciled"),
-            "match_days": cf.get("match_days", 3),
+            "match_days": cf.get("match_days", q.CALL_BOOKING_MATCH_DAYS),
         },
         # Full §01 funnel (total → spam/wrong/no-transcript filtered → genuine
         # → missed vs connected → scoring outcomes) for the funnel visual.

@@ -32,6 +32,26 @@ _BP = "project-demo-2-482101.PMS_Unified"
 _CLINIC_DATA = "project-demo-2-482101.ClinicData"
 _PATIENT_CONTACTS = f"{_BP}.patient_contacts"
 
+# How many days a PMS appointment may be created from a call and still count as
+# "booked from that call" (the booking is entered on/just after the call).
+#
+# THE definition of "booked" for every call-attribution surface — the funnel,
+# per-campaign ROAS, paid attribution, the marts and the client data feed all
+# resolve to this. Widening it moves historical numbers: calls that previously
+# read as qualified-no-conversion become bookings, so booked counts and
+# attributed revenue go UP while the recoverable-leak figures go DOWN. Nothing is
+# rewritten in storage — every surface derives it at read time — but cached
+# payloads keep the old numbers until their data version rotates.
+#
+# Widened 3 -> 10 days: bookings were being entered days after the call (callback
+# scheduling, staff working through a backlog), and a 3-day cut scored those as
+# leaks.
+#
+# Declared HERE, at the top, because it is a default argument for functions
+# throughout this module and defaults evaluate at definition time — a later
+# definition would NameError on import.
+CALL_BOOKING_MATCH_DAYS = 10
+
 # Manual call-outcome relabels, written live by the hypervisor's relabel
 # endpoint (PUT /intelligence/{clinic_id}/calls/{call_id}/outcome). Append-only:
 # the latest row per (clinic_id, complete_call_id) wins; a NULL outcome row
@@ -446,7 +466,7 @@ def line_item_mix(clinic_id: str, days: int = 365, window: "Window | None" = Non
 
 def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
                    invoca_campaign_ids: list[str] | None = None, days: int = 90,
-                   window: "Window | None" = None, match_days: int = 3) -> list[dict]:
+                   window: "Window | None" = None, match_days: int = CALL_BOOKING_MATCH_DAYS) -> list[dict]:
     """Per-campaign cascade for the clinic's linked Google Ads campaigns.
 
     The call population is the clinic's PAID calls — the same classifier
@@ -958,6 +978,102 @@ def webform_appointments(clinic_id: str, days: int = 90, window: "Window | None"
         ).result())
     except Exception as exc:
         log.warning("webform_appointments query failed for clinic_id=%s: %s", clinic_id, exc)
+        return out
+    if rows:
+        r = rows[0]
+        out["submissions"]         = int(r.submissions or 0)
+        out["matched_submissions"] = int(r.matched_submissions or 0)
+        out["appt_submissions"]    = int(r.appt_submissions or 0)
+        out["appt_patients"]       = int(r.appt_patients or 0)
+    return out
+
+
+def webform_appointments_group(
+    clinic_ids: list[str], days: int = 90, window: "Window | None" = None,
+) -> dict[str, Any]:
+    """Group-wide :func:`webform_appointments`.
+
+    Three of the four counters are SUBMISSION-keyed, and a submission belongs to
+    exactly one clinic (``webforms.clinic_id``), so ``submissions`` /
+    ``matched_submissions`` / ``appt_submissions`` are genuinely additive — this
+    reader returns the same numbers summing the per-clinic results would. It
+    exists for the fourth:
+
+    ``appt_patients`` is a distinct-PEOPLE count, and ``client_id`` is scoped to
+    a clinic (see :func:`paid_call_revenue_group`), so summing counts a person on
+    file at two locations twice. Group-wide it is keyed on the SUBMITTER'S
+    CONTACT (phone, else email) — the identity the form itself carries and the
+    only one comparable across locations. One person who submitted at two
+    locations and booked at both counts ONCE.
+
+    The submission key is likewise made global: the per-clinic reader's
+    ``ROW_NUMBER`` restarts at 1 for each clinic, so it would collide here.
+    """
+    w = _win(window, days)
+    out = {
+        "submissions": 0, "matched_submissions": 0,
+        "appt_submissions": 0, "appt_patients": 0, "window_days": w.span_days,
+    }
+    if not clinic_ids:
+        return out
+    sql = f"""
+        WITH forms AS (
+            SELECT
+              -- Ordered by clinic first so the key is unique ACROSS the group;
+              -- a per-clinic ROW_NUMBER would restart at 1 and collide.
+              ROW_NUMBER() OVER (ORDER BY clinic_id, submitted_at)             AS form_idx,
+              clinic_id,
+              RIGHT(REGEXP_REPLACE(IFNULL(phone_number, ''), r'\\D', ''), 10)  AS phone_norm,
+              LOWER(TRIM(IFNULL(email, '')))                                   AS email_norm,
+              DATE(submitted_at)                                               AS submitted_date
+            FROM `{_CLINIC_DATA}.webforms`
+            WHERE clinic_id IN UNNEST(@clinic_ids)
+              AND {_ts_between("submitted_at", w)}
+        ),
+        patients AS (
+            SELECT DISTINCT _clinic_id, client_id, phone_norm, email_norm
+            FROM `{_PATIENT_CONTACTS}`
+            WHERE _clinic_id IN UNNEST(@clinic_ids)
+        ),
+        -- A form is matched against ITS OWN clinic's patient records only;
+        -- dropping that predicate would match a submission to a namesake at
+        -- another location.
+        matched AS (
+            SELECT f.form_idx, f.submitted_date, f.phone_norm, f.email_norm,
+                   p._clinic_id, p.client_id
+            FROM forms f
+            JOIN patients p
+              ON p._clinic_id = f.clinic_id
+             AND ((LENGTH(f.phone_norm) = 10 AND f.phone_norm = p.phone_norm)
+               OR (f.email_norm != ''        AND f.email_norm = p.email_norm))
+        ),
+        appt AS (
+            SELECT m.form_idx, m.phone_norm, m.email_norm
+            FROM matched m
+            JOIN `{_BP}.Appointments` a
+              ON a._clinic_id = m._clinic_id
+             AND a.client_id = m.client_id
+             AND DATE(SAFE_CAST(a.created_time AS TIMESTAMP)) >= m.submitted_date
+        )
+        SELECT
+          (SELECT COUNT(*) FROM forms)                     AS submissions,
+          (SELECT COUNT(DISTINCT form_idx) FROM matched)   AS matched_submissions,
+          (SELECT COUNT(DISTINCT form_idx) FROM appt)      AS appt_submissions,
+          -- Person = the contact the form carried, so a submitter who booked at
+          -- two locations is one person, not two client records.
+          (SELECT COUNT(DISTINCT IF(LENGTH(phone_norm) = 10, phone_norm, email_norm))
+             FROM appt)                                    AS appt_patients
+    """
+    try:
+        rows = list(_client().query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("clinic_ids", "STRING", list(clinic_ids)),
+            ]),
+        ).result())
+    except Exception as exc:
+        log.warning("webform_appointments_group query failed for %d clinics: %s",
+                    len(clinic_ids), exc)
         return out
     if rows:
         r = rows[0]
@@ -1955,7 +2071,7 @@ def paid_call_revenue(
     invoca_campaign_ids: list[str],
     days: int = 90,
     window: "Window | None" = None,
-    match_days: int = 3,
+    match_days: int = CALL_BOOKING_MATCH_DAYS,
 ) -> dict[str, Any]:
     """Revenue generated downstream of the clinic's PAID calls.
 
@@ -2101,6 +2217,166 @@ def paid_call_revenue(
         ).result())
     except Exception as exc:
         log.warning("paid_call_revenue query failed for clinic_id=%s: %s", clinic_id, exc)
+        return out
+    if rows:
+        r = rows[0]
+        out["paid_calls"]        = int(r.paid_calls or 0)
+        out["booked_calls"]      = int(r.booked_calls or 0)
+        out["matched_patients"]  = int(r.matched_patients or 0)
+        out["invoiced_patients"] = int(r.invoiced_patients or 0)
+        out["invoice_count"]     = int(r.invoice_count or 0)
+        out["revenue"]           = float(r.revenue or 0.0)
+    return out
+
+
+def paid_call_revenue_group(
+    clinic_ids: list[str],
+    invoca_campaign_ids: list[str],
+    days: int = 90,
+    window: "Window | None" = None,
+    match_days: int = CALL_BOOKING_MATCH_DAYS,
+) -> dict[str, Any]:
+    """Group-wide :func:`paid_call_revenue` — same metric across N clinics.
+
+    This exists because the per-clinic results CANNOT simply be summed. Two
+    distinct problems, and they pull in opposite directions:
+
+    1. ``client_id`` IS SCOPED TO A CLINIC. The same human registered at two
+       locations has two different ids, and (worse) two different humans can
+       share an id across clinics. So every PMS join here keys on the COMPOSITE
+       ``(_clinic_id, client_id)`` — joining on ``client_id`` alone would
+       cross-match one clinic's patient to another clinic's appointments and
+       invoices. Same rule the existing multi-clinic reader
+       (``group_queries.zoolstra_attribution``) follows.
+
+    2. Because of (1), ``COUNT(DISTINCT client_id)`` is meaningless group-wide.
+       The only cross-clinic identity we hold is the CALLER'S PHONE — which is
+       already what the paid-call matching runs on. So ``matched_patients`` and
+       ``invoiced_patients`` count DISTINCT ``phone_norm``: one person who calls
+       and is on file at two locations counts ONCE, where summing per-clinic
+       results would have counted them twice.
+
+    Consequence worth knowing when reconciling: this reader is <= the sum of the
+    per-clinic values, and the gap IS the cross-location overlap. ``revenue`` and
+    ``invoice_count`` dedupe on ``(_clinic_id, order_id)`` — order ids are
+    clinic-scoped too — so those DO equal the per-clinic sum.
+
+    ``invoca_campaign_ids`` is the UNION across the group's clinics; calls dedupe
+    on ``complete_call_id``, which is globally unique, so no call is counted
+    twice even when two clinics share a campaign.
+    """
+    w = _win(window, days)
+    out = {
+        "paid_calls": 0, "booked_calls": 0, "matched_patients": 0,
+        "invoiced_patients": 0, "invoice_count": 0, "revenue": 0.0,
+        "window_days": w.span_days,
+    }
+    if not invoca_campaign_ids or not clinic_ids:
+        return out
+    scope = _spam_scope_clause(invoca_campaign_ids, days, window=w)
+    join_cs = _callscoring_join_sql()
+    not_spam = _non_spam_predicate_sql()
+    channel_case = _channel_case_sql()
+    sql = f"""
+        WITH calls AS (
+          SELECT
+            call_id, phone_norm, call_ts, genuine,
+            {channel_case} AS channel
+          FROM (
+            SELECT
+              t.complete_call_id AS call_id,
+              RIGHT(REGEXP_REPLACE(IFNULL(t.calling_phone_number, ''), r'\\D', ''), 10) AS phone_norm,
+              SAFE_CAST(t.timestamp AS TIMESTAMP) AS call_ts,
+              t.gclid, t.wbraid, t.gbraid, t.msclkid, t.fbclid,
+              LOWER(t.utm_medium) AS um, LOWER(t.utm_source) AS us, t.marketing_channel,
+              (cs.complete_call_id IS NOT NULL
+               AND NOT IFNULL(cs.empty_transcript, FALSE)
+               AND NOT IFNULL(cs.wrong_number, FALSE)
+               AND NOT IFNULL(cs.no_conversation, FALSE)) AS genuine
+            FROM `{_CLINIC_DATA}.transactions` t
+            {join_cs}
+            WHERE {scope}
+              AND {not_spam}
+            QUALIFY ROW_NUMBER() OVER (
+              PARTITION BY t.complete_call_id ORDER BY t.timestamp DESC) = 1
+          )
+        ),
+        paid AS (SELECT * FROM calls WHERE channel = 'Paid'),
+        -- Patient records carry their OWNING clinic; both travel together from
+        -- here on so no join can cross a clinic boundary.
+        patients AS (
+          SELECT DISTINCT _clinic_id, client_id, phone_norm
+          FROM `{_PATIENT_CONTACTS}`
+          WHERE _clinic_id IN UNNEST(@clinic_ids) AND LENGTH(phone_norm) = 10
+        ),
+        paid_x_patient AS (
+          SELECT pc.call_id, pc.call_ts, pc.genuine, pc.phone_norm,
+                 p._clinic_id, p.client_id
+          FROM paid pc
+          JOIN patients p
+            ON p.phone_norm = pc.phone_norm AND LENGTH(pc.phone_norm) = 10
+        ),
+        booked AS (
+          SELECT COUNT(DISTINCT call_id) AS booked_calls FROM (
+            SELECT pxp.call_id,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY a._clinic_id, a.event_id
+                     ORDER BY pxp.call_ts DESC
+                   ) AS rn
+            FROM paid_x_patient pxp
+            JOIN `{_BP}.Appointments` a
+              ON a._clinic_id = pxp._clinic_id
+              AND a.client_id = pxp.client_id
+            WHERE DATE_DIFF(DATE(SAFE_CAST(a.created_time AS TIMESTAMP)),
+                            DATE(pxp.call_ts), DAY) BETWEEN 0 AND {int(match_days)}
+              AND pxp.genuine
+          )
+          WHERE rn = 1
+        ),
+        -- Keyed by phone, not client_id: the group-wide unit of "a person".
+        matched AS (
+          SELECT COUNT(DISTINCT phone_norm) AS matched_patients
+          FROM paid_x_patient
+        ),
+        rev AS (
+          SELECT
+            COUNT(DISTINCT phone_norm) AS invoiced_patients,
+            COUNT(DISTINCT order_key)  AS invoice_count,
+            COALESCE(SUM(amt), 0)      AS revenue
+          FROM (
+            SELECT
+              pxp.phone_norm,
+              CONCAT(im._clinic_id, ':', im.order_id) AS order_key,
+              MAX(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS amt
+            FROM `{_BP}.InvoiceMaster` im
+            JOIN (SELECT DISTINCT _clinic_id, client_id, phone_norm
+                  FROM paid_x_patient) pxp
+              ON im._clinic_id = pxp._clinic_id
+             AND im.client_id  = pxp.client_id
+            WHERE SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
+              AND {_date_between("SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)", w)}
+            GROUP BY pxp.phone_norm, order_key
+          )
+        )
+        SELECT
+          (SELECT COUNT(*) FROM paid)                 AS paid_calls,
+          (SELECT booked_calls FROM booked)           AS booked_calls,
+          (SELECT matched_patients FROM matched)      AS matched_patients,
+          rev.invoiced_patients,
+          rev.invoice_count,
+          rev.revenue
+        FROM rev
+    """
+    try:
+        rows = list(_client().query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("clinic_ids", "STRING", list(clinic_ids)),
+            ]),
+        ).result())
+    except Exception as exc:
+        log.warning("paid_call_revenue_group query failed for %d clinics: %s",
+                    len(clinic_ids), exc)
         return out
     if rows:
         r = rows[0]
@@ -4022,9 +4298,9 @@ def call_capture(
     return out
 
 
-# How many days a PMS appointment may be created from a call and still count as
-# "booked from that call" (the booking is entered on/just after the call).
-CALL_BOOKING_MATCH_DAYS = 3
+# (CALL_BOOKING_MATCH_DAYS is defined at the top of the module — it is a default
+# argument for functions declared above this point, and defaults evaluate at
+# definition time.)
 
 # How far back before a booking call to look for preceding calls from the same
 # number that "led to" the booking (the touchpoint history the client sees when
@@ -4730,7 +5006,7 @@ def matthew_outcomes(clinic_id: str, invoca_campaign_ids: list[str], days: int =
        staffer he transferred to, on the same call) booked a NEW appointment
        live. This is the tightest "what the AI actually converted on the call".
     ``booked_in_window`` — reconciled but NOT booked live on the call: the PMS
-       appointment appeared within the 3-day match window without a live booking
+       appointment appeared within the 10-day match window without a live booking
        on the transcript (booked after the hand-off, or the caller already had
        an appointment). ``booked_on_call + booked_in_window = booked``.
 
@@ -4783,7 +5059,7 @@ def matthew_outcomes(clinic_id: str, invoca_campaign_ids: list[str], days: int =
           COUNTIF(booked)                                             AS booked,
           -- Split of `booked` by the per-call reasoning: booked LIVE on the call
           -- (a new appointment was made during the call) vs merely reconciled to
-          -- an appointment in the 3-day window without a live booking.
+          -- an appointment in the 10-day window without a live booking.
           COUNTIF(booked AND appt_booked)                             AS booked_on_call,
           COUNTIF(booked AND NOT appt_booked)                         AS booked_in_window,
           -- New-patient acquisition vs existing-patient service (PMS ground truth:

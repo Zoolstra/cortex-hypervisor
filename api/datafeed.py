@@ -27,7 +27,7 @@ Invoca (scoped by ``instances.invoca_profile_id``):
   ``/invoca/callscoring``     the settled, compute-on layer: per-call
                               classification (Claude transcript scoring), manual
                               relabels applied (``call_outcome_overrides``), and
-                              PMS-reconciled ``booked_verified`` (same 3-day
+                              PMS-reconciled ``booked_verified`` (same 10-day
                               phone-match rule as the intelligence funnel /
                               Virsono scorecard, so the numbers reconcile).
 
@@ -88,7 +88,7 @@ _PMS_UNIFIED = f"{PROJECT}.PMS_Unified"
 
 # Version of the feed's response schemas, surfaced via /dictionary. Bump on
 # any field addition/removal/redefinition so clients can pin against drift.
-SCHEMA_VERSION = "1.3"
+SCHEMA_VERSION = "1.4"
 
 # How many trailing days of ad_clicks_v2 the ETL restates on each run
 # (DELETE+APPEND settle window — mirrors big-query-ingestion
@@ -107,8 +107,14 @@ _MAX_LIMIT = 10_000
 
 # PMS reconciliation window for booked_verified: an appointment CREATED within
 # this many days on/after the call credits the call. Also why the dictionary
-# says outcomes mature over ~3 days.
-_MATCH_DAYS = 3
+# says outcomes mature over ~10 days.
+#
+# CLIENT-VISIBLE. Must match CALL_BOOKING_MATCH_DAYS in
+# intelligence_report/queries.py, and it is echoed to clients as
+# `booked_match_days` on /dictionary. Widening it raises historical
+# `booked_verified` counts for anyone pulling additively, so SCHEMA_VERSION is
+# bumped alongside it.
+_MATCH_DAYS = 10
 
 # transactions columns withheld from the client feed. gclid stays as a
 # pseudonymous join key to /google-ads/clicks; destination number and coarse
@@ -603,8 +609,8 @@ _LAYER_GUIDANCE = {
         "endpoints": ["/invoca/callscoring"],
         "use_for": "conclusions, reporting, reconciliation — this is the layer to compute on",
         "notes": (
-            "Outcomes mature over about 3 days: bookings are PMS-reconciled "
-            "(an appointment created within 3 days on/after the call), and "
+            "Outcomes mature over about 10 days: bookings are PMS-reconciled "
+            "(an appointment created within 10 days on/after the call), and "
             "manual relabels can land at any time. Re-pull the last few days "
             "on each sync."
         ),
@@ -650,11 +656,11 @@ _FIELD_DEFINITIONS = {
             "not classification."
         ),
         "booked_verified": (
-            "True when a PMS appointment was created within ~3 days on/after "
+            "True when a PMS appointment was created within ~10 days on/after "
             "the call and phone-matches the caller; each appointment credits "
             "only its most recent genuine call. This is the verified 'booked', "
             "NOT the transcript's appointment_booked language and NOT any "
-            "Invoca flag. Matures over ~3 days."
+            "Invoca flag. Matures over ~10 days."
         ),
         "reasoning": "Model's one-paragraph rationale for the classification.",
         "scored_as_of": "When this row's labels were last computed (scoring time, or relabel time if later).",

@@ -141,6 +141,46 @@ immediately on sign-out/in) — role changes are not instant.
 > accounts are unverified `password` accounts and would drop to `viewer`. Close
 > it by disabling self-signup, or verify those 3 accounts first.
 
+## Group Intelligence (multi-location rollup)
+
+`GET /intelligence/group/{instance_id}/overview` returns the **per-clinic
+Overview payload aggregated across the instance's clinics** — the same shape as
+`GET /intelligence/{clinic_id}/overview`, so the SPA renders both through the
+same `OverviewView` and every clinic-page section exists on the group page by
+construction. Gated by the instance `multi_location_group` flag (404 when off).
+
+Merge rules live in `intelligence_report/group_aggregate.py`. Three kinds, and
+picking the wrong one yields a plausible wrong number:
+
+| Kind | Examples | Rule |
+|---|---|---|
+| Additive | calls, submissions, clicks, spend, revenue | sum |
+| Derived | `booked_rate`, `capture_rate`, `avg_invoice`, `revenue_per_clinic_hour`, `roas`, every `*_delta` | **recompute from the summed components** — never average per-clinic rates, which weights a 12-call clinic like a 400-call one |
+| Distinct people | `paid_attribution.matched_patients` / `invoiced_patients`, `webforms.appt_patients` | dedicated multi-clinic SQL (`queries.paid_call_revenue_group`, `webform_appointments_group`) |
+
+**`client_id` is scoped to a clinic.** The same person at two locations has two
+ids, and two different people can share an id across clinics. So every
+cross-clinic PMS join keys on the composite `(_clinic_id, client_id)`, and
+group-wide distinct-people counts key on the CALLER'S PHONE/EMAIL instead —
+the only identity comparable across locations. Joining on `client_id` alone
+cross-matches one clinic's patient to another clinic's appointments and
+invoices. Same rule the older `group_queries.zoolstra_attribution` follows.
+
+The one metric that is NOT deduplicated: `form_submissions.patients` /
+`converted_patients` (CounselEar portal bookings) — that table carries no
+cross-clinic key, so those are patient RECORDS and are summed. Disclosed to the
+reader via `aggregation_notes` on the payload.
+
+Cost: fans the per-clinic readers across every clinic, so ~N× a clinic page.
+Cached on `_group_data_version` (the composite of its member clinics' data
+versions, so the rollup invalidates when ANY member's data lands) and warmed by
+`payload-prewarm`.
+
+> Superseded the per-location leaderboard payload (revenue / avg-invoice /
+> booked rankings, Zoolstra attribution, product + referral rollups, PMS
+> coverage). `intelligence_report/group_queries.py` still exists but has **no
+> production consumer** — safe to delete.
+
 ## BigQuery Tables
 
 Managed by this service (in the `Users` dataset):
@@ -214,13 +254,20 @@ no second image to keep in sync.
 
 | Job | Command | Schedule (PT) | Purpose |
 |---|---|---|---|
-| `payload-prewarm` | `python scripts/prewarm_payloads.py` | hourly (`20 * * * *`, `payload-prewarm-hourly`) | Warm the intelligence JSON payload cache so the first real visitor after a data-version rotation never pays the cold cost. 13 clinics × (4 windows + biweekly) + 1 group × 4 = **69 requests**; ~15 min fully cold, ~1 min when already warm. |
+| `payload-prewarm` | `python scripts/prewarm_payloads.py` | hourly, as the **last step of the `etl-hourly-chain` workflow** (no longer its own `payload-prewarm-hourly` cron) | Warm the intelligence JSON payload cache so the first real visitor after a data-version rotation never pays the cold cost. 13 clinics × (4 windows + biweekly) + 1 group × 4 = **69 requests**. The 4 group requests are now the expensive ones — each fans the per-clinic readers across every clinic in the instance (see Group Intelligence below), so they cost roughly N clinic pages apiece rather than one. Warming them matters more than it used to: a cold group page is minutes. |
 
 Why **hourly** and not pinned to `blueprint-sync`: the cache key rotates on the
 PMS snapshot date (see `_data_version` in `api/intelligence.py`), and an hourly
 run is self-healing — it needs no knowledge of when any upstream sync actually
 landed or retried, and a warm run is a cheap no-op because the job hits the same
 data-versioned keys the SPA does.
+
+It now runs as the tail of `etl-hourly-chain` (defined in
+`big-query-ingestion/deploy/etl-hourly-chain.yaml`) so it warms the cache
+*after* the hour's ingest has landed rather than racing it. It sits deliberately
+outside that workflow's fail-fast section: if an upstream ingest breaks, the
+cache is still warmed, because otherwise every dashboard visitor would pay the
+cold cost until someone fixed the ingest.
 
 No env vars or secrets are set on the job: it runs as the same service account as
 the service (`cortex-hypervisor-sa`) and fetches secrets at runtime through
@@ -233,6 +280,17 @@ gcloud run jobs deploy payload-prewarm \
   --command=python --args=scripts/prewarm_payloads.py \
   --service-account=cortex-hypervisor-sa@$PROJECT_ID.iam.gserviceaccount.com \
   --region=us-central1 --task-timeout=3600 --max-retries=1 --memory=1Gi
+
+# REQUIRED on first creation. The etl-hourly-chain workflow invokes this job as
+# the SA below; without the binding the step 403s. This exact grant was missed
+# when the job was created (2026-08-07), and back then the symptom was silent:
+# the old payload-prewarm-hourly schedule showed ENABLED with a fresh
+# lastAttemptTime while no Cloud Run execution was ever created. Now that it is
+# chained, a missing grant instead surfaces as a failed workflow execution.
+# `deploy_docker_image.sh chain` re-applies this idempotently.
+gcloud run jobs add-iam-policy-binding payload-prewarm --region=us-central1 \
+  --member="serviceAccount:cortex-accounts-cloudsql-sa@$PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/run.invoker"
 
 gcloud run jobs execute payload-prewarm --region=us-central1   # run now
 ```
