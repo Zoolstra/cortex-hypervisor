@@ -36,9 +36,9 @@ from api.voice_agent.blueprint import verify_vapi_secret
 from api.core.db import get_session
 from api.core.orm import (
     Clinic, ClinicProtocol, ClinicVoiceAgentCallerBucket,
-    ClinicVoiceAgentConfiguration, ClinicVoiceAgentPersona,
-    ClinicVoiceAgentQualifyingQuestion, ClinicVoiceAgentScript,
-    VoiceAgentCapability,
+    ClinicVoiceAgentConfiguration, ClinicVoiceAgentFaq,
+    ClinicVoiceAgentPersona, ClinicVoiceAgentQualifyingQuestion,
+    ClinicVoiceAgentScript, VoiceAgentCapability,
 )
 from api.voice_agent.protocols import (
     PROTOCOL_METADATA as CAPABILITY_METADATA,
@@ -1281,3 +1281,399 @@ def delete_voice_agent_qualifying_question(
         questions=[_question_to_item(r) for r in rows],
         vapi_sync=sync,
     )
+
+
+# ── Voice agent FAQ (curated, retrieved at call time) ────────────────────────
+#
+# FAQ content deliberately never enters the system prompt — see
+# api/voice_agent/protocols/faq_lookup.py and api/voice_agent/faq_retrieval.py.
+# Cloud SQL owns the curated text + approval state; BigQuery owns the vectors.
+# Approving embeds; unapproving/deleting/editing-an-approved-row re-syncs. The
+# two stores are reconciled on `embedding_synced_at`, so a BigQuery failure
+# leaves a visible NULL rather than silently diverging.
+
+class _FaqItem(BaseModel):
+    id:                  int | None = None
+    clinic_id:           str
+    question:            str
+    answer:              str
+    source:              Literal["etl", "manual"] = "manual"
+    source_call_id:      str | None = None
+    approved:            bool = False
+    approved_by:         str | None = None
+    embedding_synced_at: str | None = None
+    updated_at:          str | None = None
+
+
+class _FaqCreate(BaseModel):
+    question: str
+    answer:   str
+    approved: bool = False
+
+
+class _FaqUpdate(BaseModel):
+    question: str | None = None
+    answer:   str | None = None
+    approved: bool | None = None
+
+
+class _FaqsResponse(BaseModel):
+    clinic_id: str
+    faqs:      list[_FaqItem]
+    # Populated when a write triggered an embedding sync that FAILED. The write
+    # itself still succeeded, so this surfaces "approved but not retrievable"
+    # instead of pretending the FAQ is live.
+    embedding_error: str | None = None
+
+
+class _FaqImportResponse(BaseModel):
+    clinic_id: str
+    imported:  int
+    skipped:   int
+    faqs:      list[_FaqItem]
+
+
+class _FaqSearchRequest(BaseModel):
+    question: str
+
+
+def _faq_to_item(row: ClinicVoiceAgentFaq) -> _FaqItem:
+    return _FaqItem(
+        id=row.id,
+        clinic_id=row.clinic_id,
+        question=row.question,
+        answer=row.answer,
+        source=row.source,
+        source_call_id=row.source_call_id,
+        approved=bool(row.approved),
+        approved_by=row.approved_by,
+        embedding_synced_at=_isoformat(row.embedding_synced_at),
+        updated_at=_isoformat(row.updated_at),
+    )
+
+
+def _all_faqs_for_clinic(db: Session, clinic_id: str) -> list[ClinicVoiceAgentFaq]:
+    return list(db.scalars(
+        select(ClinicVoiceAgentFaq)
+        .where(ClinicVoiceAgentFaq.clinic_id == clinic_id)
+        .order_by(ClinicVoiceAgentFaq.approved.desc(),
+                  ClinicVoiceAgentFaq.id.asc())
+    ))
+
+
+def _apply_embedding(db: Session, row: ClinicVoiceAgentFaq) -> str | None:
+    """Bring BigQuery in line with this row's approval state.
+
+    Approved → embed + upsert and stamp ``embedding_synced_at``. Not approved →
+    delete the vector and clear the stamp, so an unapproved answer stops being
+    retrievable immediately rather than at the next rebuild.
+
+    Returns an error string on failure instead of raising: the Cloud SQL write
+    is already committed and rolling it back would leave the dashboard
+    disagreeing with what the admin just did. A NULL ``embedding_synced_at`` on
+    an approved row is the durable "not live yet" signal, and the message is
+    handed to the caller so the UI can say so.
+    """
+    from api.voice_agent import faq_retrieval
+
+    try:
+        if row.approved:
+            faq_retrieval.sync_faq_embedding(
+                clinic_id=row.clinic_id, faq_id=row.id,
+                question=row.question, answer=row.answer,
+            )
+            row.embedding_synced_at = datetime.utcnow()
+        else:
+            faq_retrieval.delete_faq_embedding(
+                clinic_id=row.clinic_id, faq_id=row.id,
+            )
+            row.embedding_synced_at = None
+        db.flush()
+        return None
+    except Exception as exc:  # noqa: BLE001 — surfaced to the caller, see docstring
+        log.exception(
+            "FAQ embedding sync failed clinic=%s faq_id=%s", row.clinic_id, row.id,
+        )
+        return f"{type(exc).__name__}: {exc}"
+
+
+@router.get(
+    "/clinics/{clinic_id}/voice_agent/faqs",
+    response_model=_FaqsResponse,
+)
+def list_voice_agent_faqs(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """List the clinic's curated FAQs, approved first."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
+    return _FaqsResponse(
+        clinic_id=clinic_id,
+        faqs=[_faq_to_item(r) for r in _all_faqs_for_clinic(db, clinic_id)],
+    )
+
+
+@router.post(
+    "/clinics/{clinic_id}/voice_agent/faqs",
+    response_model=_FaqsResponse,
+)
+def create_voice_agent_faq(
+    clinic_id: str,
+    body: _FaqCreate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Hand-author a FAQ. Embeds immediately when created already approved."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    question = (body.question or "").strip()
+    answer = (body.answer or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question cannot be empty")
+    if not answer:
+        raise HTTPException(status_code=400, detail="answer cannot be empty")
+
+    existing = db.scalar(
+        select(ClinicVoiceAgentFaq).where(
+            ClinicVoiceAgentFaq.clinic_id == clinic_id,
+            ClinicVoiceAgentFaq.question == question,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="A FAQ with this question already exists for this clinic",
+        )
+
+    row = ClinicVoiceAgentFaq(
+        clinic_id=clinic_id,
+        question=question,
+        answer=answer,
+        source="manual",
+        approved=body.approved,
+        approved_by=(caller.get("email") if body.approved else None),
+    )
+    db.add(row)
+    db.flush()
+    err = _apply_embedding(db, row) if row.approved else None
+
+    return _FaqsResponse(
+        clinic_id=clinic_id,
+        faqs=[_faq_to_item(r) for r in _all_faqs_for_clinic(db, clinic_id)],
+        embedding_error=err,
+    )
+
+
+@router.put(
+    "/clinics/{clinic_id}/voice_agent/faqs/{faq_id}",
+    response_model=_FaqsResponse,
+)
+def update_voice_agent_faq(
+    clinic_id: str,
+    faq_id: int,
+    body: _FaqUpdate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Update one FAQ. Partial — only present fields are written.
+
+    Any change to an APPROVED row re-embeds: editing the answer text without
+    re-syncing would leave the agent reading the previous wording, which is the
+    worst kind of stale (invisible, and confidently spoken).
+    """
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentFaq, faq_id)
+    if row is None or row.clinic_id != clinic_id:
+        raise HTTPException(status_code=404, detail="FAQ not found")
+
+    if body.question is not None:
+        q = body.question.strip()
+        if not q:
+            raise HTTPException(status_code=400, detail="question cannot be empty")
+        row.question = q
+    if body.answer is not None:
+        a = body.answer.strip()
+        if not a:
+            raise HTTPException(status_code=400, detail="answer cannot be empty")
+        row.answer = a
+    if body.approved is not None and bool(body.approved) != bool(row.approved):
+        row.approved = body.approved
+        row.approved_by = caller.get("email") if body.approved else None
+
+    db.flush()
+    # Re-sync whenever the row is (or was) approved. An unapproved row that
+    # stayed unapproved has no vector to maintain.
+    err = _apply_embedding(db, row) if (row.approved or row.embedding_synced_at) else None
+
+    return _FaqsResponse(
+        clinic_id=clinic_id,
+        faqs=[_faq_to_item(r) for r in _all_faqs_for_clinic(db, clinic_id)],
+        embedding_error=err,
+    )
+
+
+@router.delete(
+    "/clinics/{clinic_id}/voice_agent/faqs/{faq_id}",
+    response_model=_FaqsResponse,
+)
+def delete_voice_agent_faq(
+    clinic_id: str,
+    faq_id: int,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Delete one FAQ, removing its vector first so nothing is left retrievable."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    row = db.get(ClinicVoiceAgentFaq, faq_id)
+    if row is None or row.clinic_id != clinic_id:
+        raise HTTPException(status_code=404, detail="FAQ not found")
+
+    # Drop the vector BEFORE the row disappears — afterwards we'd have no
+    # faq_id to target and the embedding would be orphaned in BigQuery,
+    # answerable by the agent forever.
+    row.approved = False
+    err = _apply_embedding(db, row)
+
+    db.delete(row)
+    db.flush()
+    return _FaqsResponse(
+        clinic_id=clinic_id,
+        faqs=[_faq_to_item(r) for r in _all_faqs_for_clinic(db, clinic_id)],
+        embedding_error=err,
+    )
+
+
+@router.post(
+    "/clinics/{clinic_id}/voice_agent/faqs/import",
+    response_model=_FaqImportResponse,
+)
+def import_voice_agent_faq_suggestions(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Pull transcript-extracted FAQ suggestions from ``ClinicData.faq``.
+
+    Imported rows land ``approved = False`` and ``source = 'etl'``, always.
+    These are unreviewed LLM extractions from call recordings — auto-approving
+    them would put an unverified answer about price or coverage in front of a
+    patient in the agent's voice.
+
+    Idempotent: questions already present for the clinic are skipped, so this
+    can be run repeatedly as the extractor produces more.
+    """
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    sql = f"""
+    SELECT question, ANY_VALUE(answer) AS answer,
+           ANY_VALUE(complete_call_id) AS complete_call_id
+    FROM {bq_table('faq')}
+    WHERE clinic_id = @clinic_id
+      AND question IS NOT NULL AND TRIM(question) != ''
+      AND answer   IS NOT NULL AND TRIM(answer)   != ''
+    GROUP BY question
+    """
+    job = bq_client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+        ]),
+    )
+    candidates = [
+        (r["question"].strip(), r["answer"].strip(), r["complete_call_id"])
+        for r in job.result()
+    ]
+
+    existing = {
+        q for (q,) in db.execute(
+            select(ClinicVoiceAgentFaq.question)
+            .where(ClinicVoiceAgentFaq.clinic_id == clinic_id)
+        )
+    }
+
+    imported = 0
+    for question, answer, ccid in candidates:
+        if question in existing:
+            continue
+        # The column is String(512); a longer extraction would otherwise fail
+        # the insert and abort the whole import.
+        if len(question) > 512:
+            continue
+        db.add(ClinicVoiceAgentFaq(
+            clinic_id=clinic_id,
+            question=question,
+            answer=answer,
+            source="etl",
+            source_call_id=ccid,
+            approved=False,
+        ))
+        existing.add(question)
+        imported += 1
+    db.flush()
+
+    return _FaqImportResponse(
+        clinic_id=clinic_id,
+        imported=imported,
+        skipped=len(candidates) - imported,
+        faqs=[_faq_to_item(r) for r in _all_faqs_for_clinic(db, clinic_id)],
+    )
+
+
+@router.post("/clinics/{clinic_id}/voice_agent/faq/search")
+def search_voice_agent_faq(
+    clinic_id: str,
+    body: _FaqSearchRequest,
+    _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
+):
+    """Semantic FAQ lookup for the live agent (`answer_clinic_question`).
+
+    VAPI-authenticated, not Firebase — same posture as the Blueprint tools.
+    Returns ``{matched, answers:[{question, answer}]}``; ``matched: false``
+    means nothing was close enough, and the prompt instructs the agent to hand
+    off rather than improvise.
+
+    ``distance`` is intentionally NOT returned. It is a tuning signal for us,
+    not something the model should reason about or mention to a caller.
+    """
+    from api.voice_agent import faq_retrieval
+    from api.voice_agent.protocols.faq_lookup import FaqLookupConfig
+
+    question = (body.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+
+    # Per-clinic tuning if configured; model defaults otherwise. A stored
+    # config that no longer validates must not take the tool down mid-call —
+    # falling back to defaults degrades retrieval quality, raising drops the
+    # caller's question entirely.
+    cfg = FaqLookupConfig()
+    row = db.get(ClinicProtocol, (clinic_id, "faq_lookup"))
+    if row is not None and row.config:
+        try:
+            cfg = FaqLookupConfig(**row.config)
+        except Exception:  # noqa: BLE001 — see docstring
+            log.warning(
+                "faq_lookup config invalid for clinic=%s; using defaults", clinic_id,
+            )
+
+    results = faq_retrieval.search_faqs(
+        clinic_id=clinic_id,
+        question=question,
+        top_k=cfg.top_k,
+        max_distance=cfg.max_distance,
+    )
+    return {
+        "matched": bool(results),
+        "answers": [
+            {"question": r["question"], "answer": r["answer"]} for r in results
+        ],
+    }

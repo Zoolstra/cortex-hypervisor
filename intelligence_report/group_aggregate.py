@@ -9,6 +9,12 @@ the same metrics" is structural rather than a list someone has to keep in sync.
 (``clinic_count``, ``clinic_names``, ``aggregation_notes``) let the UI say what
 it is looking at.
 
+PMS COVERAGE. A rollup can be PARTLY measurable: revenue and booked-appointment
+totals only cover the locations with a PMS feed, and summing over the rest is
+exactly what makes an incomplete total look complete. ``pms_coverage`` /
+``pms_caveat`` carry that split (and are folded into ``aggregation_notes``), so
+the page discloses it and the LLM copy is held to it.
+
 WHY THIS IS NOT ``sum()``
 -------------------------
 Three different merge rules, and using the wrong one silently produces a
@@ -416,7 +422,10 @@ def build_group_aggregate(
     tasks["g_matthew_monthly"] = lambda: q.matthew_outcomes_by_month(clinic_ids, window=window)
 
     # Month-over-month KPI trend, one task per month (each fans internally).
-    from intelligence_report.payloads import _month_anchors, _month_window
+    # Imported here, not at module scope, for the same reason ``parallel`` is
+    # injected: this module must not import back into payloads on import.
+    from intelligence_report.payloads import (
+        _month_anchors, _month_window, pms_integrated)
     anchors = _month_anchors(window)
     for a in anchors:
         mw = _month_window(a)
@@ -489,6 +498,35 @@ def build_group_aggregate(
     if webforms and not webforms.get("submissions"):
         webforms = None
 
+    # PMS coverage. A rollup is the one place a partial answer is possible: the
+    # revenue and booked-appointment totals below cover only the locations with
+    # a PMS feed, and summing across the rest is what makes them look complete.
+    # State the split so nobody reads a group total as an all-locations figure.
+    pms_missing = [c["clinic_name"] for c in clinic_specs
+                   if not pms_integrated(c.get("pms_type"))]
+    pms_covered = len(clinic_specs) - len(pms_missing)
+    # Same rule the funnel's label follows: name the system only when there is
+    # exactly one to name (see _merge_call_funnel).
+    distinct_pms = sorted({c.get("pms_type") for c in clinic_specs
+                           if pms_integrated(c.get("pms_type"))})
+    group_pms_type = (distinct_pms[0] if len(distinct_pms) == 1
+                      else ("mixed" if distinct_pms else "none"))
+    pms_caveat = None
+    if pms_missing:
+        names = ", ".join(pms_missing)
+        pms_caveat = (
+            f"Only {pms_covered} of {len(clinic_specs)} locations have a "
+            f"practice-management (PMS) integration. Revenue and booked-"
+            f"appointment figures cover those locations only — {names} "
+            f"contribute call and form traffic but no revenue or bookings, so "
+            f"their absence is not a zero."
+            if pms_covered else
+            f"No location in this group has a practice-management (PMS) "
+            f"integration, so revenue and the link from call/form traffic to "
+            f"booked appointments cannot be calculated. Every appointment, "
+            f"booking and revenue figure is absent — not zero."
+        )
+
     payload: dict[str, Any] = {
         # The per-clinic contract keys, carrying instance identity — this is what
         # lets the group route render through the same components.
@@ -500,7 +538,19 @@ def build_group_aggregate(
         "is_group": True,
         "clinic_count": len(clinic_specs),
         "clinic_names": {c["clinic_id"]: c["clinic_name"] for c in clinic_specs},
-        "aggregation_notes": _AGGREGATION_NOTES,
+        "aggregation_notes": (_AGGREGATION_NOTES + [pms_caveat] if pms_caveat
+                              else _AGGREGATION_NOTES),
+        # Same keys the clinic payload carries, so the shared components need
+        # one branch, not two. `pms_integrated` is False only when NO location
+        # has a feed; a partial group is integrated-but-caveated.
+        "pms_type": group_pms_type,
+        "pms_integrated": pms_covered > 0,
+        "pms_coverage": {
+            "clinics_total": len(clinic_specs),
+            "clinics_integrated": pms_covered,
+            "missing": pms_missing,
+        },
+        "pms_caveat": pms_caveat,
         "tier": "group",
         "window": {"start": window.start_date, "end": win_end_incl},
         "mom": {"month": cur.get("month"), "prior_month": prev.get("month")},

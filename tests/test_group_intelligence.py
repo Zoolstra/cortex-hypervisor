@@ -321,9 +321,11 @@ def test_group_payload_has_the_same_keys_as_a_clinic_payload(stub_queries):
     # instance_id / group_intelligence are on BOTH surfaces in production — the
     # clinic ones are attached by the endpoint after build_overview returns
     # (api/intelligence.py), so they're absent from the builder's output here.
+    # pms_coverage is group-only by nature: a clinic is integrated or it isn't,
+    # while a rollup can be partly measurable and has to name which locations.
     assert set(group) - set(clinic) == {
         "is_group", "clinic_count", "clinic_names", "aggregation_notes",
-        "instance_id", "group_intelligence"}
+        "instance_id", "group_intelligence", "pms_coverage"}
 
 
 def test_group_payload_carries_instance_identity_and_disclosure(stub_queries):
@@ -338,6 +340,52 @@ def test_group_payload_carries_instance_identity_and_disclosure(stub_queries):
     assert group["clinic_count"] == 2
     assert group["clinic_names"] == {"A": "Clinic A", "B": "Clinic B"}
     assert group["aggregation_notes"], "rollup must disclose how it aggregates"
+
+
+# ── PMS coverage across locations ────────────────────────────────────────────
+#
+# The rollup is the one surface where the answer can be PARTIAL: summing over
+# locations without a PMS feed is exactly what makes an incomplete revenue total
+# look like a complete one.
+
+def _no_pms_spec(cid):
+    return {**_spec(cid), "pms_type": "none"}
+
+
+def test_group_names_the_locations_with_no_pms_integration(stub_queries):
+    group = payloads.build_group_overview(
+        instance_id="INST", instance_name="Virsono",
+        clinic_specs=[_spec("A"), _no_pms_spec("B")],
+        window=Window("2026-01-01", "2026-06-30"), with_recommendations=False)
+    cov = group["pms_coverage"]
+    assert cov == {"clinics_total": 2, "clinics_integrated": 1, "missing": ["Clinic B"]}
+    # Partial coverage is still integrated — the totals mean something, they
+    # just don't cover everyone, which the caveat has to name.
+    assert group["pms_integrated"] is True
+    assert "Clinic B" in group["pms_caveat"]
+    assert group["pms_caveat"] in group["aggregation_notes"]
+
+
+def test_group_with_no_pms_anywhere_says_revenue_is_unavailable(stub_queries):
+    group = payloads.build_group_overview(
+        instance_id="INST", instance_name="Virsono",
+        clinic_specs=[_no_pms_spec("A"), _no_pms_spec("B")],
+        window=Window("2026-01-01", "2026-06-30"), with_recommendations=False)
+    assert group["pms_integrated"] is False
+    assert group["pms_type"] == "none"
+    assert "not zero" in group["pms_caveat"]
+
+
+def test_group_pms_type_is_mixed_only_across_different_systems(stub_queries):
+    def _build(specs):
+        return payloads.build_group_overview(
+            instance_id="INST", instance_name="Virsono", clinic_specs=specs,
+            window=Window("2026-01-01", "2026-06-30"), with_recommendations=False)
+    # A location with no PMS must not turn a single-system group into "mixed" —
+    # it contributes no system to name.
+    assert _build([_spec("A"), _no_pms_spec("B")])["pms_type"] == "counselear"
+    assert _build([_spec("A"),
+                   {**_spec("B"), "pms_type": "blueprint"}])["pms_type"] == "mixed"
 
 
 # ── Endpoint: capability-flag gate ───────────────────────────────────────────

@@ -101,14 +101,26 @@ def test_headline_falls_back_to_mom_when_no_year_of_data(monkeypatch):
     # Year-ago window is entirely pre-cutoff (2025) → basis must be "mom".
     monkeypatch.setattr(q, "call_capture",
                         lambda *a, **k: {"calls": 5, "connected": 4, "booked": 2, "capture_rate": 0.5})
+    # Per-source split (§14): 2 observed web submissions + 1 CounselEar-embed
+    # booking. Top-level fields stay the sum, so `contacts` is unchanged at 8.
     monkeypatch.setattr(q, "form_capture",
-                        lambda *a, **k: {"submissions": 3, "form_bookings": 1, "form_rate": 0.33})
+                        lambda *a, **k: {
+                            "submissions": 3, "form_bookings": 1, "form_rate": 0.33,
+                            "web":    {"submissions": 2, "form_bookings": 1, "form_rate": 0.5},
+                            "portal": {"submissions": 1, "form_bookings": 0, "form_rate": 0.0},
+                        })
     monkeypatch.setattr(q, "invoice_revenue",
                         lambda *a, **k: {"revenue": 1000.0, "invoice_count": 4})
     out = headline_yoy("C1", ["1"], window=Window("2026-06-01", "2026-06-30"))
     assert out["basis"] == "mom"
     assert out["prior_window"]["end"] == "2026-05-31"   # the previous month
     assert out["current"]["contacts"] == 8
+    # The split rides alongside the sum rather than replacing it.
+    assert out["current"]["forms"] == 3
+    assert out["current"]["forms_web"] == 2
+    assert out["current"]["forms_portal"] == 1
+    # form_rate_web is the web-only booking rate, NOT the blended figure.
+    assert out["current"]["form_rate_web"] == 0.5
 
 
 # ── clinic_hours ─────────────────────────────────────────────────────────────
@@ -188,6 +200,86 @@ def test_build_overview_month_over_month(monkeypatch):
     assert oh["revenue_leakage"]["components"]["missed_calls"] == 1
     assert payload["recommendations"] == []
     assert "cortex_intercept" in payload["placeholders"]
+
+
+# ── PMS coverage disclosure ──────────────────────────────────────────────────
+#
+# A clinic with no PMS integration gets ZEROS from every PMS-derived reader (by
+# design — a missing integration must never blank a page), so the payload has to
+# distinguish "measured zero" from "not measurable" or the report reads as a
+# clinic that booked nothing and earned nothing.
+
+class _StubQueries:
+    """Every reader returns a benign empty result, so the builders run without
+    BigQuery — the same stub shape test_group_intelligence uses."""
+    @staticmethod
+    def _empty_dict(*a, **k):
+        return {}
+
+    @staticmethod
+    def _empty_list(*a, **k):
+        return []
+
+    def __getattr__(self, name):
+        if name.endswith(("_by_month", "_monthly", "_trend", "_roi", "_mix")):
+            return self._empty_list
+        return self._empty_dict
+
+
+@pytest.fixture
+def stub_queries(monkeypatch):
+    monkeypatch.setattr(payloads, "q", _StubQueries())
+
+
+def _overview(pms_type, **kw):
+    return payloads.build_overview(
+        clinic_id="C1", clinic_name="Test",
+        invoca_campaign_ids=["1"], ga_campaign_ids=["2"],
+        window=Window("2026-01-01", "2026-05-31"),
+        pms_type=pms_type, with_recommendations=False, **kw)
+
+
+@pytest.mark.parametrize("pms_type", ["blueprint", "counselear"])
+def test_overview_marks_pms_backed_clinics_integrated(pms_type, stub_queries):
+    payload = _overview(pms_type)
+    assert payload["pms_type"] == pms_type
+    assert payload["pms_integrated"] is True
+    assert payload["pms_caveat"] is None
+
+
+@pytest.mark.parametrize("pms_type", ["none", "audit_data"])
+def test_overview_discloses_missing_pms_integration(pms_type, stub_queries):
+    """``audit_data`` counts as missing until that feed actually lands in
+    PMS_Unified — the report can only claim what it can read."""
+    payload = _overview(pms_type)
+    assert payload["pms_integrated"] is False
+    assert "revenue" in payload["pms_caveat"]
+    assert "not zero" in payload["pms_caveat"]
+
+
+def test_no_pms_caveat_reaches_the_llm_copy(monkeypatch, stub_queries):
+    """Both LLM writers must be told, or they narrate the zeros as a collapse."""
+    seen: list[str] = []
+    monkeypatch.setattr(payloads, "_one_thing_sentence",
+                        lambda name, payload: seen.append(payload["pms_caveat"]))
+    monkeypatch.setattr(payloads, "forward_recommendations",
+                        lambda name, metrics, caveat=None: seen.append(caveat) or [])
+    payloads.build_overview(
+        clinic_id="C1", clinic_name="Test", invoca_campaign_ids=["1"],
+        ga_campaign_ids=["2"], window=Window("2026-01-01", "2026-05-31"),
+        pms_type="none", with_recommendations=True)
+    assert seen and all(c and "PMS" in c for c in seen)
+
+
+def test_biweekly_carries_the_same_flag(stub_queries):
+    payload = payloads.build_biweekly(
+        clinic_id="C1", clinic_name="Test", invoca_campaign_ids=["1"],
+        window=Window("2026-01-01", "2026-01-14"), pms_type="none")
+    assert payload["pms_integrated"] is False
+    payload = payloads.build_biweekly(
+        clinic_id="C1", clinic_name="Test", invoca_campaign_ids=["1"],
+        window=Window("2026-01-01", "2026-01-14"), pms_type="counselear")
+    assert payload["pms_integrated"] is True
 
 
 # ── Endpoint wiring ──────────────────────────────────────────────────────────

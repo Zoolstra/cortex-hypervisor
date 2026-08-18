@@ -24,7 +24,8 @@ router = APIRouter()
 
 
 # Field → owning table for PATCH dispatch.
-_CLINIC_FIELDS = {"address", "place_id", "country", "gbp_location_id", "etl_enabled", "tier"}
+_CLINIC_FIELDS = {"clinic_name", "address", "place_id", "country",
+                  "gbp_location_id", "etl_enabled", "tier"}
 _LOCATION_FIELDS = {
     "hours_monday", "hours_tuesday", "hours_wednesday", "hours_thursday",
     "hours_friday", "hours_saturday", "hours_sunday",

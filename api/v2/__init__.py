@@ -14,9 +14,14 @@ which is why api/__init__.py carries a comment about registration order.
 """
 from fastapi import APIRouter
 
-from api.v2 import admin_users, auth, intelligence
+from api.v2 import admin_users, auth, intelligence, provision
 
 router = APIRouter(prefix="/v2", tags=["v2"])
 router.include_router(intelligence.router)
 router.include_router(auth.router)
 router.include_router(admin_users.router)
+# After admin_users: both live under /v2/admin, and admin_users owns the
+# /admin/users/{uid} wildcard shape. Literal /admin/provision cannot collide
+# with it, but keeping the more specific prefix first preserves that guarantee
+# if either router ever gains a wildcard segment.
+router.include_router(provision.router)

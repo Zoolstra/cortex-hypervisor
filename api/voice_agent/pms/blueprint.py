@@ -308,9 +308,21 @@ class BlueprintAdapter(PMSAdapter):
               "care_plan_name": str | None,      # latest-expiry plan on file
               "care_plan_expiry": date | None,
               "active_insurer_names": [str],     # active=truthy insurer rows
+              "date_of_birth": date | None,      # ClientDemographics.birthdate
               "last_hearing_test_date": date | None,   # max Audiograms.entry_date
-              "last_clinician_visit_date": date | None # max completed appt with a
-            }                                          # practitioner in clinician_names
+              "last_clinician_visit_date": date | None, # max completed appt with a
+                                                        # practitioner in clinician_names
+              "last_clean_check_date": date | None,    # max completed appt with a
+                                                        # practitioner NOT on that list
+              "warranty_expiry_date": date | None      # soonest UPCOMING device
+            }                                          # warranty expiry
+
+        ``last_clean_check_date`` uses the practitioner list as the
+        clinician/technician discriminator — the same convention
+        ``last_clinician_visit_date`` relies on, just inverted. It is guarded on
+        a NON-EMPTY clinician list: with no names configured, "not a clinician"
+        would match every completed appointment and inject a spurious
+        clean-and-check gap into every decision.
 
         Feed columns are strings; SAFE_CAST drops unparseable rows rather than
         erroring. ``active`` in ClientInsurerCanada is matched loosely
@@ -324,6 +336,15 @@ class BlueprintAdapter(PMSAdapter):
           WHERE _clinic_id = @clinic_id
             AND CAST(client_id AS STRING) = @patient_id
         ),
+        dob AS (
+          -- MAX both guarantees a scalar and picks the LATEST birthdate if the
+          -- feed ever carries duplicate demographic rows — i.e. the youngest
+          -- reading, which errs toward routing the caller to a person.
+          SELECT MAX(SAFE_CAST(birthdate AS DATE)) AS d
+          FROM `{PROJECT}.Blueprint_PHI.ClientDemographics`
+          WHERE _clinic_id = @clinic_id
+            AND CAST(client_id AS STRING) = @patient_id
+        ),
         plan AS (
           SELECT TRIM(service_plan_name) AS name,
                  SAFE_CAST(service_plan_expiry_date AS DATE) AS expiry
@@ -333,6 +354,17 @@ class BlueprintAdapter(PMSAdapter):
             AND service_plan_name IS NOT NULL AND TRIM(service_plan_name) != ''
           ORDER BY expiry DESC
           LIMIT 1
+        ),
+        warranty AS (
+          -- Soonest UPCOMING device warranty expiry. MIN over FUTURE dates
+          -- only: an already-lapsed warranty can't be bundled with anything,
+          -- and including it would drag the minimum into the past and disable
+          -- the rule for a patient who has a second device still in warranty.
+          SELECT MIN(SAFE_CAST(warranty_expiry_date AS DATE)) AS d
+          FROM `{PROJECT}.Blueprint_PHI.ClientAids`
+          WHERE _clinic_id = @clinic_id
+            AND CAST(client_id AS STRING) = @patient_id
+            AND SAFE_CAST(warranty_expiry_date AS DATE) > CURRENT_DATE()
         ),
         insurers AS (
           SELECT ARRAY_AGG(DISTINCT insurer_name IGNORE NULLS) AS names
@@ -358,14 +390,31 @@ class BlueprintAdapter(PMSAdapter):
             AND CAST(client_id AS STRING) = @patient_id
             AND LOWER(status) LIKE '%complete%'
             AND practitioner IN UNNEST(@clinicians)
+        ),
+        last_tech AS (
+          -- Technician clean-and-check: a completed appointment whose
+          -- practitioner is NOT on the clinician list. Guarded on a non-empty
+          -- list (see docstring) and on a non-null practitioner, since
+          -- `NULL NOT IN UNNEST(...)` is NULL, not TRUE.
+          SELECT MAX(SAFE_CAST(SUBSTR(start_time, 1, 10) AS DATE)) AS d
+          FROM `{PROJECT}.Blueprint_PHI.Appointments`
+          WHERE _clinic_id = @clinic_id
+            AND CAST(client_id AS STRING) = @patient_id
+            AND LOWER(status) LIKE '%complete%'
+            AND ARRAY_LENGTH(@clinicians) > 0
+            AND practitioner IS NOT NULL
+            AND practitioner NOT IN UNNEST(@clinicians)
         )
         SELECT
           (SELECT ok     FROM pat)       AS patient_exists,
           (SELECT name   FROM plan)      AS care_plan_name,
           (SELECT expiry FROM plan)      AS care_plan_expiry,
           (SELECT names  FROM insurers)  AS active_insurer_names,
+          (SELECT d      FROM dob)       AS date_of_birth,
           (SELECT d      FROM last_test) AS last_hearing_test_date,
-          (SELECT d      FROM last_clin) AS last_clinician_visit_date
+          (SELECT d      FROM last_clin) AS last_clinician_visit_date,
+          (SELECT d      FROM last_tech) AS last_clean_check_date,
+          (SELECT d      FROM warranty)  AS warranty_expiry_date
         """
         params = [
             bigquery.ScalarQueryParameter("clinic_id", "STRING", self.clinic_id),
@@ -381,8 +430,11 @@ class BlueprintAdapter(PMSAdapter):
             "care_plan_name": row["care_plan_name"],
             "care_plan_expiry": row["care_plan_expiry"],
             "active_insurer_names": list(row["active_insurer_names"] or []),
+            "date_of_birth": row["date_of_birth"],
             "last_hearing_test_date": row["last_hearing_test_date"],
             "last_clinician_visit_date": row["last_clinician_visit_date"],
+            "last_clean_check_date": row["last_clean_check_date"],
+            "warranty_expiry_date": row["warranty_expiry_date"],
         }
 
     # ── Appointment types ─────────────────────────────────────────────────────

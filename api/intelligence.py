@@ -94,6 +94,21 @@ def _group_clinic_specs(db: Session, instance_id: str) -> list[dict]:
     return specs
 
 
+# Bump this whenever a reader's METHODOLOGY changes — a different figure for the
+# same clinic, window and data.
+#
+# It exists because `_data_version` (below) is the PMS snapshot date, so it tracks
+# when the DATA changed and is blind to when the CODE did. The shared cache tier
+# is a GCS object whose existence IS its validity, with no TTL, so without this a
+# deployed methodology fix keeps serving the pre-fix number until the next PMS
+# sync happens to rotate the snapshot — up to a day of a corrected reader looking
+# broken, and no way to tell that from a real regression.
+#
+# 2026-08-17: pipeline_revenue_by_source gained the web-form channel and
+#             cross-channel first touch (methodology-contract §14b).
+_METHODOLOGY_VERSION = "2026-08-17.1"
+
+
 def _group_data_version(clinic_ids: list[str]) -> str:
     """Cache version for a group payload: every member clinic's version.
 
@@ -505,9 +520,14 @@ def get_intelligence_overview(
     invoca_ids, gads_ids = _active_campaign_ids(db, clinic_id)
     tier = getattr(clinic, "tier", "none") or "none"
     hours = _location_hours(clinic)
+    pms_type = getattr(clinic, "pms_type", None) or "none"
 
+    # pms_type is in the key for the same reason tier is: it changes the payload
+    # (the "no PMS integration" disclosure and the LLM copy written under it),
+    # and connecting a clinic's PMS does not rotate its data_version, so without
+    # this the report would keep claiming the integration is missing.
     key = ("overview", clinic_id, window.start_date, window.end_date_excl, tier,
-           _data_version(clinic_id))
+           pms_type, _data_version(clinic_id), _METHODOLOGY_VERSION)
     use_cache = not nocache and not skip_llm
     if use_cache:
         cached = _cache_lookup(key, clinic_id, use_cache=use_cache)
@@ -524,7 +544,7 @@ def get_intelligence_overview(
         window=window,
         location_hours=hours,
         tier=tier,
-        pms_type=(getattr(clinic, "pms_type", None) or "none"),
+        pms_type=pms_type,
         with_recommendations=not skip_llm,
     )
     # So the clinic page can link up to instance-wide Group Intelligence when
@@ -535,6 +555,74 @@ def get_intelligence_overview(
     if not skip_llm:
         _cache_store(key, clinic_id, payload, use_cache=use_cache)
     return payload
+
+
+@router.get("/intelligence/{clinic_id}/pipeline-revenue")
+def get_pipeline_revenue(
+    clinic_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 365,
+    nocache: bool = False,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Window-exact attributed-revenue total for the dashboard KPI tile, plus
+    its breakdown by ``utm_source`` for the chart drawn under it.
+
+    **Why this is its own route rather than a field on ``/overview``.** The
+    overview payload is expensive (two Claude calls plus every section reader),
+    which is why it is cached on a data-versioned key and warmed hourly by
+    `payload-prewarm`. This total is window-exact, whereas the payload's
+    existing revenue reader is month-grained and pinned to Dec 2025, so it
+    cannot simply be read off that. Keeping it separate means the tile can be
+    recomputed — or its methodology changed — without touching, invalidating,
+    or waiting on the expensive payload.
+
+    ``by_source`` is a genuine partition: every patient is attributed to their
+    FIRST touch only, so the slices sum exactly to ``revenue`` and can honestly
+    be drawn as parts of a whole. See
+    :func:`~intelligence_report.queries.pipeline_revenue_by_source`.
+
+    ``by_channel_month`` feeds the "Revenue trend" card and is a **wider
+    population than ``revenue`` above it** — it adds the web-form channel, which
+    neither the tile nor ``by_source`` counts. So
+    ``by_channel_month.totals.revenue >= revenue``, and the difference is
+    form-acquired patients. This is deliberately additive rather than a
+    correction to the headline: ``paid_attribution`` and ``webform_revenue`` are
+    parity-frozen (methodology-contract §1.2), and
+    ``resources/form-revenue-attribution-plan.md`` §6 requires the new figures to
+    ship alongside the old ones and be quantified with ``parity_harness.py``
+    BEFORE anything decides to switch. Both numbers are correct for what they
+    each claim; the card names the difference rather than hiding it.
+    """
+    clinic = db.get(Clinic, clinic_id)
+    if not clinic or clinic.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+    require_read_access(clinic.instance_id, caller)
+
+    window = _resolve_window(start, end, days)
+    invoca_ids, _ = _active_campaign_ids(db, clinic_id)
+
+    from intelligence_report.queries import pipeline_revenue_by_source
+
+    key = ("pipeline-revenue", clinic_id, window.start_date, window.end_date_excl,
+           getattr(clinic, "pms_type", None) or "none", _data_version(clinic_id),
+           _METHODOLOGY_VERSION)
+    use_cache = not nocache
+    cached = _cache_lookup(key, clinic_id, use_cache=use_cache)
+    if cached is not None:
+        return cached
+
+    # NOT passing customerio_touches yet — see the reader's docstring. Wiring it
+    # is a Cloud SQL read here (customerio_enrollments → [(client_id, sent_at)]),
+    # not a change to the SQL.
+    out = {
+        **pipeline_revenue_by_source(clinic_id, invoca_ids, window=window),
+        "window": {"start": window.start_date, "end": window.end_date_excl},
+    }
+    _cache_store(key, clinic_id, out, use_cache=use_cache)
+    return out
 
 
 @router.get("/intelligence/{clinic_id}/biweekly")
@@ -558,9 +646,12 @@ def get_intelligence_biweekly(
 
     window = _resolve_window(start, end, days)
     invoca_ids, gads_ids = _active_campaign_ids(db, clinic_id)
+    pms_type = getattr(clinic, "pms_type", None) or "none"
 
+    # In the key for the same reason as on the Overview: it changes what the
+    # report is allowed to claim, and it doesn't rotate the data_version.
     key = ("biweekly", clinic_id, window.start_date, window.end_date_excl,
-           _data_version(clinic_id))
+           pms_type, _data_version(clinic_id), _METHODOLOGY_VERSION)
     use_cache = not nocache
     if use_cache:
         cached = _cache_lookup(key, clinic_id, use_cache=use_cache)
@@ -575,7 +666,7 @@ def get_intelligence_biweekly(
         invoca_campaign_ids=invoca_ids,
         ga_campaign_ids=gads_ids,
         window=window,
-        pms_type=(getattr(clinic, "pms_type", None) or "none"),
+        pms_type=pms_type,
     )
     _cache_store(key, clinic_id, payload, use_cache=use_cache)
     return payload
@@ -623,8 +714,14 @@ def get_group_overview(
     window = _resolve_window(start, end, days)
     clinic_specs = _group_clinic_specs(db, instance_id)
 
+    # The member clinics' PMS types are in the key for the same reason the
+    # clinic page's is: they decide what the rollup may claim about revenue and
+    # bookings, and connecting one location's PMS rotates no data version.
     key = ("group-overview", instance_id, window.start_date, window.end_date_excl,
-           _group_data_version([c["clinic_id"] for c in clinic_specs]))
+           "|".join(f"{c['clinic_id']}:{c['pms_type']}"
+                    for c in sorted(clinic_specs, key=lambda c: c["clinic_id"])),
+           _group_data_version([c["clinic_id"] for c in clinic_specs]),
+           _METHODOLOGY_VERSION)
     use_cache = not nocache and not skip_llm
     if use_cache:
         cached = _cache_lookup(key, instance_id, use_cache=use_cache)
@@ -696,7 +793,14 @@ def get_group_line_item_calls(
         outcome="ok",
         detail=f"clinics={len(clinics)} n={len(calls)}",
     )
-    return {"calls": calls}
+    # False only when NO location has a feed — with a partial group the columns
+    # are populated for some rows, which the table's own coverage note explains.
+    from intelligence_report.payloads import pms_integrated
+    pms_types = list(db.scalars(
+        select(Clinic.pms_type).where(Clinic.instance_id == instance_id,
+                                      Clinic.deleted_at.is_(None))))
+    return {"calls": calls,
+            "pms_integrated": any(pms_integrated(p) for p in pms_types)}
 
 
 @router.get("/intelligence/{clinic_id}/active-leads")
@@ -865,7 +969,12 @@ def get_line_item_calls(
         outcome="ok",
         detail=f"n={len(calls)}",
     )
-    return {"calls": calls}
+    # Carried so the table can say why every appointment/revenue cell is empty:
+    # with no PMS feed there is nothing to reconcile a call against, and the
+    # booked/led-to-booking outcomes can never be assigned.
+    from intelligence_report.payloads import pms_integrated
+    return {"calls": calls,
+            "pms_integrated": pms_integrated(getattr(clinic, "pms_type", None))}
 
 
 class _OutcomeOverrideBody(BaseModel):

@@ -81,6 +81,10 @@ class ClinicCreate(BaseModel):
 # ── Update models ─────────────────────────────────────────────────────────────
 
 class InstanceUpdate(BaseModel):
+    # Renaming is safe: `instance_name` is a display label everywhere it is
+    # read (reports, pickers, mart row labels) and is never a join key — scope
+    # and every FK resolve through `instance_id`.
+    instance_name: Optional[str] = None
     primary_contact_name: Optional[str] = None
     primary_contact_email: Optional[str] = None
     google_ads_customer_id: Optional[str] = None
@@ -90,7 +94,7 @@ class InstanceUpdate(BaseModel):
     multi_location_group: Optional[bool] = None
 
     @field_validator(
-        "primary_contact_name", "primary_contact_email",
+        "instance_name", "primary_contact_name", "primary_contact_email",
         "google_ads_customer_id", "invoca_profile_id",
     )
     @classmethod
@@ -99,6 +103,14 @@ class InstanceUpdate(BaseModel):
 
 
 class ClinicUpdate(BaseModel):
+    # Renaming is safe for the same reason as `instance_name`: every consumer
+    # of `clinic_name` treats it as a label (reports, voice-agent prompt copy,
+    # the marts' clinic dimension, the `webforms` stamp), and every key is
+    # `clinic_id`. NOTE the two places a rename is not retroactive — the live
+    # VAPI assistant keeps the old name in its prompt until republished, and
+    # `ClinicData.webforms` rows already written keep the name they were
+    # stamped with, which is a point-in-time record rather than a stale copy.
+    clinic_name: Optional[str] = None
     address: Optional[str] = None
     place_id: Optional[str] = None
     about_us: Optional[str] = None
@@ -118,7 +130,7 @@ class ClinicUpdate(BaseModel):
     tier: Optional[Literal["none", "bridge", "growth"]] = None
 
     @field_validator(
-        "address", "phone", "email", "place_id", "about_us",
+        "clinic_name", "address", "phone", "email", "place_id", "about_us",
         "time_zone", "country", "gbp_location_id",
         "hours_monday", "hours_tuesday", "hours_wednesday", "hours_thursday",
         "hours_friday", "hours_saturday", "hours_sunday",
@@ -202,6 +214,17 @@ class WebformSubmission(BaseModel):
     utm_content: Optional[str] = None
     gclid: Optional[str] = None          # Google Ads click id
     fbclid: Optional[str] = None         # Meta click id
+    # Google sends gbraid (cross-device) or wbraid (iOS post-ATT) INSTEAD of a
+    # gclid on many clicks; gad_campaignid is the campaign id itself. All three
+    # are optional here because the relay may not capture them — the ingest
+    # falls back to parsing them out of `landing_page` (webforms._attribution).
+    gbraid: Optional[str] = None
+    wbraid: Optional[str] = None
+    gad_campaignid: Optional[str] = None
+    # Referring site host. Sites currently send this INSIDE utm_source when the
+    # visit had no UTM tags; the ingest splits it back out (webforms._utm), so
+    # relays may either send it here explicitly or keep doing what they do.
+    referrer_host: Optional[str] = None
     landing_page: Optional[str] = None
     customer_type: Optional[str] = None  # e.g. "New Customer" / "Returning Customer"
     message: Optional[str] = None        # free-text "How can we help?" intent
@@ -214,7 +237,8 @@ class WebformSubmission(BaseModel):
     @field_validator(
         "first_name", "last_name", "phone_number", "email",
         "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-        "gclid", "fbclid", "landing_page",
+        "gclid", "fbclid", "gbraid", "wbraid", "gad_campaignid",
+        "referrer_host", "landing_page",
         "customer_type", "message",
     )
     @classmethod

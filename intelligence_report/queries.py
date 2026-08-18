@@ -16,7 +16,7 @@ import datetime as _dt
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from google.cloud import bigquery
 
@@ -1109,7 +1109,26 @@ def webform_funnel(clinic_id: str, days: int = 90, window: "Window | None" = Non
         WITH forms AS (
             SELECT
               ROW_NUMBER() OVER (ORDER BY submitted_at, email, phone_number)   AS form_id,
-              COALESCE(NULLIF(TRIM(utm_source), ''), 'Direct / untagged')      AS source,
+              -- Three-way, NOT two. Until 2026-08-10 the sites wrote the
+              -- referring host into `utm_source`, so this grouped referrers and
+              -- called them campaign sources; `referrer_host` now holds those
+              -- (webforms._utm). A referrer is real signal and must not be
+              -- dumped into 'Direct / untagged', but it is NOT a campaign, so
+              -- the label says so and `source_kind` makes it machine-readable.
+              CASE
+                WHEN NULLIF(TRIM(utm_source), '')    IS NOT NULL THEN TRIM(utm_source)
+                -- 'direct' is the sites' marker for NO referrer, so labelling it
+                -- "direct (referrer)" would contradict itself.
+                WHEN LOWER(TRIM(referrer_host)) = 'direct' THEN 'Direct (no referrer)'
+                WHEN NULLIF(TRIM(referrer_host), '') IS NOT NULL
+                     THEN CONCAT(TRIM(referrer_host), ' (referrer)')
+                ELSE 'Direct / untagged'
+              END                                                             AS source,
+              CASE
+                WHEN NULLIF(TRIM(utm_source), '')    IS NOT NULL THEN 'utm'
+                WHEN NULLIF(TRIM(referrer_host), '') IS NOT NULL THEN 'referrer'
+                ELSE 'untagged'
+              END                                                             AS source_kind,
               RIGHT(REGEXP_REPLACE(IFNULL(phone_number, ''), r'\\D', ''), 10)  AS phone_norm,
               LOWER(TRIM(IFNULL(email, '')))                                   AS email_norm,
               DATE(submitted_at)                                              AS submitted_date
@@ -1118,7 +1137,10 @@ def webform_funnel(clinic_id: str, days: int = 90, window: "Window | None" = Non
               AND {_ts_between("submitted_at", w)}
         ),
         submissions AS (
-            SELECT source, COUNT(*) AS submissions FROM forms GROUP BY source
+            -- source_kind is functionally dependent on source (the label
+            -- encodes it), so grouping by both cannot split a source row.
+            SELECT source, source_kind, COUNT(*) AS submissions
+            FROM forms GROUP BY source, source_kind
         ),
         patients AS (
             SELECT DISTINCT client_id, phone_norm, email_norm
@@ -1159,6 +1181,7 @@ def webform_funnel(clinic_id: str, days: int = 90, window: "Window | None" = Non
         )
         SELECT
           s.source,
+          s.source_kind,
           s.submissions,
           IFNULL(i.invoiced, 0) AS invoiced,
           IFNULL(r.revenue, 0)  AS revenue
@@ -1178,6 +1201,7 @@ def webform_funnel(clinic_id: str, days: int = 90, window: "Window | None" = Non
     for r in rows:
         out["sources"].append({
             "source":      r.source,
+            "source_kind": r.source_kind,
             "submissions": int(r.submissions or 0),
             "invoiced":    int(r.invoiced or 0),
             "revenue":     float(r.revenue or 0.0),
@@ -4905,6 +4929,262 @@ def pipeline_revenue_by_month(
     return [{"month": r.month, "revenue": float(r.revenue or 0.0), "invoices": int(r.invoices or 0)} for r in rows]
 
 
+# Acquisition channels Cortex can bring a patient through, in the order the
+# breakdown lists them. ``customerio`` is a live seam, not a placeholder label —
+# see the "Customer.io" paragraph in pipeline_revenue_by_source.
+REVENUE_CHANNELS = ("call", "form", "portal", "customerio")
+
+# Source label for the two channels that carry no campaign tagging of their own.
+_PORTAL_SOURCE = "counselear portal referral"
+_CIO_SOURCE = "customer.io campaign"
+
+
+def pipeline_revenue_by_source(
+    clinic_id: str,
+    invoca_campaign_ids: list[str],
+    days: int = 90,
+    window: "Window | None" = None,
+    customerio_touches: "Sequence[tuple[str, _dt.datetime]] | None" = None,
+) -> dict[str, Any]:
+    """Total revenue Cortex has led to the clinic in the window, split by
+    ``utm_source`` and by acquisition channel.
+
+    This is the "Revenue attributed" figure on the growth dashboard, and it is
+    meant to be the WHOLE of what Cortex drove — every channel it can bring a
+    patient through, counted once:
+
+    * ``call``       — a tracked inbound call (Invoca), phone-matched to a patient
+    * ``form``       — a web-form submission, matched on phone last-10 OR email
+    * ``portal``     — a ``Referral - Zoolstra`` CounselEar appointment
+    * ``customerio`` — a reactivation campaign send (seam; see below)
+
+    Revenue rule, unchanged: positive ``InvoiceMaster`` rows, deduped on
+    ``order_id``, invoice date inside the selected window.
+
+    The two windows differ, intentionally:
+
+    * **touch** window is Dec 2025 → window end. A patient who called in March
+      and was invoiced in August is August revenue; requiring the touch inside a
+      7-day range would report ~nothing.
+    * **invoice** window is the selected range — what "in this range" means.
+
+    **Every patient is credited to their FIRST touch across ALL channels, and
+    only that one.** Two things depend on this. It makes ``by_source`` and
+    ``by_channel`` genuine partitions that sum exactly to ``revenue``, so either
+    can honestly be drawn as parts of a whole. And it is what stops the total
+    double-counting: before the form channel was folded in here, forms were
+    credited separately by :func:`webform_revenue` over the same invoices, so
+    adding that figure to this one counted every patient who both called and
+    submitted twice. That defect is §5 of
+    ``resources/form-revenue-attribution-plan.md``; folding the channel in here
+    is its fix. ``webform_revenue`` is left alone and still answers its own
+    narrower question — **do not add the two together.**
+
+    Ordering is on the full touch TIMESTAMP rather than the date, because
+    same-day ties land on exactly the patients most likely to have both a call
+    and a form. The portal leg is the one channel with no clock —
+    ``CounselEar_PHI.appointments`` carries ``appt_date`` only — so it is ordered
+    at midnight and loses same-day ties to a timestamped call or form. That is
+    the correct bias: a dated-only booking is weaker evidence of first contact
+    than a timestamped enquiry. Remaining ties break on channel then source, so
+    the split is deterministic run to run.
+
+    Source labels. Calls and forms use their own ``utm_source``, rolled up to
+    ``direct / untagged`` when NULL, blank or noise (``nan``/``null``/``none``) —
+    the same label :func:`webform_sources` uses, so the vocabulary matches across
+    the app. The form leg deliberately does NOT fall back to
+    ``webforms.referrer_host``: a referrer is not a campaign source, and §14a of
+    the methodology contract is explicit that presenting one as the other is a
+    mislabel. Portal and Customer.io are named rather than folded into
+    ``direct / untagged``, because both are real revenue with a knowable origin
+    and hiding them inside "direct" would misattribute it.
+
+    **Customer.io is wired but not fed.** ``customerio_touches`` takes
+    ``(client_id, sent_at)`` pairs and folds them in as a fourth channel on equal
+    terms with the rest. Nothing passes it yet: the enrollment log lives in Cloud
+    SQL (``customerio_enrollments``, keyed on the same PMS ``client_id`` this
+    query joins on) while this runs in BigQuery, so lighting it up is a matter of
+    the CALLER reading that table and handing the pairs over — not of changing
+    this SQL. Until then the channel is reported at zero, which is deliberate:
+    the response shape does not change on the day it starts contributing.
+
+    Correlational, not causal — it credits a channel whose patient later
+    transacted, not proof the channel caused it.
+    """
+    w = _win(window, days)
+    end_incl = w.end_excl - _dt.timedelta(days=1)
+    out: dict[str, Any] = {
+        "revenue": 0.0, "invoices": 0, "patients": 0,
+        "by_source": [],
+        "by_channel": [{"channel": c, "revenue": 0.0, "invoices": 0, "patients": 0}
+                       for c in REVENUE_CHANNELS],
+    }
+    if end_incl < MIN_WINDOW_DATE:
+        return out
+    touch = Window(MIN_WINDOW_DATE.isoformat(), end_incl.isoformat())
+    in_iv = "(" + ", ".join(f"'{c}'" for c in invoca_campaign_ids) + ")" if invoca_campaign_ids else "('')"
+    noise = ", ".join(f"'{n}'" for n in _UTM_NOISE)
+
+    # The Customer.io leg is a typed empty relation when no touches are supplied,
+    # so the UNION ALL keeps one shape whether or not the channel is fed. Same
+    # technique as the rc_call_facts clinic seam: absent, not special-cased.
+    cio_params: list[Any] = []
+    if customerio_touches:
+        cio_cte = f"""
+          SELECT client_id, touch_ts, 'customerio' AS channel, '{_CIO_SOURCE}' AS source
+          FROM UNNEST(@cio_touches)
+        """
+        cio_params.append(bigquery.ArrayQueryParameter(
+            "cio_touches", "RECORD",
+            [bigquery.StructQueryParameter(
+                "", bigquery.ScalarQueryParameter("client_id", "STRING", str(cid)),
+                bigquery.ScalarQueryParameter("touch_ts", "TIMESTAMP", ts))
+             for cid, ts in customerio_touches],
+        ))
+    else:
+        # An empty TYPED array rather than `SELECT NULL … WHERE FALSE`: BigQuery
+        # rejects a WHERE clause on a query with no FROM, and this shape is also
+        # structurally identical to the fed branch above, so the UNION ALL sees
+        # the same columns and types either way.
+        cio_cte = f"""
+          SELECT client_id, touch_ts, 'customerio' AS channel, '{_CIO_SOURCE}' AS source
+          FROM UNNEST(ARRAY<STRUCT<client_id STRING, touch_ts TIMESTAMP>>[])
+        """
+
+    sql = f"""
+        WITH call_touch AS (
+          SELECT pc.client_id AS client_id,
+                 t.timestamp  AS touch_ts,
+                 'call'       AS channel,
+                 IF(t.utm_source IS NULL
+                      OR LOWER(TRIM(t.utm_source)) IN ({noise}),
+                    'direct / untagged',
+                    LOWER(TRIM(t.utm_source))) AS source
+          FROM `{_CLINIC_DATA}.transactions` t
+          JOIN `{_PATIENT_CONTACTS}` pc
+            ON pc._clinic_id = @clinic_id AND LENGTH(pc.phone_norm) = 10
+           AND pc.phone_norm = RIGHT(REGEXP_REPLACE(IFNULL(t.calling_phone_number, ''), r'\\D', ''), 10)
+          WHERE CAST(t.invoca_campaign_id AS STRING) IN {in_iv}
+            AND {_ts_between('t.timestamp', touch)}
+        ),
+        -- Same submitter→patient rule as webform_revenue (phone last-10 OR
+        -- email), so the two readers cannot disagree about who is a form lead.
+        form_src AS (
+          SELECT RIGHT(REGEXP_REPLACE(IFNULL(phone_number, ''), r'\\D', ''), 10) AS phone_norm,
+                 LOWER(TRIM(IFNULL(email, '')))                                  AS email_norm,
+                 submitted_at,
+                 IF(utm_source IS NULL
+                      OR LOWER(TRIM(utm_source)) IN ({noise}),
+                    'direct / untagged',
+                    LOWER(TRIM(utm_source))) AS source
+          FROM `{_CLINIC_DATA}.webforms`
+          WHERE clinic_id = @clinic_id
+            AND {_ts_between('submitted_at', touch)}
+        ),
+        form_touch AS (
+          SELECT p.client_id AS client_id,
+                 f.submitted_at AS touch_ts,
+                 'form'         AS channel,
+                 f.source       AS source
+          FROM form_src f
+          JOIN (SELECT DISTINCT client_id, phone_norm, email_norm
+                FROM `{_PATIENT_CONTACTS}` WHERE _clinic_id = @clinic_id) p
+            ON (LENGTH(f.phone_norm) = 10 AND f.phone_norm = p.phone_norm)
+            OR (f.email_norm != ''        AND f.email_norm = p.email_norm)
+        ),
+        portal_touch AS (
+          SELECT CAST(patient_id AS STRING) AS client_id,
+                 TIMESTAMP(appt_date)       AS touch_ts,
+                 'portal'                   AS channel,
+                 '{_PORTAL_SOURCE}'         AS source
+          FROM `{_COUNSELEAR}.appointments`
+          WHERE _clinic_id = @clinic_id AND appt_referral_type = @ztag
+            AND patient_id IS NOT NULL
+            AND {_date_between('appt_date', touch)}
+        ),
+        customerio_touch AS ({cio_cte}),
+        touches AS (
+          SELECT * FROM call_touch
+          UNION ALL SELECT * FROM form_touch
+          UNION ALL SELECT * FROM portal_touch
+          UNION ALL SELECT * FROM customerio_touch
+        ),
+        -- One row per patient: the source AND channel of their earliest touch.
+        -- This is the step that makes both breakdowns partitions rather than
+        -- overlapping tallies.
+        first_touch AS (
+          SELECT client_id,
+                 ARRAY_AGG(STRUCT(source, channel)
+                           ORDER BY touch_ts, channel, source LIMIT 1)[OFFSET(0)] AS t
+          FROM touches
+          WHERE client_id IS NOT NULL
+          GROUP BY client_id
+        ),
+        inv AS (
+          SELECT im.order_id,
+                 ANY_VALUE(ft.t.source)                             AS source,
+                 ANY_VALUE(ft.t.channel)                            AS channel,
+                 ANY_VALUE(CAST(im.client_id AS STRING))            AS client_id,
+                 MAX(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS amt
+          FROM `{_BP}.InvoiceMaster` im
+          JOIN first_touch ft ON CAST(im.client_id AS STRING) = ft.client_id
+          WHERE im._clinic_id = @clinic_id
+            AND SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
+            AND {_date_between("SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)", w)}
+          GROUP BY im.order_id
+        )
+        -- Grouped by BOTH so the two breakdowns are folded from one row set in
+        -- Python. Querying them separately would let the source split and the
+        -- channel split disagree about the total they are each parts of.
+        SELECT source, channel,
+               SUM(amt)                  AS revenue,
+               COUNT(DISTINCT order_id)  AS invoices,
+               COUNT(DISTINCT client_id) AS patients
+        FROM inv
+        GROUP BY source, channel
+    """
+    params = [
+        bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
+        bigquery.ScalarQueryParameter("ztag", "STRING", ZOOLSTRA_REFERRAL_TAG),
+        *cio_params,
+    ]
+    try:
+        rows = list(_client().query(
+            sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
+    except Exception as exc:
+        log.warning("pipeline_revenue_by_source failed clinic=%s: %s", clinic_id, exc)
+        return out
+
+    # An order belongs to one patient, who has exactly one first touch, so every
+    # order lands in exactly one (source, channel) group — which is what makes
+    # summing these counts across groups safe rather than double-counting.
+    def _fold(rows_, key: str, seed: tuple[str, ...] = ()) -> list[dict]:
+        acc: dict[str, dict] = {
+            s: {key: s, "revenue": 0.0, "invoices": 0, "patients": 0} for s in seed
+        }
+        for r in rows_:
+            k = getattr(r, key)
+            slot = acc.setdefault(k, {key: k, "revenue": 0.0, "invoices": 0, "patients": 0})
+            slot["revenue"] += float(r.revenue or 0.0)
+            slot["invoices"] += int(r.invoices or 0)
+            slot["patients"] += int(r.patients or 0)
+        return sorted(acc.values(), key=lambda d: (-d["revenue"], d[key]))
+
+    by_source = _fold(rows, "source")
+    # Seeded with every channel so one that contributed nothing reports zero
+    # rather than vanishing — an absent channel reads as "not configured".
+    by_channel = _fold(rows, "channel", REVENUE_CHANNELS)
+
+    # Totals are summed from the breakdown rather than queried separately, so the
+    # headline figure and the charts drawn under it cannot drift apart.
+    out["by_source"] = by_source
+    out["by_channel"] = by_channel
+    out["revenue"] = sum(s["revenue"] for s in by_source)
+    out["invoices"] = sum(s["invoices"] for s in by_source)
+    out["patients"] = sum(s["patients"] for s in by_source)
+    return out
+
+
 def form_submission_outcomes(clinic_id: str, days: int = 90,
                              window: "Window | None" = None) -> dict[str, Any]:
     """Online form submissions and their outcomes for the window.
@@ -5794,11 +6074,41 @@ def form_capture(
     ``form_bookings`` (submitter matched to a PMS patient with an appointment
     on/after submission) and ``form_rate`` = form_bookings / submissions.
 
-    Covers two form sources: ``ClinicData.webforms`` (Jotform/relay clinics) and,
-    for CounselEar (Virsono) clinics, ``appt_referral_type = "Referral - Zoolstra"``
-    appointments that booked directly into the PMS. The two are summed."""
+    Covers two form sources, which are **counted separately and also summed**:
+
+    ``web`` — ``ClinicData.webforms``. A submission we observe at submit time,
+      carrying the full web-analytics block (gclid / utm_* / landing_page). This
+      is the only form population that can ever be tied to a campaign.
+
+    ``portal`` — for CounselEar (Virsono) clinics, the site's CounselEar booking
+      embed writes straight into the PMS; we never see a submission, only the
+      resulting ``appt_referral_type = "Referral - Zoolstra"`` appointment. No
+      gclid, no utm, no landing page — **structurally unattributable**, not
+      merely unattributed.
+
+    The top-level ``submissions`` / ``form_bookings`` / ``form_rate`` remain the
+    SUM of both, so existing consumers are unchanged. They are, however, a sum
+    of unlike things and only ``submissions`` is a clean total:
+
+    * ``form_rate`` mixes two metrics. On the web side it is submissions that
+      led to an appointment ÷ submissions (a BOOKING rate). On the portal side
+      every row is already an appointment, so its rate is kept ÷ booked (a SHOW
+      rate). Use ``web.form_rate`` when the question is "how many enquiries
+      converted"; the combined figure answers neither question.
+    * The two are windowed on different events — web on ``submitted_at``, portal
+      on ``appt_date`` — so a portal booking made in one month for a visit in the
+      next lands in the later window.
+    * Only the web block can ever carry a campaign, so any attribution-coverage
+      rate must use ``web.submissions`` as its denominator; the combined figure
+      depresses coverage by the size of a population that can never be covered.
+
+    See methodology-contract.md §14."""
     w = _win(window, days)
-    out = {"submissions": 0, "form_bookings": 0, "form_rate": None}
+    out = {
+        "submissions": 0, "form_bookings": 0, "form_rate": None,
+        "web":    {"submissions": 0, "form_bookings": 0, "form_rate": None},
+        "portal": {"submissions": 0, "form_bookings": 0, "form_rate": None},
+    }
     try:
         rows = list(_client().query(f"""
             WITH forms AS (
@@ -5835,14 +6145,22 @@ def form_capture(
         rows = []   # webforms unavailable; still fold in the CounselEar source below
     if rows:
         r = rows[0]
-        out["submissions"] = int(r.submissions or 0)
-        out["form_bookings"] = int(r.form_bookings or 0)
-    # Virsono: web-form submissions book directly into CounselEar as
-    # 'Referral - Zoolstra' appointments. Sum them in (no-op for other clinics).
+        out["web"]["submissions"]   = int(r.submissions or 0)
+        out["web"]["form_bookings"] = int(r.form_bookings or 0)
+    # Virsono: the site's CounselEar embed books directly into the PMS as
+    # 'Referral - Zoolstra' appointments. No-op for non-CounselEar clinics.
     z_sub, z_booked = _zoolstra_form_submissions(clinic_id, w)
-    out["submissions"] += z_sub
-    out["form_bookings"] += z_booked
-    out["form_rate"] = (out["form_bookings"] / out["submissions"]) if out["submissions"] else None
+    out["portal"]["submissions"]   = z_sub
+    out["portal"]["form_bookings"] = z_booked
+
+    def _rate(block: dict[str, int]) -> float | None:
+        return (block["form_bookings"] / block["submissions"]) if block["submissions"] else None
+
+    out["web"]["form_rate"]    = _rate(out["web"])
+    out["portal"]["form_rate"] = _rate(out["portal"])
+    out["submissions"]   = out["web"]["submissions"] + out["portal"]["submissions"]
+    out["form_bookings"] = out["web"]["form_bookings"] + out["portal"]["form_bookings"]
+    out["form_rate"]     = _rate(out)
     return out
 
 
@@ -5860,6 +6178,10 @@ def patient_contacts(
     return {
         "calls": calls["calls"],
         "forms": forms["submissions"],
+        # Split per §14: `forms_web` are observed submissions (attributable),
+        # `forms_portal` are CounselEar-embed bookings we only see downstream.
+        "forms_web": forms["web"]["submissions"],
+        "forms_portal": forms["portal"]["submissions"],
         "total": calls["calls"] + forms["submissions"],
     }
 
@@ -5902,8 +6224,10 @@ def headline_yoy(
 
     def _period(win: "Window | None") -> dict[str, Any]:
         if win is None:
-            return {"contacts": 0, "calls": 0, "forms": 0, "connected": 0,
-                    "booked": 0, "capture_rate": None, "form_rate": None, "revenue": 0.0}
+            return {"contacts": 0, "calls": 0, "forms": 0, "forms_web": 0,
+                    "forms_portal": 0, "connected": 0, "booked": 0,
+                    "capture_rate": None, "form_rate": None,
+                    "form_rate_web": None, "revenue": 0.0}
         calls = call_capture(clinic_id, invoca_campaign_ids, window=win)
         forms = form_capture(clinic_id, window=win)
         rev = invoice_revenue(clinic_id, window=win)
@@ -5911,10 +6235,20 @@ def headline_yoy(
             "contacts": calls["calls"] + forms["submissions"],
             "calls": calls["calls"],
             "forms": forms["submissions"],
+            # Per-source split (§14). `forms` stays the sum so the contacts
+            # total and every existing reader are unchanged.
+            "forms_web": forms["web"]["submissions"],
+            "forms_portal": forms["portal"]["submissions"],
             "connected": calls["connected"],
             "booked": calls["booked"],
             "capture_rate": calls["capture_rate"],
             "form_rate": forms["form_rate"],
+            # Web-only capture rate — the only one that means "submissions that
+            # led to a booking". The combined `form_rate` above is NOT that:
+            # every portal row is already an appointment, so its own rate is a
+            # SHOW rate (kept / booked), and summing the two mixes two different
+            # numerators over two different denominators. Prefer this one.
+            "form_rate_web": forms["web"]["form_rate"],
             "revenue": rev["revenue"],
         }
 

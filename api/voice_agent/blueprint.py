@@ -690,11 +690,17 @@ def appointment_decision(
     patient. See ``api/voice_agent/appointment_decision.py`` for the rule spec.
 
     Responses:
-      {status:"need_payer", options:[...]} — multiple funded payers on file;
+      {status:"need_payer", options:[...]} — multiple payer programs on file;
         the agent asks the caller and retries with ``payer_type``.
-      {status:"decided", outcome, reason, real_event_type_id, bookable, trace}
+      {status:"decided", outcome, reason, real_event_type_id, bookable,
+       earliest_bookable_date, self_pay_price, patient_context}
         — ``bookable`` is true only when the outcome maps to a
-        real_event_type_id that also has a placeholder pair configured.
+        real_event_type_id that also has a placeholder pair configured. The
+        three ``REFER_TO_STAFF_*`` outcomes are never bookable by design (not a
+        phase-1 gap): prior authorization, payer review, and under-age callers
+        all require a person. ``earliest_bookable_date`` is set when the
+        clean-and-check gap pushes the window out; ``self_pay_price`` only on
+        the self-pay offer.
     """
     from api.voice_agent.appointment_decision import (
         DecisionInputs, DecisionRules, decide, resolve_payer,
@@ -765,13 +771,23 @@ def appointment_decision(
             payer_type=payer,
             last_hearing_test_date=inputs_raw["last_hearing_test_date"],
             last_clinician_visit_date=inputs_raw["last_clinician_visit_date"],
+            last_clean_check_date=inputs_raw["last_clean_check_date"],
+            date_of_birth=inputs_raw["date_of_birth"],
+            warranty_expiry_date=inputs_raw["warranty_expiry_date"],
         ),
         DecisionRules(
             qualifying_plan_names=tuple(cfg.qualifying_plan_names),
             non_qualifying_plan_names=tuple(cfg.non_qualifying_plan_names),
             unknown_plan_allows_annual=cfg.unknown_plan_allows_annual,
+            expired_qualifying_allows_annual=cfg.expired_qualifying_allows_annual,
             payer_min_years=dict(cfg.payer_min_years),
+            payer_actions=dict(cfg.payer_actions),
             clinician_visit_threshold_years=cfg.clinician_visit_threshold_years,
+            self_pay_annual_price=cfg.self_pay_annual_price,
+            minor_age_threshold=cfg.minor_age_threshold,
+            min_months_after_clean_check=cfg.min_months_after_clean_check,
+            warranty_bundle_trigger_months=cfg.warranty_bundle_trigger_months,
+            warranty_bundle_window_months=cfg.warranty_bundle_window_months,
         ),
     )
 
@@ -800,6 +816,31 @@ def appointment_decision(
         "reason": decision.reason,
         "real_event_type_id": real_id if bookable else None,
         "bookable": bookable,
+        # HARD floor (clean-and-check gap) — the agent may never offer earlier.
+        "earliest_bookable_date": (
+            decision.earliest_bookable_date.isoformat()
+            if decision.earliest_bookable_date else None
+        ),
+        # SOFT warranty-bundling target. The agent offers inside this window
+        # first and explains why, but books outside it if the caller can't make
+        # it — deliberately not merged with the hard floor above, because the
+        # two must be negotiable to different degrees.
+        "preferred_window": (
+            {
+                "start": decision.preferred_earliest_date.isoformat(),
+                "end": decision.preferred_latest_date.isoformat(),
+                "reason": "warranty_bundling",
+                "warranty_expiry": (
+                    decision.warranty_expiry_date.isoformat()
+                    if decision.warranty_expiry_date else None
+                ),
+            }
+            if decision.preferred_earliest_date and decision.preferred_latest_date
+            else None
+        ),
+        # Only present on the self-pay offer — the price the agent must quote
+        # and get agreement on before booking.
+        "self_pay_price": decision.self_pay_price,
         "patient_context": {
             "care_plan": inputs_raw["care_plan_name"],
             "care_plan_active": bool(expiry and expiry >= today),

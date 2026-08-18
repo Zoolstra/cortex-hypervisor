@@ -443,3 +443,110 @@ def test_coverage_empty_when_no_table_and_no_registry(coverage_harness, monkeypa
     resp = client.get("/webforms/coverage")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+# ── Ad-click identifier extraction ────────────────────────────────────────────
+
+def test_attribution_reads_click_ids_from_landing_page():
+    """gbraid / gad_campaignid arrive ONLY in the landing URL today — no form
+    sends them as hidden fields — so the fallback is the whole feature."""
+    lp = ("/brand-official-cec?matchtype=p&keyword=hearing%20places"
+          "&gad_source=1&gad_campaignid=22788881937"
+          "&gbraid=0AAAAADmeCYZRgOvoUrY7oEIU5gZjT70N5&gclid=Cj0KCQjw7eXT")
+    got = webforms._attribution({"landing_page": lp})
+    assert got["gad_campaignid"] == "22788881937"
+    assert got["gbraid"] == "0AAAAADmeCYZRgOvoUrY7oEIU5gZjT70N5"
+    assert got["gclid"] == "Cj0KCQjw7eXT"
+    assert got["wbraid"] is None
+
+
+def test_attribution_prefers_explicit_field_over_url():
+    got = webforms._attribution({
+        "gclid": "from-field",
+        "landing_page": "/x?gclid=from-url&gbraid=g1",
+    })
+    assert got["gclid"] == "from-field"
+    assert got["gbraid"] == "g1"          # no field → URL still used
+
+
+def test_attribution_rejects_nan_and_blank_sentinels():
+    """'nan' is the ETL's absent-marker (queries.py:574) and a bare '?gclid='
+    must not become an empty-string id that reads as present."""
+    assert webforms._attribution({"gclid": "nan", "landing_page": "/x"})["gclid"] is None
+    assert webforms._attribution({"landing_page": "/x?gclid=nan"})["gclid"] is None
+    assert webforms._attribution({"landing_page": "/x?gclid="})["gclid"] is None
+
+
+def test_attribution_handles_missing_and_querystringless_urls():
+    for lp in (None, "", "/no-query-string"):
+        got = webforms._attribution({"landing_page": lp})
+        assert all(v is None for v in got.values()), lp
+
+
+# ── utm_source / referrer split ───────────────────────────────────────────────
+
+def test_utm_moves_referrer_host_out_of_utm_source():
+    """The sites write document.referrer's host into the utm_source field when
+    the visit carried no UTM tags. That is not a campaign source."""
+    got = webforms._utm({"utm_source": "google.com", "landing_page": "/contact"})
+    assert got["utm_source"] is None
+    assert got["referrer_host"] == "google.com"
+
+
+def test_utm_keeps_genuine_utm_whose_value_looks_like_a_host():
+    """`?utm_source=chatgpt.com` is a REAL tag whose value happens to be a
+    hostname — this row exists in production. Provenance decides, not shape."""
+    got = webforms._utm({
+        "utm_source": "chatgpt.com",
+        "landing_page": "/contact?utm_source=chatgpt.com",
+    })
+    assert got["utm_source"] == "chatgpt.com"
+    assert got["referrer_host"] is None
+
+
+def test_utm_url_params_beat_the_form_field():
+    got = webforms._utm({
+        "utm_source": "google.com",           # referrer fallback from the site
+        "landing_page": "/lp?utm_source=newsletter&utm_medium=email",
+    })
+    assert got["utm_source"] == "newsletter"
+    assert got["utm_medium"] == "email"
+    assert got["referrer_host"] is None       # a real tag was present
+
+
+def test_utm_treats_direct_and_android_package_as_referrers():
+    for value in ("direct", "com.google.android.googlequicksearchbox",
+                  "ca.search.yahoo.com"):
+        got = webforms._utm({"utm_source": value, "landing_page": "/"})
+        assert got["utm_source"] is None, value
+        assert got["referrer_host"] == value, value
+
+
+def test_utm_passes_through_a_plain_campaign_source():
+    got = webforms._utm({"utm_source": "spring-promo", "landing_page": "/"})
+    assert got["utm_source"] == "spring-promo"
+    assert got["referrer_host"] is None
+
+
+def test_utm_honours_referrer_host_sent_explicitly_by_a_fixed_site():
+    """After the site fix the referrer arrives in its OWN field and utm_source is
+    genuinely empty. The salvage path must not blank it."""
+    got = webforms._utm({
+        "utm_source": None,
+        "referrer_host": "google.com",
+        "landing_page": "/contact",
+    })
+    assert got["referrer_host"] == "google.com"
+    assert got["utm_source"] is None
+
+
+def test_utm_explicit_referrer_host_wins_over_the_salvaged_one():
+    """Mixed fleet: one site deployed, another still on the old build. An
+    explicit value must never be overwritten by the utm_source salvage."""
+    got = webforms._utm({
+        "utm_source": "bing.com",        # old-build fallback
+        "referrer_host": "google.com",   # new-build explicit
+        "landing_page": "/",
+    })
+    assert got["referrer_host"] == "google.com"
+    assert got["utm_source"] is None

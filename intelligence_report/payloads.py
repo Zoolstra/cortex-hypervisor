@@ -46,13 +46,52 @@ def _parallel(tasks: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# ── PMS coverage ─────────────────────────────────────────────────────────────
+
+# The PMS types that actually land data in ``PMS_Unified`` (appointments,
+# invoices, patients). Anything else — ``none``, and ``audit_data`` until that
+# feed exists — means the clinic has NO practice-management integration.
+#
+# This matters for how the report READS, not just what it computes: every
+# PMS-derived query returns zeros for such a clinic (that is deliberate — a
+# missing integration must never blank a page), so an unlabelled report shows
+# "0 booked appointments" and "$0 revenue", which a reader takes as a real
+# result rather than an absent measurement. The payload therefore carries the
+# integration state explicitly so the UI can say "not measurable here" instead
+# of rendering those zeros.
+PMS_WITH_DATA = frozenset({"blueprint", "counselear"})
+
+
+def pms_integrated(pms_type: str | None) -> bool:
+    """True when the clinic's PMS feeds revenue + appointment data."""
+    return (pms_type or "none") in PMS_WITH_DATA
+
+
+# What a report cannot say without a PMS integration. Kept here (not in the UI)
+# so the clinic page, the biweekly and the group rollup all disclose the same
+# thing, and so the LLM copy is held to it too.
+NO_PMS_CAVEAT = (
+    "This clinic has no practice-management (PMS) integration, so revenue and "
+    "the link from call/form traffic to booked appointments cannot be "
+    "calculated. Every appointment, booking and revenue figure is absent — not "
+    "zero."
+)
+
+
 # ── Forward recommendations (LLM) ────────────────────────────────────────────
 
 _REC_FALLBACK: list[dict] = []
 
 
-def forward_recommendations(clinic_name: str, metrics: dict[str, Any]) -> list[dict]:
+def forward_recommendations(clinic_name: str, metrics: dict[str, Any],
+                            caveat: str | None = None) -> list[dict]:
     """Top-3 next moves derived from the computed Overview metrics, via Claude.
+
+    ``caveat`` is prepended to the prompt when some of the metrics are not
+    measurable for this clinic (no PMS integration, or only some locations in a
+    group have one). Without it the model reads an absent measurement as a real
+    zero and confidently recommends fixing a revenue collapse that is really a
+    missing feed.
 
     Returns a list of ``{move, why, data, owner}``; an empty list on any failure
     (no key, timeout, bad JSON) so the section degrades gracefully.
@@ -65,7 +104,12 @@ def forward_recommendations(clinic_name: str, metrics: dict[str, Any]) -> list[d
         "the data, the specific 'data' figure behind it, and an 'owner' — one of "
         "'Cortex', 'Client', or 'Shared'. Be concrete and non-obvious; no "
         "preamble. Respond with ONLY a JSON array of exactly 3 objects with keys "
-        "move, why, data, owner.\n\n" + facts
+        "move, why, data, owner.\n\n"
+        + (f"IMPORTANT — {caveat} Never cite a revenue, booking or appointment "
+           "figure that is unavailable, and never describe one as a decline or "
+           "a zero. Base every move on the metrics that ARE measured.\n\n"
+           if caveat else "")
+        + facts
     )
     try:
         import anthropic
@@ -184,6 +228,7 @@ def build_overview(
     w = window
     win_start = w.start_date
     win_end_incl = (w.end_excl - _one_day()).isoformat()
+    has_pms = pms_integrated(pms_type)
 
     # System-performance + operational-health KPIs are computed for EVERY month
     # in the window (the trend); the month-over-month stats are the last two.
@@ -238,6 +283,15 @@ def build_overview(
         "clinic_id": clinic_id,
         "clinic_name": clinic_name,
         "tier": tier,
+        # PMS integration state. The readers below return zeros for a clinic
+        # with no PMS feed, so the page needs to know the difference between
+        # "measured zero" and "not measurable" — see PMS_WITH_DATA. The caveat
+        # sentence ships with the payload (rather than living in the UI) so the
+        # clinic page, the biweekly and the group rollup all say the same thing,
+        # and so the LLM copy above is written under the same constraint.
+        "pms_type": pms_type,
+        "pms_integrated": has_pms,
+        "pms_caveat": None if has_pms else NO_PMS_CAVEAT,
         "window": {"start": win_start, "end": win_end_incl},
         "mom": {"month": cur.get("month"), "prior_month": prev.get("month")},
         "headline": {
@@ -320,7 +374,8 @@ def build_overview(
             log.warning("one_thing failed clinic=%s: %s", clinic_name, exc)
             payload["headline"]["one_thing"] = None
         try:
-            payload["recommendations"] = forward_recommendations(clinic_name, payload)
+            payload["recommendations"] = forward_recommendations(
+                clinic_name, payload, caveat=None if has_pms else NO_PMS_CAVEAT)
         except Exception as exc:                       # pragma: no cover - defensive
             log.warning("recommendations failed clinic=%s: %s", clinic_name, exc)
             payload["recommendations"] = []
@@ -331,10 +386,16 @@ def build_overview(
 
 def _one_thing_sentence(clinic_name: str, payload: dict) -> str | None:
     """One-sentence 'the thing that matters this month', LLM-written from the
-    YoY headline block. Returns None on failure (the UI hides the line)."""
+    YoY headline block. Returns None on failure (the UI hides the line).
+
+    Reads the PMS caveat off the payload rather than taking it as an argument,
+    so the group builder (which assembles its payload elsewhere) gets the same
+    treatment for free."""
     yoy = (payload.get("headline") or {}).get("yoy") or {}
     if not yoy:
         return None
+    caveat = payload.get("pms_caveat") or (
+        None if payload.get("pms_integrated", True) else NO_PMS_CAVEAT)
     facts = json.dumps({
         "yoy": yoy,
         "leakage": (payload.get("operational_health") or {}).get("revenue_leakage"),
@@ -345,7 +406,11 @@ def _one_thing_sentence(clinic_name: str, payload: dict) -> str | None:
         "intelligence dashboard. From the year-over-year figures below, write ONE "
         "sentence (max 30 words) naming the most important thing right now: lead "
         "with the direction/trend, plain language, a specific number, no preamble, "
-        "no hedging. Return only the sentence.\n\n" + facts
+        "no hedging. Return only the sentence.\n\n"
+        + (f"IMPORTANT — {caveat} Do not cite or characterise any revenue, "
+           "booking or appointment figure; write the sentence from the call and "
+           "form traffic instead.\n\n" if caveat else "")
+        + facts
     )
     try:
         import anthropic
@@ -442,7 +507,8 @@ def build_group_overview(
             log.warning("group one_thing failed instance=%s: %s", instance_name, exc)
             payload["headline"]["one_thing"] = None
         try:
-            payload["recommendations"] = forward_recommendations(instance_name, payload)
+            payload["recommendations"] = forward_recommendations(
+                instance_name, payload, caveat=payload.get("pms_caveat"))
         except Exception as exc:                       # pragma: no cover - defensive
             log.warning("group recommendations failed instance=%s: %s", instance_name, exc)
             payload["recommendations"] = []
@@ -499,6 +565,9 @@ def build_biweekly(
         "clinic_id": clinic_id,
         "clinic_name": clinic_name,
         "pms_type": pms_type,
+        # Same contract as the Overview: without a PMS feed the appointment,
+        # booking and revenue blocks below are absent measurements, not zeros.
+        "pms_integrated": pms_integrated(pms_type),
         "window": {"start": w.start_date, "end": (w.end_excl - _one_day()).isoformat()},
         "appointments": {
             "total": appts.get("total", 0),

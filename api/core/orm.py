@@ -11,7 +11,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger, Boolean, CHAR, Column, DateTime, Enum, ForeignKey,
-    Integer, SmallInteger, String, Text, UniqueConstraint, func,
+    Index, Integer, SmallInteger, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -126,6 +126,9 @@ class Clinic(Base):
         back_populates="clinic", cascade="all, delete-orphan"
     )
     voice_agent_qualifying_questions: Mapped[list["ClinicVoiceAgentQualifyingQuestion"]] = relationship(
+        back_populates="clinic", cascade="all, delete-orphan"
+    )
+    voice_agent_faqs: Mapped[list["ClinicVoiceAgentFaq"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
     )
     capabilities: Mapped[list["VoiceAgentCapability"]] = relationship(
@@ -463,6 +466,63 @@ class ClinicVoiceAgentQualifyingQuestion(Base):
     )
 
     clinic: Mapped["Clinic"] = relationship(back_populates="voice_agent_qualifying_questions")
+
+
+# ──────────────────── voice_agent FAQ (N) ────────────────────
+
+class ClinicVoiceAgentFaq(Base):
+    """Per-clinic curated FAQ the agent retrieves at call time.
+
+    Deliberately NOT prompt content. The agent reaches these through the
+    ``faq_lookup`` protocol's ``answer_clinic_question`` tool, which runs a
+    semantic search over ``ClinicData.faq_embeddings``. Keeping the corpus out
+    of the system prompt is what lets it grow without diluting the booking
+    spine (see ``api/voice_agent/roles.py`` on salience inversion).
+
+    Approval is config, so it lives here rather than on
+    ``ClinicData.faq.voice_assistant`` — see alembic 0023 for why. ``source``
+    marks whether a row is a transcript-derived LLM extraction ('etl',
+    imported unapproved) or human-authored ('manual').
+
+    ``embedding_synced_at`` is the seam to BigQuery: NULL on an approved row
+    means the embedding hasn't landed, so the agent cannot retrieve it yet.
+    That is the drift signal — reconcile on it, not on ``approved`` alone.
+    """
+    __tablename__ = "clinic_voice_agent_faq"
+    # Mirrors alembic 0023. Declared here too so metadata.create_all (tests)
+    # enforces the same idempotency the import path relies on.
+    __table_args__ = (
+        UniqueConstraint("clinic_id", "question", name="uq_va_faq_clinic_question"),
+        Index("ix_va_faq_clinic_approved", "clinic_id", "approved"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    question: Mapped[str] = mapped_column(String(512), nullable=False)
+    answer:   Mapped[str] = mapped_column(Text, nullable=False)
+    source:   Mapped[str] = mapped_column(
+        Enum("etl", "manual", name="va_faq_source_enum"),
+        nullable=False, server_default="manual",
+    )
+    source_call_id: Mapped[str | None] = mapped_column(String(128))
+    approved:    Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="0")
+    approved_by: Mapped[str | None] = mapped_column(String(255))
+    embedding_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="voice_agent_faqs")
 
 
 # ──────────────────── voice_agent_capabilities (N) ────────────────────

@@ -38,6 +38,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from google.cloud import bigquery
@@ -93,6 +94,20 @@ def _ensure_table() -> None:
         bigquery.SchemaField("utm_content",  "STRING"),
         bigquery.SchemaField("gclid",        "STRING"),
         bigquery.SchemaField("fbclid",       "STRING"),
+        # Paid-click identifiers beyond gclid. Google sends `gbraid` (app/web
+        # cross-device) or `wbraid` (iOS, post-ATT) INSTEAD of a gclid on a large
+        # and growing share of clicks, so a gclid-only capture silently loses
+        # them: 7 of the first 8 attributable submissions carried a gbraid.
+        # `gad_campaignid` is the strongest key of the three — it IS the campaign
+        # id, so it needs no ad_clicks_v2 join and is therefore immune to that
+        # table's 7-day click settle window.
+        bigquery.SchemaField("gbraid",         "STRING"),
+        bigquery.SchemaField("wbraid",         "STRING"),
+        bigquery.SchemaField("gad_campaignid", "STRING"),
+        # The referring site's host, when the visit carried no UTM parameters.
+        # Split out of utm_source by _utm() — see that docstring for why the two
+        # were conflated and how they are told apart.
+        bigquery.SchemaField("referrer_host",  "STRING"),
         bigquery.SchemaField("landing_page", "STRING"),
         bigquery.SchemaField("customer_type", "STRING"),
         bigquery.SchemaField("message",       "STRING"),
@@ -113,10 +128,136 @@ def _ensure_table() -> None:
     # Check existence first so we don't issue a create — and log a benign
     # "Already Exists" audit error — on every cold start.
     try:
-        bq_client.get_table(WEBFORMS_TABLE)
+        existing = bq_client.get_table(WEBFORMS_TABLE)
     except NotFound:
         bq_client.create_table(bigquery.Table(WEBFORMS_TABLE, schema=schema))
+        _table_ready = True
+        return
+    # Additively reconcile: a table created before a column was added keeps its
+    # old schema forever, and the insert would then fail on the unknown field.
+    # ONLY appends NULLABLE columns — never removes, reorders or retypes, so it
+    # cannot destroy data and needs no migration step on deploy.
+    have = {f.name for f in existing.schema}
+    missing = [f for f in schema if f.name not in have]
+    if missing:
+        existing.schema = list(existing.schema) + missing
+        bq_client.update_table(existing, ["schema"])
+        log.info("webforms: added columns %s", ", ".join(f.name for f in missing))
     _table_ready = True
+
+
+# ── Attribution extraction ────────────────────────────────────────────────────
+
+# Ad-click identifiers we lift off the landing URL. `gad_campaignid` is not a
+# click id but rides in the same query string and is the most directly useful of
+# the set.
+_ATTRIBUTION_PARAMS = ("gclid", "gbraid", "wbraid", "fbclid", "gad_campaignid")
+
+
+def _query_params(url: str | None) -> dict[str, str]:
+    """Query params off a stored ``landing_page``.
+
+    Values are relative paths (``/brand-official?gad_source=1&…``) — urlsplit
+    parses the query regardless of a missing scheme/host, so no normalisation is
+    needed. ``keep_blank_values=False`` so a bare ``?gclid=`` yields nothing
+    rather than an empty-string id that would read as "present".
+    """
+    if not url or "?" not in url:
+        return {}
+    try:
+        qs = urlsplit(url).query
+    except ValueError:      # malformed URL (e.g. bad IPv6 literal)
+        return {}
+    return {
+        k: v[0].strip()
+        for k, v in parse_qs(qs, keep_blank_values=False).items()
+        if v and v[0].strip()
+    }
+
+
+_UTM_KEYS = ("utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content")
+
+# A bare hostname (`google.com`, `ca.search.yahoo.com`, and Android's
+# `com.google.android.googlequicksearchbox`) or the literal `direct`.
+_REFERRER_RE = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$", re.I)
+
+
+def _utm(fields: dict) -> dict[str, str | None]:
+    """Real UTM parameters, with the site's referrer fallback split back out.
+
+    **The bug this fixes.** Every site feeding these endpoints — Jotform-hosted
+    and JSON-relay alike — populates a hidden field named ``utm_source``. When
+    the visit carries no UTM parameters the site writes ``document.referrer``'s
+    HOST into it instead of leaving it empty. So the column reads `google.com`,
+    `bing.com`, `chatgpt.com`, `direct` — referrers, not campaign sources — and
+    `utm_medium` is never populated at all. Anything grouping by ``utm_source``
+    (``webform_funnel``) was therefore reporting referrers as campaign sources.
+
+    **How they are told apart: provenance, not shape.** A UTM parameter present
+    in the landing URL's query string is real, full stop. A value that arrives
+    only in the form field, with no ``utm_source=`` in the URL, is the site's
+    referrer fallback. Shape alone cannot decide this — `?utm_source=chatgpt.com`
+    is a genuine campaign tag whose value happens to be a hostname, and it
+    appears in this data — so the URL is checked first and wins.
+
+    The referrer is preserved in its own ``referrer_host`` key rather than
+    discarded: knowing a lead arrived from organic Google is useful, it simply
+    is not a campaign source.
+    """
+    params = _query_params(fields.get("landing_page"))
+    # An explicitly-sent referrer_host is authoritative: the sites were fixed to
+    # send it in its own field rather than smuggled inside utm_source. Seed from
+    # it so the salvage path below only ever fills the gap left by an OLD site
+    # build — otherwise the fixed sites' value would be silently dropped here.
+    explicit_referrer = fields.get("referrer_host")
+    explicit_referrer = (explicit_referrer.strip()
+                         if isinstance(explicit_referrer, str) else explicit_referrer)
+    out: dict[str, str | None] = {"referrer_host": explicit_referrer or None}
+    for key in _UTM_KEYS:
+        from_url = params.get(key)
+        if from_url:
+            out[key] = from_url          # a real UTM parameter — authoritative
+            continue
+        value = fields.get(key)
+        value = value.strip() if isinstance(value, str) else value
+        if not value:
+            out[key] = None
+            continue
+        if key == "utm_source" and (
+            value.lower() == "direct" or _REFERRER_RE.match(value)
+        ):
+            # Site's referrer fallback wearing a utm_source label. Move it —
+            # but never over an explicit referrer_host from a fixed site build.
+            out["referrer_host"] = out["referrer_host"] or value
+            out[key] = None
+        else:
+            out[key] = value
+    return out
+
+
+def _attribution(fields: dict) -> dict[str, str | None]:
+    """Resolve every ad-click identifier: explicit form field first, landing-page
+    query string as fallback.
+
+    Field-first ordering matters for forward compatibility — the site currently
+    sends only ``gclid`` as a hidden field, so the URL is the sole source for the
+    rest; when the site starts posting them properly the field wins with no code
+    change here. It also means a form that captured the click id at a DIFFERENT
+    moment than the landing hit is trusted over the URL.
+    """
+    params = _query_params(fields.get("landing_page"))
+    out: dict[str, str | None] = {}
+    for key in _ATTRIBUTION_PARAMS:
+        explicit = fields.get(key)
+        explicit = explicit.strip() if isinstance(explicit, str) else explicit
+        # 'nan' is the sentinel the ETL treats as absent (queries.py:574); reject
+        # it here too so it never reaches a column that downstream joins on.
+        if explicit and explicit.lower() != "nan":
+            out[key] = explicit
+        else:
+            value = params.get(key)
+            out[key] = value if value and value.lower() != "nan" else None
+    return out
 
 
 # ── Shared insert ─────────────────────────────────────────────────────────────
@@ -129,6 +270,8 @@ def _store_submission(clinic: Clinic, fields: dict) -> None:
     server-side. Raises 500 if BigQuery rejects the row.
     """
     _ensure_table()
+    attr = _attribution(fields)
+    utm = _utm(fields)
     row = {
         "clinic_id":     clinic.clinic_id,
         "clinic_name":   clinic.clinic_name,
@@ -136,13 +279,22 @@ def _store_submission(clinic: Clinic, fields: dict) -> None:
         "last_name":     fields.get("last_name"),
         "phone_number":  fields.get("phone_number"),
         "email":         fields.get("email"),
-        "utm_source":    fields.get("utm_source"),
-        "utm_medium":    fields.get("utm_medium"),
-        "utm_campaign":  fields.get("utm_campaign"),
-        "utm_term":      fields.get("utm_term"),
-        "utm_content":   fields.get("utm_content"),
-        "gclid":         fields.get("gclid"),
-        "fbclid":        fields.get("fbclid"),
+        # From _utm, NOT straight off `fields`: the sites write the referrer host
+        # into utm_source when no campaign tag is present, and that must not be
+        # stored as a campaign source.
+        "utm_source":    utm["utm_source"],
+        "utm_medium":    utm["utm_medium"],
+        "utm_campaign":  utm["utm_campaign"],
+        "utm_term":      utm["utm_term"],
+        "utm_content":   utm["utm_content"],
+        "referrer_host": utm["referrer_host"],
+        # Click ids come from _attribution (form field, else the landing URL) —
+        # NOT straight off `fields`, or the gbraid-only submissions land blank.
+        "gclid":          attr["gclid"],
+        "fbclid":         attr["fbclid"],
+        "gbraid":         attr["gbraid"],
+        "wbraid":         attr["wbraid"],
+        "gad_campaignid": attr["gad_campaignid"],
         "landing_page":  fields.get("landing_page"),
         "customer_type": fields.get("customer_type"),
         "message":       fields.get("message"),
@@ -291,6 +443,11 @@ def _parse_jotform(raw_request: str) -> dict:
         "utm_content":   _clean(tracking("utm_content")),
         "gclid":         _clean(tracking("gclid")),
         "fbclid":        _clean(tracking("fbclid")),
+        # Not configured as hidden fields on any form today — read anyway so the
+        # form wins over the URL the moment they are added, per _attribution().
+        "gbraid":         _clean(tracking("gbraid")),
+        "wbraid":         _clean(tracking("wbraid")),
+        "gad_campaignid": _clean(tracking("gad_campaignid")),
         "landing_page":  _clean(tracking("landing_page")),
         "customer_type": customer_type,
         "message":       _clean(message),

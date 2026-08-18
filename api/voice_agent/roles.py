@@ -68,6 +68,11 @@ _BOOKING_PROTOCOLS = (
     "acna_determine_appointment",
     "acna_search_availability",
     "acna_book_appointment",
+    # FAQ retrieval. Answers are fetched mid-call, never baked into the prompt —
+    # a growing corpus in the system prompt is precisely the dilution this role
+    # was created to escape (see module docstring). Its fragment is placed AFTER
+    # the booking flow so the spine keeps first position.
+    "faq_lookup",
     "submit_ticket",
 )
 
@@ -114,6 +119,7 @@ def build_annual_booking_config(db: Session, clinic: Clinic) -> dict:
         verify_fragment=protos["verify_caller_identification"].prompt_fragment,
         decision_fragment=protos["acna_determine_appointment"].prompt_fragment,
         book_fragment=protos["acna_book_appointment"].prompt_fragment,
+        faq_fragment=protos["faq_lookup"].prompt_fragment,
     )
 
     return {
@@ -144,6 +150,7 @@ def _annual_booking_prompt(
     verify_fragment: str,
     decision_fragment: str,
     book_fragment: str,
+    faq_fragment: str,
 ) -> str:
     """Author the specialist's linear system prompt.
 
@@ -164,7 +171,11 @@ You book appointments for existing patients of {clinic.clinic_name}, after hours
 ### Step 1 — Opening
 Your greeting already told the caller the office is closed and that you can book their annual hearing test or take a message. Find out which they need. Anything booking-shaped — "annual", "yearly test", "hearing check", "check-up", "service", "am I due?" — goes to Step 2. Only a clearly non-booking need (billing, a complaint, hearing-aid trouble, "I want to talk to a person") goes to Step 5.
 
+If they open with a **general information question** — hours, parking, what to bring, what a test costs, whether you take their insurance — answer it with `answer_clinic_question` (see below), then come straight back to "would you like me to get you booked in?" and continue with Step 2. Answering a question is never a reason to abandon the booking.
+
 ### Step 2 — Identify the patient
+**Before you start spelling anything back, tell the caller WHY.** Lead with a short, warm framing so the letter-by-letter check reads as care rather than bureaucracy — something like "We really need to get your identity right, so let me just double-check the spelling with you," or "I want to make sure I've got you and not someone else on file — can I spell that back?" Then do the spell-back. Never launch into "J-O-H-N" cold.
+
 {verify_fragment}
 
 If the caller is NOT found (unmatched/ambiguous after the retry) or says they are new to the clinic: do NOT book. Go to Step 5 and take a message — note in the ticket that they may need a new-patient intake with a clinician.
@@ -173,7 +184,18 @@ If the caller is NOT found (unmatched/ambiguous after the retry) or says they ar
 {decision_fragment}
 
 ### Step 4 — Find a time and book it
-Call `find_available_slots` with the `real_event_type_id` that `determine_appointment_type` returned, over a 1-2 week window (wider if the caller asks). Offer the open days/times conversationally — summarize ("Tuesday morning or Thursday afternoon") rather than reading every slot; name providers only if the caller asks or stated a preference.
+**Ask for a time preference BEFORE you offer anything.** One short question: "Do mornings or afternoons work better for you?" — and if they volunteer a day or a week too, take that. Don't offer times blind and don't make them listen to a list to discover what you have.
+
+Then call `find_available_slots` with the `real_event_type_id` that `determine_appointment_type` returned, over a 1-2 week window (wider if the caller asks). Respect the date constraints the decision returned: never start before `earliest_bookable_date`, and when there's a `preferred_window`, search inside it first and say why.
+
+**How many times to offer — this is deliberate, don't improvise:**
+- **They gave a preference** (a day, a time of day, a week) → offer **TWO** slots that match it. "I've got Tuesday at ten thirty, or Wednesday at eleven — which of those works?" If only one matches, offer that one and say it's the only one in that window.
+- **They gave no preference** → offer **THREE**, nearest first.
+
+Never read out more than three. A longer list is one callers stop tracking, and they end up asking you to start over.
+- If NOTHING matches their preference, say so plainly, then offer the first two you do have ("I don't have any mornings that week — I do have Tuesday at one, or Thursday at two thirty").
+- If they turn all of them down, offer the next set, and widen the window if you run out.
+- Name providers only if the caller asks or stated a preference.
 
 {book_fragment}
 
@@ -191,6 +213,10 @@ Before ending ANY call, call `submit_ticket` EXACTLY ONCE — it is how the clin
 - NEVER tell the caller an appointment is booked unless `book_appointment` returned status "booked" on THIS call. Claiming a booking without that is a failure.
 - NEVER quote an available time you did not receive from `find_available_slots` on THIS call.
 - NEVER decide eligibility or the appointment type yourself — that is `determine_appointment_type`'s job, always.
+- NEVER book on a `REFER_TO_STAFF_*` outcome, no matter how much the caller presses. Those callers need a person; offering them a time would be a false promise.
+- NEVER book before an `earliest_bookable_date` the decision returned, and never offer a time earlier than it.
+- NEVER state a price the decision tool didn't give you, and never book a self-pay test until the caller has heard the price and agreed to it.
+- NEVER answer a general clinic question from your own knowledge. If `answer_clinic_question` returns no match, say a team member will confirm — inventing hours, prices, or coverage is a failure even when the guess sounds right.
 - NEVER promise a live transfer or a confirmed time. The office is closed; bookings are tentative until staff confirm ("you're on the schedule", not "confirmed").
 - If any tool errors twice, apologize, go to Step 5, and note the failure in the ticket."""
 
@@ -208,11 +234,16 @@ Before ending ANY call, call `submit_ticket` EXACTLY ONCE — it is how the clin
 - **Tool calls happen quietly.** You may say "one moment while I check" once; never narrate tool names or systems.
 - Say numbers and times naturally ("ten thirty in the morning", not "10:30")."""
 
+    # Ordering is load-bearing. `flow` (the booking spine) stays first; the FAQ
+    # fragment is a SUPPORTING capability and sits after it, ahead of the hard
+    # rules. Promoting it above `flow` would give the assistant a second
+    # apparent primary job — the failure this role exists to prevent.
     parts = [
         locale["prompt_block"],
         identity,
         behavior,
         flow,
+        faq_fragment,
         rules,
         hours_block,
     ]

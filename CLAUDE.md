@@ -111,10 +111,84 @@ in `require_read_access` — do not assume it exists.
 | `PATCH /v2/admin/users/{uid}/role` | super_admin | Sets the claim. Refuses self-demotion (that would lock you out of the endpoint that undoes it). |
 | `PUT /v2/admin/users/{uid}/instances` | super_admin | Replaces the `clinic_admins` grant set. Does NOT touch `primary_contact_uid` — ownership is a different relationship. |
 | `DELETE /v2/admin/users/{uid}` | super_admin | Removes grants, then the Firebase user (that order leaves recoverable orphan rows on failure rather than grants pointing at a reusable uid). Refuses self-deletion, and refuses any user who is an instance's `primary_contact_uid` — reassign ownership first. |
+| `POST /v2/admin/provision` | super_admin | Stands up a client: get-or-create the primary contact's Firebase user, give them `admin` **only if they have no claim**, then `provision_full_account` (instance + clinics + their 1:1 sub-tables) in one transaction. Refuses a contact who already owns an instance (409) — `GET /instance/{uid}` returns one row per uid and cannot represent two. Returns a `password_reset_link` when it created the account; there is no SMTP, so the admin forwards it. |
 
 The SPA surfaces all of this at `/admin/users` (`cortex-spa/src/routes/AdminUsers.tsx`),
 reachable from a super-admin-only button on `/`. The client-side role check is
 convenience; every call is gated server-side.
+
+### Provisioning (`api/v2/provision.py`)
+
+Re-homed from the Next app's `/api/admin/provision` server route, which needed
+the Firebase Admin SDK and so could not move to a static SPA — provisioning was
+simply missing from cortex-spa until this landed.
+
+The Next route ran outside the hypervisor, so to call `POST /provision_account/`
+it had to *become* the target user: create/lookup the Firebase user, mint a
+custom token, exchange it at the Identity Toolkit for an ID token using
+`firebase-web-api-key`, then send that as the Bearer. In-process there is no HTTP
+hop, so the custom token, the exchange, and that secret dependency are all gone;
+the handler calls `provision_full_account` directly with the verified super_admin
+caller. What the exchange implied is kept explicitly (existing role claims are
+never overwritten; a uid that already owns an instance is refused).
+
+Firebase and Cloud SQL cannot share a transaction, so **every refusal is checked
+before Firebase is touched** — the common failure (already provisioned) creates
+nothing. After that point a DB failure leaves an account with no instance, which
+is recoverable and harmless: `admin` with no membership reaches nothing.
+
+`ProvisionRequestV2.instance` also accepts the two **upstream account ids**
+(`google_ads_customer_id`, `invoca_profile_id`). They are INSTANCE columns — one
+ads account and one Invoca profile serve every location of a business — and the
+ETL reads them to decide what to pull, so setting them at provisioning is what
+lets a new client's data start flowing without a follow-up config pass. Both are
+optional, and blank normalises to **NULL, never `""`**: the ETL tests these for
+presence and an empty string is truthy in a SQL join. Edited afterwards through
+the existing `PATCH /instance/{instance_id}`.
+
+Two creation paths, deliberately separate endpoints:
+
+| Need | Endpoint | Creates |
+|---|---|---|
+| New business | `POST /v2/admin/provision` | Firebase user + instance + its first clinics |
+| New location for an existing client | `POST /clinics/{instance_id}` | clinic only |
+
+Frontend: both live on the **clinic picker** (`cortex-spa/src/routes/ClinicPicker.tsx`,
+at `/intelligence`), which already lists every business and its locations —
+`ProvisionModal` in the page header, `AddClinicForm` under each business. They
+share one `ClinicFields` form because both build the same `ClinicCreate` body.
+A separate `/admin/instances` directory existed briefly and was removed: it
+listed the same businesses and clinics, differing only in the chrome hung off
+them. Note that the picker's single-clinic auto-redirect is suppressed for
+super_admins, or a one-clinic tenant would strand them away from these buttons.
+
+**Settings → Details** (`cortex-spa/src/routes/settings/ClinicDetails.tsx`) is
+where both of the above are edited after the fact, in two panels split by blast
+radius: the instance's **name** + upstream account ids (changes every location of
+the business) and this clinic's **name** / address / phone / time zone / **hours**.
+
+`instance_name` and `clinic_name` became mutable here — neither was in its
+update model before, so a typo from an onboarding call could only be fixed in
+Cloud SQL. Renaming is safe: **nothing joins on a name.** Scope, FKs, mart keys
+and the per-clinic PMS secrets (`clinic_{clinic_id}_{pms}_{key}` — id-keyed, not
+the name-derived layout the root CLAUDE.md still documents) all key on ids, and
+every other reader treats the name as a display label. Two spots are *not*
+retroactive: the live VAPI assistant keeps the old name in its prompt until
+republished, and `ClinicData.webforms` rows already written keep the name they
+were stamped with (a point-in-time record, not a stale copy). Neither had
+any home in the SPA before — the ids were Cloud-SQL-only, and the clinic fields
+were write-once at provisioning. Note `_reject_empty_string` on `ClinicUpdate` /
+the None-drop in `update_instance`: a value can be corrected but not blanked,
+which is why the UI only ever sends fields that actually changed.
+
+> **Clinic hours are load-bearing — do not "simplify" them out of the model.**
+> `clinic_location_details.hours_<weekday>` has three live consumers:
+> `_hours_block` in the voice-agent prompt (`api/voice_agent/factory.py`, also
+> used by `roles.py`), the **Revenue-per-clinic-hour** KPI
+> (`intelligence_report/payloads.py` + the group rollup, parsed by
+> `intelligence_report/clinic_hours.py`), and the "is this clinic open right
+> now" gate on active leads (`active_leads.py`). The KPI is inside the
+> methodology parity freeze (dashboard-rework-plan §1.2).
 
 ### Running tests without live ADC
 
@@ -180,6 +254,39 @@ versions, so the rollup invalidates when ANY member's data lands) and warmed by
 > booked rankings, Zoolstra attribution, product + referral rollups, PMS
 > coverage). `intelligence_report/group_queries.py` still exists but has **no
 > production consumer** — safe to delete.
+
+## PMS coverage on intelligence payloads
+
+Clinics with `pms_type` outside `{blueprint, counselear}` (today: `none`, and
+`audit_data` until that feed lands) have **no PMS integration**. Every
+PMS-derived reader returns **zeros** for them rather than erroring — deliberate,
+so a missing integration never blanks a page — which means an unlabelled report
+shows "0 booked appointments" and "$0 revenue" for something nobody measured.
+
+Two things are simply unknowable without the feed, and the reports must say so
+rather than print a zero:
+
+* **revenue** — invoices live in the PMS; there is no second source
+* **traffic → bookings** — a call, ad click or form submission is tied to an
+  appointment only by reconciling it against PMS appointment records
+
+`payloads.pms_integrated()` is the single test (`PMS_WITH_DATA`). Every payload
+carries `pms_type` / `pms_integrated` / `pms_caveat`; the group rollup adds
+`pms_coverage` (`{clinics_total, clinics_integrated, missing}`) because a rollup
+can be **partly** measurable — summing over the locations without a feed is
+exactly what makes an incomplete revenue total look complete. The caveat is also
+injected into both LLM prompts (`one_thing`, `forward_recommendations`), which
+otherwise narrate the zeros as a revenue collapse.
+
+`pms_type` is part of the overview / biweekly / group **cache keys**: it changes
+what the report may claim, and connecting a clinic's PMS rotates no data version,
+so without it the disclosure would persist for the life of the cache entry.
+
+Frontend: `components/intelligence/PmsCoverage.tsx` (both apps) — a page-level
+banner plus the inline replacements used wherever a suppressed figure sat. The
+funnel stops at "connected", ROAS/revenue columns are dropped rather than
+dashed, and the qualified-no-conversion leak is restated as an unverified
+follow-up list (nothing can confirm those callers didn't book later).
 
 ## BigQuery Tables
 

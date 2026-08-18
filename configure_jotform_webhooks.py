@@ -87,7 +87,15 @@ INLINED_FORMS = {"261767450350053", "261766594045062"}
 # tracking()). Order preserved for stable field ordering on the form.
 UTM_FIELDS = [
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "gclid", "fbclid", "landing_page",
+    # Google sends gbraid (cross-device) or wbraid (iOS post-ATT) INSTEAD of a
+    # gclid on many clicks, and gad_campaignid IS the campaign id — a paid click
+    # is invisible without a field to land in.
+    "gclid", "gbraid", "wbraid", "fbclid", "gad_campaignid",
+    # The referring host. Kept separate from utm_source on purpose: the sites
+    # used to write the referrer INTO utm_source, which made downstream report
+    # "google.com" as a campaign. See api/webforms.py::_utm.
+    "referrer_host",
+    "landing_page",
 ]
 
 # clinic_id sits in the webhook URL path: .../webforms/jotform/{clinic_id}?token=…

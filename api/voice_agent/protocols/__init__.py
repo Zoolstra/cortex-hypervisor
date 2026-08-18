@@ -7,7 +7,7 @@ clinic. Protocols generalize the legacy `Capability` framework — see
 `protocols/base.py` for the shape and `resources/protocols-design.md`
 for the design rationale.
 
-Active protocols (seven toggleable + one always-on):
+Active protocols (eight toggleable + one always-on):
 
   - `VerifyCallerIdentificationProtocol`   (Blueprint, Audit Data)
   - `RetrievePatientContextProtocol`       (Blueprint) journal/history context
@@ -16,6 +16,7 @@ Active protocols (seven toggleable + one always-on):
   - `BookAppointmentProtocol`              (Blueprint)
   - `CancelAppointmentProtocol`            (Blueprint)
   - `RescheduleAppointmentProtocol`        (Blueprint)
+  - `FaqLookupProtocol`                    (PMS-agnostic) semantic FAQ retrieval
   - `SubmitTicketProtocol`                 (always-on, PMS-agnostic)
 
 The hypervisor's existing `capabilities.py` is a thin compat shim
@@ -40,6 +41,7 @@ from api.voice_agent.protocols.acna_troubleshooting import ACNATroubleshootingPr
 from api.voice_agent.protocols.base import EmptyConfig, Protocol
 from api.voice_agent.protocols.book_appointment import BookAppointmentProtocol
 from api.voice_agent.protocols.cancel_appointment import CancelAppointmentProtocol
+from api.voice_agent.protocols.faq_lookup import FaqLookupProtocol
 from api.voice_agent.protocols.locate_appointment import LocateAppointmentProtocol
 from api.voice_agent.protocols.reschedule_appointment import RescheduleAppointmentProtocol
 from api.voice_agent.protocols.retrieve_patient_context import (
@@ -66,6 +68,7 @@ PROTOCOL_REGISTRY: dict[str, type[Protocol]] = {
     BookAppointmentProtocol.id:               BookAppointmentProtocol,
     CancelAppointmentProtocol.id:             CancelAppointmentProtocol,
     RescheduleAppointmentProtocol.id:         RescheduleAppointmentProtocol,
+    FaqLookupProtocol.id:                     FaqLookupProtocol,
     # Clinic-scoped (ACNA placeholder-grid availability/booking, decision,
     # troubleshooting).
     ACNASearchAvailabilityProtocol.id:        ACNASearchAvailabilityProtocol,
@@ -87,6 +90,7 @@ PROTOCOL_METADATA: list[type[Protocol]] = [
     BookAppointmentProtocol,
     CancelAppointmentProtocol,
     RescheduleAppointmentProtocol,
+    FaqLookupProtocol,
     ACNASearchAvailabilityProtocol,
     ACNABookAppointmentProtocol,
     ACNADetermineAppointmentProtocol,
@@ -206,6 +210,7 @@ __all__ = [
     "CancelAppointmentProtocol",
     "RescheduleAppointmentProtocol",
     "RetrievePatientContextProtocol",
+    "FaqLookupProtocol",
     "ACNASearchAvailabilityProtocol",
     "ACNABookAppointmentProtocol",
     "ACNADetermineAppointmentProtocol",

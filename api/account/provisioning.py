@@ -30,14 +30,26 @@ def provision_instance(
     primary_contact_name: str,
     primary_contact_email: str,
     primary_contact_uid: str,
+    google_ads_customer_id: str | None = None,
+    invoca_profile_id: str | None = None,
 ) -> Instance:
-    """Create + add an Instance to the session. Returns the ORM object."""
+    """Create + add an Instance to the session. Returns the ORM object.
+
+    The two upstream account ids are optional and default to NULL. They live on
+    the INSTANCE, not the clinic — one Google Ads account and one Invoca profile
+    serve every location of a business — and the ETL reads them from here to
+    decide what to pull, so setting them at provisioning time is what makes a
+    new client's data start flowing. Blank stays NULL rather than "": the ETL
+    tests these for presence, and an empty string is truthy in SQL joins.
+    """
     instance = Instance(
         instance_id=str(uuid.uuid4()),
         instance_name=instance_name,
         primary_contact_name=primary_contact_name,
         primary_contact_email=primary_contact_email,
         primary_contact_uid=primary_contact_uid,
+        google_ads_customer_id=google_ads_customer_id or None,
+        invoca_profile_id=invoca_profile_id or None,
     )
     db.add(instance)
     return instance
@@ -119,6 +131,10 @@ def provision_full_account(
         primary_contact_name=instance_create["primary_contact_name"],
         primary_contact_email=instance_create["primary_contact_email"],
         primary_contact_uid=primary_contact_uid,
+        # .get() so the v1 /provision_account/ path, whose InstanceCreate model
+        # carries neither key, keeps working unchanged.
+        google_ads_customer_id=instance_create.get("google_ads_customer_id"),
+        invoca_profile_id=instance_create.get("invoca_profile_id"),
     )
 
     clinic_id_map: dict[str, str] = {}

@@ -61,6 +61,9 @@ def test_exact_tool_set(cfg):
         "determine_appointment_type",
         "find_available_slots",
         "book_appointment",
+        # FAQ retrieval sits between booking and the close: the corpus is
+        # fetched mid-call rather than compiled into the prompt.
+        "answer_clinic_question",
         "submit_ticket",
     ]
 
@@ -112,6 +115,55 @@ def test_imperative_tool_rules_present(cfg):
     assert "NEVER decide eligibility or the appointment type yourself" in sys
 
 
+def test_referral_and_price_rules_present(cfg):
+    # The 2026-08-10 outcomes introduce two new ways to make a false promise:
+    # booking a caller who must reach a person, and inventing a price.
+    sys = cfg["model"]["messages"][0]["content"]
+    assert "NEVER book on a `REFER_TO_STAFF_*` outcome" in sys
+    assert "NEVER book before an `earliest_bookable_date`" in sys
+    assert "NEVER state a price the decision tool didn't give you" in sys
+
+
+def test_identity_check_is_prefaced_before_the_spell_back(cfg):
+    # The framing must land BEFORE the verify fragment's letter-by-letter
+    # instructions, or the agent spells names back cold.
+    sys = cfg["model"]["messages"][0]["content"]
+    i_preface = sys.find("We really need to get your identity right")
+    i_spellback = sys.find("Confirm the spelling of BOTH names")
+    assert -1 < i_preface < i_spellback
+
+
+def test_time_preference_precedes_offering_slots(cfg):
+    sys = cfg["model"]["messages"][0]["content"]
+    assert "Ask for a time preference BEFORE you offer anything" in sys
+    assert "Do mornings or afternoons work better for you?" in sys
+    # The count instruction must sit after the preference ask.
+    i_pref = sys.find("Ask for a time preference BEFORE you offer anything")
+    i_count = sys.find("How many times to offer")
+    assert -1 < i_pref < i_count
+
+
+def test_slot_counts_are_two_with_a_preference_and_three_without(cfg):
+    """Clinic call 2026-07-27: "even if they don't give a preference, give
+    three. But if they do give a preference, give two." Both halves matter —
+    an earlier revision only specified the preference case."""
+    sys = cfg["model"]["messages"][0]["content"]
+    assert "offer **TWO** slots that match it" in sys
+    assert "offer **THREE**, nearest first" in sys
+    assert "Never read out more than three" in sys
+
+
+def test_hard_floor_and_soft_window_are_distinguished(cfg):
+    # Collapsing these would either let the agent breach the clean-and-check
+    # gap, or make the warranty preference sound like a refusal to book.
+    sys = cfg["model"]["messages"][0]["content"]
+    assert "never start before `earliest_bookable_date`" in sys
+    assert "`earliest_bookable_date` — HARD" in sys
+    assert "`preferred_window` — SOFT" in sys
+    assert "This is a preference, never a refusal" in sys
+    assert "Never tell the caller you can't see them until the window" in sys
+
+
 def test_no_generalist_machinery(cfg):
     sys = cfg["model"]["messages"][0]["content"]
     for absent in ("Price Shopper", "Stage 3a", "Stage 3b", "caller buckets",
@@ -127,3 +179,43 @@ def test_payload_shape_matches_general_factory(cfg):
     }
     assert cfg["model"]["provider"] == "openai"
     assert cfg["model"]["messages"][0]["role"] == "system"
+
+
+def test_faq_corpus_is_not_in_the_prompt(cfg):
+    """The whole point of the retrieval tool: instructions in, content out.
+
+    The prompt may say HOW to look a question up; it must not contain answer
+    text. If a future change goes back to compiling FAQs into the prompt, the
+    booking spine starts getting diluted again — the exact regression roles.py
+    was written to stop.
+    """
+    sys = cfg["model"]["messages"][0]["content"]
+    assert "answer_clinic_question" in sys          # the instruction is present
+    # Retrieval-shaped language, not a Q&A dump.
+    assert "Never improvise an answer" in sys
+    assert "## Answering General Questions" in sys
+
+
+def test_faq_fragment_sits_after_the_booking_spine(cfg):
+    # Ordering is the salience guard: booking flow first, FAQ as a supporting
+    # capability, hard rules last.
+    sys = cfg["model"]["messages"][0]["content"]
+    i_book = sys.find("### Step 4 — Find a time and book it")
+    i_faq = sys.find("## Answering General Questions")
+    i_rules = sys.find("## Non-negotiable tool rules")
+    assert -1 < i_book < i_faq < i_rules
+
+
+def test_faq_tool_is_scoped_to_general_information(cfg):
+    tool = next(t for t in cfg["model"]["tools"]
+                if t["name"] == "answer_clinic_question")
+    desc = tool["description"]
+    # Must not become a back door to patient data — that's the PHI tools' job,
+    # and this endpoint is not PHI-audit-logged.
+    assert "never for anything about a specific patient" in desc.lower()
+    assert set(tool["body"]["required"]) == {"question"}
+
+
+def test_faq_miss_routes_to_a_handoff_not_a_guess(cfg):
+    sys = cfg["model"]["messages"][0]["content"]
+    assert "NEVER answer a general clinic question from your own knowledge" in sys
