@@ -242,11 +242,26 @@ def build_overview(
         "webforms": lambda: q.webform_appointments(clinic_id, window=w),
         "call_outcomes_monthly": lambda: q.connected_outcomes_by_month(clinic_id, invoca_campaign_ids, window=w),
         "channel_mix": lambda: q.channel_mix(clinic_id, invoca_campaign_ids, window=w),
+        "webform_drivers": lambda: q.webform_drivers(clinic_id, window=w),
         "matthew": lambda: q.matthew_outcomes(clinic_id, invoca_campaign_ids, window=w),
         "matthew_monthly": lambda: q.matthew_outcomes_by_month([clinic_id], window=w),
         "pipeline_revenue_monthly": lambda: q.pipeline_revenue_by_month(clinic_id, invoca_campaign_ids, window=w),
         "ad_campaigns": lambda: q.google_ads_roi(clinic_id, ga_campaign_ids, invoca_campaign_ids, window=w),
         "paid_attribution": lambda: q.paid_call_revenue(clinic_id, invoca_campaign_ids, window=w),
+        # The web-form leg of ad-attributed revenue, INCREMENTAL to the call leg
+        # above (a patient who did both is counted once, under calls). Kept a
+        # separate section rather than folded into paid_attribution so the ads
+        # tab can show the composition — a combined figure alone would hide
+        # that most of it rests on a traffic-origin assumption, not click ids.
+        "paid_form_attribution": lambda: q.paid_form_revenue(
+            clinic_id, window=w, invoca_campaign_ids=invoca_campaign_ids),
+        # Per-campaign PAID form submissions + their revenue, merged onto the
+        # campaign rows in the UI by campaign_id. Separate reader rather than
+        # folded into google_ads_roi so that reader's call cascade — which is
+        # parity-frozen — is untouched.
+        "webform_campaign_attribution": lambda: q.webform_campaign_attribution(
+            clinic_id, ga_campaign_ids, window=w,
+            invoca_campaign_ids=invoca_campaign_ids),
         "ad_click_attribution": lambda: q.ad_click_attribution(
             clinic_id, invoca_campaign_ids, ga_campaign_ids, window=w),
     }
@@ -344,17 +359,33 @@ def build_overview(
         "webforms": (lambda wf: wf if wf and wf.get("submissions") else None)(sections.get("webforms")),
         "call_outcomes_monthly": sections.get("call_outcomes_monthly"),
         "channel_mix": sections.get("channel_mix"),
+        "webform_drivers": sections.get("webform_drivers"),
         # Matthew (AI receptionist) outcomes — only for clinics that have Matthew
         # calls (answered>0); null otherwise so the UI hides the section.
         "matthew": (lambda mo: mo if mo and mo.get("answered") else None)(sections.get("matthew")),
         "matthew_monthly": sections.get("matthew_monthly"),
         "pipeline_revenue_monthly": sections.get("pipeline_revenue_monthly"),
-        "ad_campaigns": sections.get("ad_campaigns"),
+        # Call rows with the paid-form leg folded in — one merge point, so the
+        # SPA table, the HTML report and the biweekly payload cannot disagree
+        # about a campaign's revenue or ROAS. See queries.merge_campaign_forms.
+        "ad_campaigns": q.merge_campaign_forms(
+            sections.get("ad_campaigns") or [],
+            sections.get("webform_campaign_attribution"),
+            # The headline's whole form leg, so revenue no campaign row can carry
+            # gets a labelled residual row instead of leaving the table summing
+            # to less than the figure above it.
+            total_form_revenue=(sections.get("paid_form_attribution") or {}).get("revenue")),
         # §04 headline attribution: all Paid calls (same classifier as
         # traffic_drivers) → invoices on/after each matched patient's first
         # paid call. The per-campaign rows in ad_campaigns keep the looser
         # name-match convention — they're a split, not the headline.
         "paid_attribution": sections.get("paid_attribution"),
+        # Form submitters who transacted in the window and were NOT already
+        # claimed by the paid-call leg, so the two can be summed. Population is
+        # ALL submissions, not only click-id-bearing ones — see the reader's
+        # docstring for why that is an instructed assumption about traffic
+        # origin, and `returning_patients` for the part of it that is weakest.
+        "paid_form_attribution": sections.get("paid_form_attribution"),
         # Ad clicks → calls: Paid calls split by how far each traces back to a
         # Google Ads campaign via gclid. null when the clinic has no Paid calls,
         # so the section hides for clinics with no paid search.

@@ -907,7 +907,97 @@ def webform_revenue(clinic_id: str, days: int = 90, window: "Window | None" = No
     return out
 
 
-def webform_appointments(clinic_id: str, days: int = 90, window: "Window | None" = None) -> dict[str, Any]:
+def webform_drivers(
+    clinic_id: str, days: int = 90, window: "Window | None" = None,
+) -> dict[str, Any]:
+    """What is driving web-form submissions, by MEDIUM and by SOURCE.
+
+    Both partitions are folded from ONE grouping, so they sum to the same
+    submission count and cannot disagree.
+
+    **Medium** uses the canonical ``TRAFFIC_CHANNELS`` vocabulary via
+    :func:`_form_medium_case_sql` — the same per-submission rule that decides a
+    form's medium for revenue attribution (contract §14b), so a submission
+    counted Paid here is the one whose revenue lands under Paid there.
+
+    **Source is NOT ``utm_source``.** Measured over all 299 submissions:
+    ``utm_source`` is real on **4**, ``utm_campaign`` on **1**. A utm_source chart
+    would be one slice labelled "direct / untagged" and two singletons — true, and
+    useless. What actually identifies a form is, in descending strength:
+
+    1. ``gad_campaignid`` resolved against ``ad_clicks_v2`` → the **Google Ads
+       campaign name** (15 submissions; needs no click-row join, so no exposure to
+       the 7-day settle window).
+    2. A genuine ``utm_source`` (4).
+    3. ``referrer_host`` → the **referring site** (63: google.com 47, direct 10,
+       bing.com 4, …). Prefixed "via " so a referrer is never mistaken for a
+       campaign — §14a is explicit that presenting one as the other is the mislabel
+       the ingest split was built to end.
+    4. Otherwise ``unattributed``.
+
+    So roughly a quarter of submissions can be named today, and the honest reading
+    of this chart is mostly "we do not know" — which is the finding, not a defect
+    to hide. Site-side UTM capture is the fix (form-revenue-attribution-plan §2a.1).
+    """
+    w = _win(window, days)
+    out: dict[str, Any] = {"by_medium": [], "by_source": [], "submissions": 0}
+    noise = ", ".join(f"'{n}'" for n in _UTM_NOISE)
+    sql = f"""
+        WITH f AS (
+          SELECT gclid, gbraid, wbraid, gad_campaignid, fbclid,
+                 LOWER(TRIM(utm_medium)) AS fum,
+                 LOWER(TRIM(IFNULL(referrer_host, ''))) AS fref,
+                 IF(utm_source IS NULL OR LOWER(TRIM(utm_source)) IN ({noise}),
+                    NULL, LOWER(TRIM(utm_source))) AS futm,
+                 NULLIF(NULLIF(gad_campaignid, ''), 'nan') AS gad
+          FROM `{_CLINIC_DATA}.webforms`
+          WHERE clinic_id = @clinic_id
+            AND {_ts_between('submitted_at', w)}
+        ),
+        camps AS (
+          SELECT CAST(google_ads_campaign_id AS STRING) AS cid,
+                 ANY_VALUE(campaign_name) AS nm
+          FROM `{_CLINIC_DATA}.ad_clicks_v2`
+          WHERE google_ads_campaign_id IS NOT NULL
+          GROUP BY cid
+        )
+        SELECT ({_form_medium_case_sql()}) AS medium,
+               COALESCE(cm.nm, f.futm,
+                        IF(f.fref = '', NULL, CONCAT('via ', f.fref)),
+                        'unattributed') AS source,
+               COUNT(*) AS n
+        FROM f LEFT JOIN camps cm ON cm.cid = f.gad
+        GROUP BY medium, source
+    """
+    try:
+        rows = list(_client().query(
+            sql, job_config=bigquery.QueryJobConfig(
+                query_parameters=_params(clinic_id))).result())
+    except Exception as exc:
+        log.warning("webform_drivers failed clinic=%s: %s", clinic_id, exc)
+        return out
+
+    med: dict[str, int] = {}
+    src: dict[str, int] = {}
+    total = 0
+    for r in rows:
+        n = int(r.n or 0)
+        total += n
+        med[r.medium] = med.get(r.medium, 0) + n
+        src[r.source] = src.get(r.source, 0) + n
+    # Medium keeps the canonical order so a bucket does not move between windows;
+    # source is open-ended, so it ranks by volume.
+    out["by_medium"] = [{"channel": c, "count": med[c]} for c in TRAFFIC_CHANNELS if med.get(c)]
+    out["by_medium"] += [{"channel": c, "count": n} for c, n in sorted(med.items())
+                         if c not in TRAFFIC_CHANNELS and n]
+    out["by_source"] = [{"channel": s, "count": n}
+                        for s, n in sorted(src.items(), key=lambda kv: (-kv[1], kv[0]))]
+    out["submissions"] = total
+    return out
+
+
+def webform_appointments(clinic_id: str, days: int = 90, window: "Window | None" = None,
+                         match_days: int = CALL_BOOKING_MATCH_DAYS) -> dict[str, Any]:
     """Web-form submissions reconciled to PMS appointments.
 
     Same submitter→patient matching as :func:`webform_revenue` (phone last-10
@@ -923,14 +1013,25 @@ def webform_appointments(clinic_id: str, days: int = 90, window: "Window | None"
     rest of the webform section: it credits forms whose submitter later booked,
     not proof the form drove the visit.
 
+    ``appt_submissions_matched`` is the SAME count bounded to ``match_days``
+    (default :data:`CALL_BOOKING_MATCH_DAYS`, i.e. the call leg's 10 days), and it
+    exists because the unbounded figure is not comparable to anything. Measured
+    2026-08-20: unbounded, 40–81% of submissions "led to an appointment" against
+    0.3–2.9% of paid calls — not because forms convert 25x better but because a
+    submitter who is an existing patient almost always has SOME later
+    appointment. Drawn beside the call leg's booked node that would read as a
+    finding. Use the bounded field wherever the two legs appear together; the
+    unbounded one still answers the Web forms tab's own, looser question.
+
     Returns ``{"submissions", "matched_submissions", "appt_submissions",
-    "appt_patients", "window_days"}``. Fails safe to zeros (never raises) when
-    the webform table is absent.
+    "appt_submissions_matched", "appt_patients", "window_days"}``. Fails safe to
+    zeros (never raises) when the webform table is absent.
     """
     w = _win(window, days)
     out = {
         "submissions": 0, "matched_submissions": 0,
-        "appt_submissions": 0, "appt_patients": 0, "window_days": w.span_days,
+        "appt_submissions": 0, "appt_submissions_matched": 0,
+        "appt_patients": 0, "window_days": w.span_days,
     }
     sql = f"""
         WITH forms AS (
@@ -958,7 +1059,9 @@ def webform_appointments(clinic_id: str, days: int = 90, window: "Window | None"
               OR (f.email_norm != ''        AND f.email_norm = p.email_norm)
         ),
         appt AS (
-            SELECT m.form_idx, m.client_id
+            SELECT m.form_idx, m.client_id,
+                   DATE_DIFF(DATE(SAFE_CAST(a.created_time AS TIMESTAMP)),
+                             m.submitted_date, DAY) AS lag_days
             FROM matched m
             JOIN `{_BP}.Appointments` a
               ON a._clinic_id = @clinic_id
@@ -969,7 +1072,9 @@ def webform_appointments(clinic_id: str, days: int = 90, window: "Window | None"
           (SELECT COUNT(*) FROM forms)                     AS submissions,
           (SELECT COUNT(DISTINCT form_idx) FROM matched)   AS matched_submissions,
           (SELECT COUNT(DISTINCT form_idx) FROM appt)      AS appt_submissions,
-          (SELECT COUNT(DISTINCT client_id) FROM appt)     AS appt_patients
+          (SELECT COUNT(DISTINCT client_id) FROM appt)     AS appt_patients,
+          (SELECT COUNT(DISTINCT form_idx) FROM appt
+            WHERE lag_days <= {int(match_days)})           AS appt_submissions_matched
     """
     try:
         rows = list(_client().query(
@@ -984,6 +1089,7 @@ def webform_appointments(clinic_id: str, days: int = 90, window: "Window | None"
         out["submissions"]         = int(r.submissions or 0)
         out["matched_submissions"] = int(r.matched_submissions or 0)
         out["appt_submissions"]    = int(r.appt_submissions or 0)
+        out["appt_submissions_matched"] = int(r.appt_submissions_matched or 0)
         out["appt_patients"]       = int(r.appt_patients or 0)
     return out
 
@@ -1718,6 +1824,18 @@ _SOCIAL_SOURCES = (
     "fb", "ig", "facebook.com", "instagram.com", "facebook", "instagram",
 )
 
+# Referrer hosts that mean a SEARCH ENGINE sent the visit, so the arrival is
+# organic search. A regex rather than an exact list because the same engine
+# arrives under many hosts (google.com, google.ca, www.google.co.uk,
+# ca.search.yahoo.com, and Android's com.google.android.googlequicksearchbox),
+# and an exact list silently reclassifies a visit as Referral the first time a new
+# TLD shows up. AI assistants are included: a chatgpt.com referral is an unpaid
+# search-like arrival, which is what this bucket means.
+_ORGANIC_HOST_RE = (
+    r"(?i)(^|\.)(google|bing|duckduckgo|ecosia|yandex|baidu|brave)\.|"
+    r"search\.yahoo|googlequicksearchbox|(^|\.)(chatgpt|openai|perplexity)\."
+)
+
 
 def _real_id_sql(col: str) -> str:
     """SQL predicate: TRUE when ``col`` holds a genuine click ID. Treats NULL,
@@ -1725,6 +1843,61 @@ def _real_id_sql(col: str) -> str:
     guard is defensive — the ETL now nulls that sentinel and the table has been
     backfilled — so any straggler row still classifies correctly."""
     return f"({col} IS NOT NULL AND {col} NOT IN ('nan', ''))"
+
+
+def _form_medium_case_sql() -> str:
+    """CASE mapping one web-form submission to the same TRAFFIC_CHANNELS bucket
+    calls use, so the two legs of `by_medium` speak one vocabulary.
+
+    CLICK IDS FIRST, and that ordering is the whole point. Measured 2026-08-18
+    over all 292 submissions: ``utm_medium`` is populated **zero** times, and the
+    ``pretty`` blob holds no hidden UTM either (its 53 ``utm_`` mentions are the
+    referrer hosts the ingest correctly moved to ``referrer_host``). So a
+    utm_medium-first rule would file every form under 'No data' forever. The click
+    ids are the only paid evidence forms carry: 13 of 292 have one, and ALL 13
+    resolve to a linked campaign through ``gad_campaignid`` (9 of 13 also match a
+    ``ad_clicks_v2`` click row; the other 4 fell outside its 7-day settle window,
+    which is exactly why the campaign id is the stronger key).
+
+    ``gad_campaignid`` counts as a paid signal even though it is not a click id —
+    it is the campaign id lifted straight from the landing URL, so its presence
+    means the visit came from an ad.
+
+    ``referrer_host`` is the LAST resort, reached only when no click id and no UTM
+    said anything. A search-engine host becomes 'Organic', the ingest's literal
+    'direct' sentinel becomes 'Direct', and any other host becomes 'Referral'.
+
+    KNOWN IMPRECISION, accepted deliberately: a google.com referrer could be
+    organic search OR paid search whose click id was dropped, and nothing in the
+    row distinguishes them — so this slightly understates Paid and overstates
+    Organic. It buys coverage that matters: without it every one of the ~89
+    referrer-bearing submissions sits in 'No data', which tells a reader nothing.
+    The ordering is what bounds the error: any submission with real paid evidence
+    is already classified Paid several branches above and never reaches here.
+    """
+    paid_ids = " OR ".join(_real_id_sql(f"f.{c}") for c in ("gclid", "gbraid", "wbraid"))
+    paid_mediums = ", ".join(f"'{m}'" for m in _PAID_MEDIUMS)
+    social_mediums = ", ".join(f"'{m}'" for m in _SOCIAL_MEDIUMS)
+    social_sources = ", ".join(f"'{s}'" for s in _SOCIAL_SOURCES)
+    return f"""
+        CASE
+          WHEN {paid_ids} OR {_real_id_sql('f.gad_campaignid')} THEN 'Paid'
+          WHEN {_real_id_sql('f.fbclid')} OR f.fum IN ({social_mediums}) THEN 'Social'
+          WHEN f.fum IN ({paid_mediums}) THEN 'Paid'
+          WHEN f.fum = 'organic'  THEN 'Organic'
+          WHEN f.fum = 'direct'   THEN 'Direct'
+          WHEN f.fum = 'referral' THEN 'Referral'
+          -- Referrer fallback. Checked AFTER every click-id and UTM branch, so it
+          -- can only classify a submission that carried no better evidence.
+          WHEN f.fref IN ({social_sources}) THEN 'Social'
+          WHEN REGEXP_CONTAINS(f.fref, r'{_ORGANIC_HOST_RE}') THEN 'Organic'
+          -- The ingest writes the literal 'direct' when there was no referrer at
+          -- all; it is a sentinel, not a hostname.
+          WHEN f.fref = 'direct' THEN 'Direct'
+          WHEN f.fref != '' THEN 'Referral'
+          ELSE 'No data'
+        END
+    """
 
 
 def _channel_case_sql() -> str:
@@ -2251,6 +2424,585 @@ def paid_call_revenue(
         out["invoice_count"]     = int(r.invoice_count or 0)
         out["revenue"]           = float(r.revenue or 0.0)
     return out
+
+
+def paid_form_revenue(
+    clinic_id: str,
+    days: int = 90,
+    window: "Window | None" = None,
+    exclude_call_patients: bool = True,
+    invoca_campaign_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Revenue from WEB-FORM submitters, scoped and deduped for use in the ads
+    tab's ROAS numerator alongside :func:`paid_call_revenue`.
+
+    WHY THIS IS NOT :func:`webform_revenue`. Three differences, each deliberate:
+
+    1. **Invoice window.** ``webform_revenue`` counts every invoice dated on or
+       after the patient's first submission, with no upper bound — a 2023
+       submitter's 2026 purchase counts in full. That is lifetime value attached
+       to a touch, which cannot go in a ROAS numerator: the denominator is one
+       period's spend. Here the rule is the SAME as ``paid_call_revenue`` —
+       positive invoices dated **inside the selected window**, deduped per
+       ``order_id``. The two legs of the ratio therefore speak one unit.
+
+    2. **Touch window.** Submissions are also restricted to the window, again
+       matching the call leg (whose ``_spam_scope_clause`` is window-scoped).
+
+    3. **Double-count guard.** A patient who both called from an ad and
+       submitted a form has ONE set of invoices, and the call leg already claims
+       them. With ``exclude_call_patients`` (the default) the form leg counts
+       only patients the paid-call leg did not, so
+       ``paid_call_revenue.revenue + paid_form_revenue.revenue`` is a sum of
+       disjoint populations and double-counts nobody.
+
+    DOCUMENTED DIVERGENCE FROM FIRST TOUCH (methodology contract §16). Elsewhere
+    — :func:`pipeline_revenue_by_source` — a patient is credited to whichever
+    channel touched them FIRST. Here precedence is given to the call leg
+    regardless of order, for two reasons. It leaves the published §04 "Attributed
+    revenue" call figure byte-identical rather than silently moving it, and it
+    keeps the per-campaign table below the headline reconcilable: those rows are
+    call-derived, so a time-ordered split would make them stop summing to the
+    call leg for reasons invisible on screen. The cost is that a form-then-call
+    patient is filed under calls; the benefit is that the new leg can only ever
+    ADD revenue nothing else claimed, which is the conservative direction.
+
+    POPULATION IS ALL FORM SUBMISSIONS, NOT ONLY CLICK-ID-BEARING ONES. This is
+    a deliberate, instructed choice, and it is the one number here a reader could
+    misread. Only ~12% of submissions carry any click id (measured 2026-08-20:
+    15 of 299 live rows, 14 of 120 in the Virsono backfill), because click-id
+    capture on the forms was wired up only recently. The clinic's position is
+    that the forms sit on campaign landing pages and the traffic is therefore
+    ad-driven, so the whole population is credited to ad spend rather than the
+    click-id-flagged sliver. Consequences the caller MUST surface rather than
+    bury:
+
+    * It is an assumption about traffic origin, not click-verified attribution.
+      Any submission that arrived organically or direct is credited to spend.
+    * It is correlational: it credits form submitters who also transacted in the
+      window, including existing patients who would have transacted anyway.
+      ``returning_patients`` is returned so the caller can show how much of the
+      leg is existing customers instead of leaving that invisible.
+
+    Returns ``{"submissions", "matched_patients", "invoiced_patients",
+    "invoice_count", "revenue", "returning_patients", "window_days"}``. Fails
+    safe to zeros — a clinic with no ``webforms`` rows reads 0, never an error.
+
+    ``invoca_campaign_ids`` is required only when ``exclude_call_patients`` is
+    set: without it there is no paid-call population to exclude, so an empty
+    list would silently make the leg non-incremental. Passing none with the flag
+    on returns zeros rather than an over-count.
+    """
+    w = _win(window, days)
+    out = {
+        "submissions": 0, "matched_patients": 0, "invoiced_patients": 0,
+        "invoice_count": 0, "revenue": 0.0, "returning_patients": 0,
+        "window_days": w.span_days,
+    }
+    # No Invoca campaigns → there is no paid-call population, so there is nothing
+    # to be incremental TO and the exclusion is unnecessary rather than impossible.
+    # `paid_call_revenue` returns zeros under the identical condition, so the
+    # caller is adding this to 0 and the full form leg is the correct answer.
+    #
+    # This started life as a hard `return out` (zeros), on the theory that a
+    # non-incremental figure could be double-counted. That was wrong in the one
+    # direction that mattered: it silently blanked the whole leg for every clinic
+    # that runs web forms WITHOUT Invoca call tracking — the clinics where form
+    # revenue is the only ad-attributed revenue there is.
+    if exclude_call_patients and not invoca_campaign_ids:
+        log.info(
+            "paid_form_revenue: no invoca_campaign_ids for clinic_id=%s — no paid-call "
+            "population to exclude, returning the full form leg", clinic_id)
+        exclude_call_patients = False
+
+    if exclude_call_patients:
+        scope = _spam_scope_clause(invoca_campaign_ids or [], days, window=w)
+        join_cs = _callscoring_join_sql()
+        not_spam = _non_spam_predicate_sql()
+        channel_case = _channel_case_sql()
+        call_cte = f"""
+        calls AS (
+          SELECT phone_norm, {channel_case} AS channel
+          FROM (
+            SELECT
+              RIGHT(REGEXP_REPLACE(IFNULL(t.calling_phone_number, ''), r'\\D', ''), 10) AS phone_norm,
+              t.gclid, t.wbraid, t.gbraid, t.msclkid, t.fbclid,
+              LOWER(t.utm_medium) AS um, LOWER(t.utm_source) AS us, t.marketing_channel
+            FROM `{_CLINIC_DATA}.transactions` t
+            {join_cs}
+            WHERE {scope}
+              AND {not_spam}
+            QUALIFY ROW_NUMBER() OVER (
+              PARTITION BY t.complete_call_id ORDER BY t.timestamp DESC) = 1
+          )
+        ),
+        call_patients AS (
+          SELECT DISTINCT p.client_id
+          FROM calls c
+          JOIN patients p ON p.phone_norm = c.phone_norm
+          WHERE c.channel = 'Paid' AND LENGTH(c.phone_norm) = 10
+        ),"""
+        exclude_clause = """
+              AND NOT EXISTS (
+                SELECT 1 FROM call_patients cp WHERE cp.client_id = fx.client_id
+              )"""
+    else:
+        call_cte = ""
+        exclude_clause = ""
+
+    sql = f"""
+        WITH patients AS (
+          SELECT DISTINCT client_id, phone_norm, email_norm
+          FROM `{_PATIENT_CONTACTS}`
+          WHERE _clinic_id = @clinic_id
+        ),{call_cte}
+        forms AS (
+          SELECT
+            RIGHT(REGEXP_REPLACE(IFNULL(phone_number, ''), r'\\D', ''), 10) AS phone_norm,
+            LOWER(TRIM(IFNULL(email, '')))                                  AS email_norm,
+            submitted_at
+          FROM `{_CLINIC_DATA}.webforms`
+          WHERE clinic_id = @clinic_id
+            AND {_ts_between("submitted_at", w)}
+        ),
+        -- Same match key as webform_revenue: phone last-10 OR email. A form row
+        -- can fan out to more than one patient record (duplicate PMS records for
+        -- one person), so this collapses to distinct patients before any money
+        -- is touched.
+        form_x_patient AS (
+          SELECT p.client_id, MIN(f.submitted_at) AS first_form_ts
+          FROM forms f
+          JOIN patients p
+            ON (LENGTH(f.phone_norm) = 10 AND f.phone_norm = p.phone_norm)
+            OR (f.email_norm != ''        AND f.email_norm = p.email_norm)
+          GROUP BY p.client_id
+        ),
+        form_only AS (
+          SELECT fx.client_id, fx.first_form_ts
+          FROM form_x_patient fx
+          WHERE TRUE{exclude_clause}
+        ),
+        -- Existing-customer disclosure: a patient invoiced BEFORE this window
+        -- was already transacting, so revenue credited to their form submission
+        -- is the weakest causal claim in the leg. Counted, not filtered.
+        returning AS (
+          SELECT COUNT(DISTINCT fo.client_id) AS n
+          FROM form_only fo
+          JOIN `{_BP}.InvoiceMaster` im
+            ON im._clinic_id = @clinic_id AND im.client_id = fo.client_id
+          WHERE SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
+            AND SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date) < DATE('{w.start}')
+        ),
+        rev AS (
+          SELECT
+            COUNT(DISTINCT client_id) AS invoiced_patients,
+            COUNT(DISTINCT order_id)  AS invoice_count,
+            COALESCE(SUM(amt), 0)     AS revenue
+          FROM (
+            SELECT im.client_id, im.order_id,
+                   MAX(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS amt
+            FROM `{_BP}.InvoiceMaster` im
+            JOIN form_only fo USING (client_id)
+            WHERE im._clinic_id = @clinic_id
+              AND SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
+              AND {_date_between("SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)", w)}
+            GROUP BY im.client_id, im.order_id
+          )
+        )
+        SELECT
+          (SELECT COUNT(*) FROM forms)        AS submissions,
+          (SELECT COUNT(*) FROM form_only)    AS matched_patients,
+          (SELECT n FROM returning)           AS returning_patients,
+          rev.invoiced_patients,
+          rev.invoice_count,
+          rev.revenue
+        FROM rev
+    """
+    try:
+        rows = list(_client().query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=_params(clinic_id)),
+        ).result())
+    except Exception as exc:
+        log.warning("paid_form_revenue query failed for clinic_id=%s: %s", clinic_id, exc)
+        return out
+    if rows:
+        r = rows[0]
+        out["submissions"]        = int(r.submissions or 0)
+        out["matched_patients"]   = int(r.matched_patients or 0)
+        out["invoiced_patients"]  = int(r.invoiced_patients or 0)
+        out["invoice_count"]      = int(r.invoice_count or 0)
+        out["revenue"]            = float(r.revenue or 0.0)
+        out["returning_patients"] = int(r.returning_patients or 0)
+    return out
+
+
+def merge_campaign_forms(
+    campaigns: list[dict],
+    campaign_forms: list[dict] | None,
+    total_form_revenue: float | None = None,
+) -> list[dict]:
+    """Fold per-campaign paid form submissions onto :func:`google_ads_roi` rows.
+
+    THE SINGLE PLACE the call and form legs are combined. Three consumers read
+    these rows — the SPA ads table, the HTML report's ROAS section
+    (``report._section_roas``), and the biweekly payload — and before this each
+    would have had to combine them itself, which is how three different ROAS
+    numbers for one campaign get shipped. They now all read ``revenue_total`` /
+    ``roas_total``.
+
+    ``revenue`` and ``roas`` are LEFT UNTOUCHED, deliberately: they are the
+    call-only figures the parity harness and methodology-contract §17 matrix are
+    written against, and silently redefining them would make a frozen number move
+    for reasons no reader could see. The combined figures are added alongside.
+
+    Rows in ``campaign_forms`` with no matching campaign row are APPENDED — a
+    campaign can draw paid forms and no paid calls, and the paid-form remainder
+    can exist where the paid-call remainder does not (Virsono today). Dropping
+    them would silently lose real submissions. Appended rows carry zero
+    clicks/spend, so they cannot invent a ROAS.
+
+    ``total_form_revenue`` is the §04 headline's whole form leg
+    (``paid_form_revenue.revenue``). Whatever click ids could not place is spread
+    across the spending campaigns, weighted by clicks, so the Revenue column sums
+    to the headline and no campaign shows 0.0x against real spend while the
+    figure above it shows a return. That was the Princeton case: a $7,240 headline
+    over $5,737 of spend (1.3x) with every campaign row reading $0.
+
+    Omit it and the rows carry only click-id-placed form revenue, which is the
+    right behaviour for callers that are not rendering a ROAS table.
+    """
+    by_id = {f["campaign_id"]: f for f in (campaign_forms or [])}
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in campaigns or []:
+        cid = row.get("campaign_id")
+        seen.add(cid)
+        f = by_id.get(cid) or {}
+        forms = int(f.get("forms") or 0)
+        form_rev = float(f.get("revenue") or 0.0)
+        total = float(row.get("revenue") or 0.0) + form_rev
+        spend = float(row.get("spend") or 0.0)
+        out.append({
+            **row,
+            "forms": forms,
+            "form_revenue": form_rev,
+            "revenue_total": total,
+            # None, not 0.0, on no spend: the remainder row has no spend and a
+            # 0.0x there reads as a campaign that returned nothing.
+            "roas_total": (total / spend) if spend else None,
+        })
+    for cid, f in by_id.items():
+        if cid in seen:
+            continue
+        rev = float(f.get("revenue") or 0.0)
+        out.append({
+            "campaign_id": cid,
+            # Named for what this row actually holds. It has no calls, so
+            # UNATTRIBUTED_CAMPAIGN_NAME ("Unattributed paid calls") would be a
+            # false label; when unattributed calls DO exist the row already came
+            # from google_ads_roi and keeps that name, with forms folded in.
+            "campaign_name": ("Unattributed paid forms" if f.get("unattributed")
+                              else cid),
+            "unattributed": bool(f.get("unattributed")),
+            "clicks": 0, "calls": 0, "booked": 0, "spend": 0.0,
+            "revenue": 0.0, "invoice_count": 0, "cpc": 0.0,
+            "cost_per_call": 0.0, "cost_per_booking": 0.0, "roas": 0.0,
+            "revenue_per_booking": 0.0, "click_to_call_pct": 0.0,
+            "call_to_book_pct": 0.0,
+            "forms": int(f.get("forms") or 0),
+            "form_revenue": rev,
+            "revenue_total": rev,
+            "roas_total": None,
+        })
+
+    # Distribute everything click ids could not place — both the revenue and the
+    # submission counts — across the campaigns that drove the traffic.
+    #
+    # Forms are taken to be campaign-driven: they sit on campaign landing pages,
+    # so the traffic that produced them was bought. Click ids place what they can;
+    # the rest is spread rather than parked in a remainder row, which left
+    # campaigns reading 0.0x against real spend while the headline showed a
+    # return (Princeton: $7,240 over $5,737 of spend, every row $0).
+    #
+    # THE POOL HAS TWO SOURCES and missing either leaves money stranded:
+    #   1. rows the reader itself could not attribute (its remainder row), and
+    #   2. any headline form revenue beyond what all rows carry — revenue whose
+    #      patients matched no attributable submission at all.
+    # Widening the population to every submission made (1) the dominant source,
+    # which is why computing the pool only from (2) silently distributed nothing.
+    #
+    # Weighted by CLICKS, not spend: clicks are the traffic that actually produced
+    # the submissions, so a campaign that drew more visits receives more of them.
+    # Falls back to spend, then an equal split, so nothing is stranded when a
+    # campaign has spend but no recorded clicks.
+    # NOT gated on `total_form_revenue`. It was, and that is why the group ads
+    # table kept an "Unattributed paid forms" row holding the whole form leg: the
+    # group builds these rows without the headline figure, so distribution never
+    # ran there while the clinic page looked correct. The trigger is whether
+    # anything is unplaced, which is knowable from the rows alone.
+    # Any REAL campaign is a target, not only those with spend in the window. A
+    # clinic whose campaigns were paused mid-range still owns the form fills its
+    # earlier clicks produced, and requiring spend > 0 there would leave the
+    # "Unattributed paid forms" row on screen for exactly the clinics with the
+    # least going on. Weighting still prefers clicks, so a zero-spend campaign
+    # only receives a share when nothing better distinguishes them.
+    targets = [r for r in out if not r.get("unattributed")]
+    if targets:
+        spare = [r for r in out if r not in targets]
+        pool_rev = round(sum(float(r.get("form_revenue") or 0.0) for r in spare), 2)
+        pool_forms = sum(int(r.get("forms") or 0) for r in spare)
+        placed = sum(float(r.get("form_revenue") or 0.0) for r in out)
+        # Top-up only: headline revenue no row accounts for. Now that the
+        # counted population is every submission — the same population and the
+        # same call-patient exclusion `paid_form_revenue` uses — this is
+        # normally 0, so it is a safety net rather than the mechanism.
+        if total_form_revenue is not None:
+            pool_rev = round(
+                pool_rev + max(0.0, float(total_form_revenue) - placed), 2)
+        for r in spare:
+            if r.get("unattributed"):
+                r["form_revenue"] = 0.0
+                r["forms"] = 0
+                r["revenue_total"] = round(float(r.get("revenue") or 0.0), 2)
+
+        weights = [float(r.get("clicks") or 0) for r in targets]
+        if sum(weights) <= 0:
+            weights = [float(r.get("spend") or 0.0) for r in targets]
+        if sum(weights) <= 0:
+            weights = [1.0] * len(targets)
+        wsum = sum(weights)
+
+        if pool_rev > 0.005:
+            # Last row absorbs the rounding remainder, so the column sums to
+            # the headline exactly rather than drifting a cent per row.
+            running = 0.0
+            for i, (row, w) in enumerate(zip(targets, weights)):
+                share = (round(pool_rev - running, 2) if i == len(targets) - 1
+                         else round(pool_rev * w / wsum, 2))
+                running = round(running + share, 2)
+                row["form_revenue"] = round(float(row.get("form_revenue") or 0.0) + share, 2)
+                row["revenue_total"] = round(float(row.get("revenue_total") or 0.0) + share, 2)
+
+        if pool_forms:
+            # Largest remainder, so the integers sum to the true total rather
+            # than every row rounding down.
+            exact = [pool_forms * x / wsum for x in weights]
+            base = [int(e) for e in exact]
+            for i in sorted(range(len(exact)),
+                            key=lambda i: -(exact[i] - base[i]))[:pool_forms - sum(base)]:
+                base[i] += 1
+            for row, n in zip(targets, base):
+                row["forms"] = int(row.get("forms") or 0) + n
+
+        for row in targets:
+            spend = float(row.get("spend") or 0.0)
+            row["roas_total"] = (row["revenue_total"] / spend) if spend else None
+
+        # A remainder row emptied by the above carries nothing; an empty
+        # "unattributed" row reads as a tracking failure that isn't there.
+        out = [r for r in out
+               if not (r.get("unattributed")
+                       and int(r.get("forms") or 0) == 0
+                       and int(r.get("calls") or 0) == 0
+                       and float(r.get("revenue_total") or 0.0) == 0.0)]
+    return out
+
+
+def webform_campaign_attribution(
+    clinic_id: str,
+    ga_campaign_ids: list[str],
+    days: int = 90,
+    window: "Window | None" = None,
+    invoca_campaign_ids: list[str] | None = None,
+) -> list[dict]:
+    """Per-campaign PAID web-form submissions and the revenue behind them — the
+    form counterpart to :func:`google_ads_roi`'s call rows.
+
+    Returns one row per linked Google Ads campaign that placed at least one paid
+    form, plus a remainder row (``UNATTRIBUTED_CAMPAIGN_ID``) for paid forms no
+    tier could place. Shape: ``{campaign_id, forms, revenue, unattributed}``.
+    The caller merges these onto the ``google_ads_roi`` rows by ``campaign_id``.
+
+    ATTRIBUTION CASCADE, strongest first — deliberately only two tiers:
+
+    1. **gad_campaignid** — the Google Ads campaign id lifted straight out of the
+       landing URL. Campaign-exact and the STRONGEST signal a form carries;
+       measured 2026-08-18 it resolved 13 of 13 click-id-bearing submissions
+       where ``gclid`` resolved only 9 (the other 4 fell outside ``ad_clicks_v2``'s
+       7-day settle window, which is exactly why the campaign id beats the click).
+    2. **gclid → ad_clicks_v2** — the same join the call cascade's first tier
+       uses, for forms carrying a click but no campaign id.
+
+    THERE IS NO NAME TIER, and that is a measured decision rather than an
+    omission. The call cascade can fall back on normalized campaign names because
+    Invoca campaigns are named after Ads campaigns ("Princeton" ↔ "Beta
+    Princeton"). Form ``utm_campaign`` values are not campaign names at all —
+    measured 2026-08-20 they are generic ad-group-ish labels
+    (``hearing-aid-search``, ``earlens-brand``) that match no Ads campaign name,
+    so a name tier would place nothing for Virsono while creating a false-match
+    risk for clients whose labels happen to collide.
+
+    CONSEQUENCE FOR VIRSONO, worth stating because it is the clinic that prompted
+    this: none of its paid forms carry a click id or campaign id — the historical
+    CSV backfill had only ``utm_medium=cpc`` — so every one lands in the
+    remainder row until the live Jotform webhook starts capturing click ids.
+    Three of them are also ``utm_source=bing``, i.e. Microsoft Ads, which can
+    never appear in a Google Ads table at all. The remainder row is the honest
+    place for all of that; dropping them would understate paid form volume.
+
+    REVENUE IS INCREMENTAL TO THE CALL LEG, on the same rule as
+    :func:`paid_form_revenue`: a patient the paid-call population already claims
+    is excluded, so a row's call revenue and form revenue can be ADDED without
+    counting one patient's invoices twice. A patient submitting forms attributed
+    to two campaigns is credited to their EARLIEST such form, so every patient
+    lands in exactly one row and the rows stay a partition.
+
+    Invoices are window-bounded on both sides, matching the call rows — not
+    ``webform_revenue``'s unbounded on/after-first-submission rule, which is
+    lifetime value and cannot sit beside a windowed spend figure.
+
+    Empty ``ga_campaign_ids`` → ``[]`` (nothing to attribute to). Fails safe to
+    ``[]`` on any query error, so the table degrades to its call-only form rather
+    than erroring.
+    """
+    w = _win(window, days)
+    if not ga_campaign_ids:
+        return []
+
+    # POPULATION IS EVERY SUBMISSION, not the click-id-bearing subset. Forms are
+    # taken to be campaign-driven (see the module policy in methodology-contract
+    # §16 items 8 and 10), so restricting the COUNT to forms with paid evidence
+    # while crediting ALL of their revenue to the campaigns produced two numbers
+    # that could not both be right: the ads traffic fork read 2 submissions where
+    # the web-form section read 11, for the same clinic and window.
+    # The call population to exclude. Absent Invoca ids there are no paid calls
+    # (paid_call_revenue returns zeros under the same condition), so nothing can
+    # overlap and the exclusion is simply skipped — see paid_form_revenue.
+    if invoca_campaign_ids:
+        call_cte = f"""
+        calls AS (
+          SELECT phone_norm, {_channel_case_sql()} AS channel
+          FROM (
+            SELECT
+              RIGHT(REGEXP_REPLACE(IFNULL(t.calling_phone_number, ''), r'\\D', ''), 10) AS phone_norm,
+              t.gclid, t.wbraid, t.gbraid, t.msclkid, t.fbclid,
+              LOWER(t.utm_medium) AS um, LOWER(t.utm_source) AS us, t.marketing_channel
+            FROM `{_CLINIC_DATA}.transactions` t
+            {_callscoring_join_sql()}
+            WHERE {_spam_scope_clause(invoca_campaign_ids, days, window=w)}
+              AND {_non_spam_predicate_sql()}
+            QUALIFY ROW_NUMBER() OVER (
+              PARTITION BY t.complete_call_id ORDER BY t.timestamp DESC) = 1
+          )
+        ),
+        call_patients AS (
+          SELECT DISTINCT p.client_id
+          FROM calls c JOIN patients p ON p.phone_norm = c.phone_norm
+          WHERE c.channel = 'Paid' AND LENGTH(c.phone_norm) = 10
+        ),"""
+        exclude = ("\n              AND NOT EXISTS (SELECT 1 FROM call_patients cp "
+                   "WHERE cp.client_id = fp.client_id)")
+    else:
+        call_cte = ""
+        exclude = ""
+
+    sql = f"""
+        WITH patients AS (
+          SELECT DISTINCT client_id, phone_norm, email_norm
+          FROM `{_PATIENT_CONTACTS}`
+          WHERE _clinic_id = @clinic_id
+        ),{call_cte}
+        -- gclid → campaign, restricted to the clinic's OWN linked campaigns so a
+        -- click belonging to another clinic in the instance cannot cross-attribute.
+        clicks AS (
+          SELECT DISTINCT click_view_gclid AS gclid, google_ads_campaign_id AS cid
+          FROM `{_CLINIC_DATA}.ad_clicks_v2`
+          WHERE google_ads_campaign_id IN UNNEST(@ga_ids)
+            AND click_view_gclid IS NOT NULL
+        ),
+        forms AS (
+          SELECT
+            RIGHT(REGEXP_REPLACE(IFNULL(f.phone_number, ''), r'\\D', ''), 10) AS phone_norm,
+            LOWER(TRIM(IFNULL(f.email, '')))                                  AS email_norm,
+            f.submitted_at,
+            -- The cascade. gad_campaignid wins outright; then the click join;
+            -- otherwise the remainder sentinel. Restricted to linked campaigns:
+            -- a gad_campaignid for a campaign this clinic does not own is not
+            -- evidence about this clinic's spend, so it falls to the remainder.
+            CASE
+              WHEN {_real_id_sql('f.gad_campaignid')}
+                   AND f.gad_campaignid IN UNNEST(@ga_ids) THEN f.gad_campaignid
+              WHEN cl.cid IS NOT NULL THEN cl.cid
+              ELSE '{UNATTRIBUTED_CAMPAIGN_ID}'
+            END AS campaign_id
+          FROM `{_CLINIC_DATA}.webforms` f
+          LEFT JOIN clicks cl ON cl.gclid = f.gclid
+          WHERE f.clinic_id = @clinic_id
+            AND {_ts_between("f.submitted_at", w)}
+        ),
+        -- One patient → one campaign (their earliest attributed form), so the
+        -- rows partition the population and revenue cannot be counted twice.
+        form_patients AS (
+          SELECT client_id, campaign_id FROM (
+            SELECT p.client_id, fo.campaign_id,
+                   ROW_NUMBER() OVER (PARTITION BY p.client_id
+                                      ORDER BY fo.submitted_at, fo.campaign_id) AS rn
+            FROM forms fo
+            JOIN patients p
+              ON (LENGTH(fo.phone_norm) = 10 AND fo.phone_norm = p.phone_norm)
+              OR (fo.email_norm != ''        AND fo.email_norm = p.email_norm)
+          )
+          WHERE rn = 1
+        ),
+        fp AS (
+          SELECT client_id, campaign_id FROM form_patients
+        ),
+        rev AS (
+          SELECT fp.campaign_id, SUM(amt) AS revenue
+          FROM (
+            SELECT fp.campaign_id, im.client_id, im.order_id,
+                   MAX(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS amt
+            FROM fp
+            JOIN `{_BP}.InvoiceMaster` im
+              ON im._clinic_id = @clinic_id AND im.client_id = fp.client_id
+            WHERE SAFE_CAST(im.order_total_with_tax AS NUMERIC) > 0
+              AND {_date_between("SAFE.PARSE_DATE('%Y-%m-%d', im.invoice_date)", w)}
+              {exclude}
+            GROUP BY fp.campaign_id, im.client_id, im.order_id
+          ) fp
+          GROUP BY fp.campaign_id
+        ),
+        counts AS (
+          SELECT campaign_id, COUNT(*) AS forms FROM forms GROUP BY campaign_id
+        )
+        SELECT
+          c.campaign_id,
+          c.forms,
+          IFNULL(r.revenue, 0) AS revenue
+        FROM counts c
+        LEFT JOIN rev r USING (campaign_id)
+        ORDER BY c.forms DESC
+    """
+    params = _params(clinic_id) + [
+        bigquery.ArrayQueryParameter("ga_ids", "STRING", [str(x) for x in ga_campaign_ids]),
+    ]
+    try:
+        rows = list(_client().query(
+            sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
+    except Exception as exc:
+        log.warning("webform_campaign_attribution failed for clinic_id=%s: %s",
+                    clinic_id, exc)
+        return []
+    return [
+        {
+            "campaign_id": r.campaign_id,
+            "forms": int(r.forms or 0),
+            "revenue": float(r.revenue or 0.0),
+            "unattributed": r.campaign_id == UNATTRIBUTED_CAMPAIGN_ID,
+        }
+        for r in rows
+    ]
 
 
 def paid_call_revenue_group(
@@ -3472,6 +4224,9 @@ def _stage2_outcome_detail(
           t.connect_duration,
           t.utm_medium,
           cs.reasoning,
+          -- Additive, for callers that must tell "did not book" from "we cannot
+          -- confirm the booking" — active_leads drops the latter from the inbox.
+          IFNULL(cs.appointment_booked, FALSE) AS appt_booked,
           {outcome_case} AS outcome
         FROM `{_CLINIC_DATA}.transactions` t
         JOIN `{_CLINIC_DATA}.callscoring` cs ON cs.complete_call_id = t.complete_call_id
@@ -4592,7 +5347,10 @@ def _call_tagging_cte(in_iv: str, w: "Window") -> str:
 _BUCKET_PREDICATE = {
     "booked": "genuine AND connected_raw AND reconciled",
     "existing_customer": "genuine AND connected_raw AND NOT reconciled AND NOT qualified AND existing",
-    "qualified_no_conversion": "genuine AND connected_raw AND NOT reconciled AND qualified",
+    # Mirrors the funnel: appt_booked is its own bucket and leaves this one.
+    "unconfirmed_booking": "genuine AND connected_raw AND NOT reconciled AND appt_booked",
+    "qualified_no_conversion":
+        "genuine AND connected_raw AND NOT reconciled AND NOT appt_booked AND qualified",
     # never_connected now = voicemail + hangup only (genuine requires a
     # transcript), so this drill-down no longer surfaces transcript-less calls.
     "never_connected": "genuine AND NOT connected_raw",
@@ -4647,7 +5405,9 @@ def call_outcomes_funnel(
         "booked_existing_deep_dormant": 0, "booked_existing_never": 0,
         "existing_patient": 0, "existing_active": 0, "existing_lapsed": 0,
         "existing_lapsing": 0, "existing_deep_dormant": 0, "existing_dormant_never": 0,
-        "qualified_not_booked": 0, "other": 0, "booked_rate": None,
+        "unconfirmed_booking": 0,
+        "qualified_not_booked": 0, "qualified_not_booked_callers": 0,
+        "other": 0, "booked_rate": None,
         "booked_method": "pms_reconciled", "match_days": int(match_days),
     }
     if not invoca_campaign_ids:
@@ -4697,8 +5457,28 @@ def call_outcomes_funnel(
               COUNTIF(genuine AND connected_raw AND existing AND appt_lapsing)        AS existing_lapsing,
               COUNTIF(genuine AND connected_raw AND existing AND appt_deep_dormant)   AS existing_deep_dormant,
               COUNTIF(genuine AND connected_raw AND existing AND appt_none)           AS existing_dormant_never,
-              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT existing AND looking_to_book)     AS qualified_not_booked,
-              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT existing AND NOT looking_to_book) AS other
+              -- appt_booked is EXCLUDED from both of the no-booking buckets below:
+              -- a transcript that says an appointment was made is not evidence of
+              -- a lost lead, so counting it as one overstated the recoverable leak.
+              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT existing AND appt_booked)         AS unconfirmed_booking,
+              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT existing AND NOT appt_booked AND looking_to_book)     AS qualified_not_booked,
+              COUNTIF(genuine AND connected_raw AND NOT reconciled AND NOT existing AND NOT appt_booked AND NOT looking_to_book) AS other,
+              -- The same population as qualified_not_booked, counted as PEOPLE
+              -- rather than calls: one caller who rang three times is one
+              -- recoverable lead, not three. Deliberately reuses the predicate
+              -- above verbatim so the two can never describe different cohorts.
+              --
+              -- Phone normalised to its last 10 digits, matching every other
+              -- phone match in this file. A call whose number is unusable falls
+              -- back to its own call id — we cannot prove it duplicates another
+              -- caller, and collapsing all of them into one would undercount.
+              COUNT(DISTINCT IF(
+                genuine AND connected_raw AND NOT reconciled AND NOT existing
+                  AND NOT appt_booked AND looking_to_book,
+                COALESCE(
+                  NULLIF(RIGHT(REGEXP_REPLACE(IFNULL(phone_raw, ''), r'\\D', ''), 10), ''),
+                  complete_call_id),
+                NULL)) AS qualified_not_booked_callers
             FROM tagged
     """
     try:
@@ -4735,7 +5515,9 @@ def call_outcomes_funnel(
         out["existing_lapsing"] = int(r.existing_lapsing or 0)
         out["existing_deep_dormant"] = int(r.existing_deep_dormant or 0)
         out["existing_dormant_never"] = int(r.existing_dormant_never or 0)
+        out["unconfirmed_booking"] = int(r.unconfirmed_booking or 0)
         out["qualified_not_booked"] = int(r.qualified_not_booked or 0)
+        out["qualified_not_booked_callers"] = int(r.qualified_not_booked_callers or 0)
         out["other"] = int(r.other or 0)
         out["booked_rate"] = (out["booked"] / out["connected"]) if out["connected"] else None
     return out
@@ -4938,6 +5720,77 @@ REVENUE_CHANNELS = ("call", "form", "portal", "customerio")
 _PORTAL_SOURCE = "counselear portal referral"
 _CIO_SOURCE = "customer.io campaign"
 
+# CHANNEL and MEDIUM are orthogonal dimensions and must stay that way.
+# `by_channel` answers where the revenue came from (a call, a form); `by_medium`
+# answers what marketing produced it. An earlier version put "Web form" in the
+# medium split, which is wrong twice over: it is not a canonical medium, and it
+# implied a form cannot have one. It can — see _form_medium_case_sql.
+#
+# The portal and Customer.io legs genuinely have no medium (a CounselEar portal
+# booking carries no analytics of any kind), so they report the same 'No data'
+# bucket a call with no usable UTM does. `by_channel` is where you learn they
+# were portal bookings.
+
+
+def average_invoice(clinic_id: str, window: "Window | None" = None) -> dict[str, Any]:
+    """Mean value of one positive invoice — **over the clinic's whole history by
+    default**, not a window.
+
+    Exists because the Recoverable-revenue tile needs a per-patient VALUATION, and
+    every windowed average was the wrong instrument for that:
+
+    * ``revenue_leakage.avg_invoice`` is scoped to the current CALENDAR MONTH
+      (``payloads.py`` builds `operational_health` as a month-over-month series),
+      so early in a month it is thin or zero. That is what made the tile read "no
+      average invoice in this range" on 19 Aug.
+    * The selected window has the same failure in miniature: a one-week range can
+      legitimately contain no invoices while the clinic obviously still has an
+      average invoice value.
+
+    An average invoice is a rate, not a quantity — it does not become unknowable
+    because the chosen window is short. So multiplying a window-scoped caller
+    count by an all-history average is deliberate: the count says how many people
+    are recoverable now, the average says what a patient is typically worth. Pass
+    an explicit ``window`` if a caller genuinely wants the windowed figure.
+
+    Positive invoices only, matching :func:`invoice_revenue` — zero-total rows are
+    credit notes and placeholders, and including them would drag the mean toward
+    zero. Fails safe to zeros: a clinic with no PMS feed has no invoices, and the
+    caller is expected to suppress rather than estimate against 0.
+    """
+    out = {"avg_invoice": 0.0, "invoice_count": 0,
+           "first_invoice": None, "last_invoice": None}
+    date_filter = ""
+    if window is not None:
+        date_filter = "AND " + _date_between(
+            "SAFE.PARSE_DATE('%Y-%m-%d', invoice_date)", window)
+    sql = f"""
+        SELECT COUNT(*) AS invoice_count,
+               AVG(SAFE_CAST(order_total_with_tax AS NUMERIC)) AS avg_invoice,
+               MIN(invoice_date) AS first_invoice,
+               MAX(invoice_date) AS last_invoice
+        FROM `{_BP}.InvoiceMaster`
+        WHERE _clinic_id = @clinic_id
+          AND SAFE_CAST(order_total_with_tax AS NUMERIC) > 0
+          {date_filter}
+    """
+    try:
+        rows = list(_client().query(
+            sql, job_config=bigquery.QueryJobConfig(
+                query_parameters=_params(clinic_id))).result())
+    except Exception as exc:
+        log.warning("average_invoice failed clinic=%s: %s", clinic_id, exc)
+        return out
+    if not rows:
+        return out
+    r = rows[0]
+    return {
+        "avg_invoice": float(r.avg_invoice or 0.0),
+        "invoice_count": int(r.invoice_count or 0),
+        "first_invoice": str(r.first_invoice) if r.first_invoice else None,
+        "last_invoice": str(r.last_invoice) if r.last_invoice else None,
+    }
+
 
 def pipeline_revenue_by_source(
     clinic_id: str,
@@ -5016,6 +5869,7 @@ def pipeline_revenue_by_source(
     out: dict[str, Any] = {
         "revenue": 0.0, "invoices": 0, "patients": 0,
         "by_source": [],
+        "by_medium": [],
         "by_channel": [{"channel": c, "revenue": 0.0, "invoices": 0, "patients": 0}
                        for c in REVENUE_CHANNELS],
     }
@@ -5031,7 +5885,8 @@ def pipeline_revenue_by_source(
     cio_params: list[Any] = []
     if customerio_touches:
         cio_cte = f"""
-          SELECT client_id, touch_ts, 'customerio' AS channel, '{_CIO_SOURCE}' AS source
+          SELECT client_id, touch_ts, 'customerio' AS channel,
+                 '{_CIO_SOURCE}' AS source, 'No data' AS medium
           FROM UNNEST(@cio_touches)
         """
         cio_params.append(bigquery.ArrayQueryParameter(
@@ -5047,25 +5902,40 @@ def pipeline_revenue_by_source(
         # structurally identical to the fed branch above, so the UNION ALL sees
         # the same columns and types either way.
         cio_cte = f"""
-          SELECT client_id, touch_ts, 'customerio' AS channel, '{_CIO_SOURCE}' AS source
+          SELECT client_id, touch_ts, 'customerio' AS channel,
+                 '{_CIO_SOURCE}' AS source, 'No data' AS medium
           FROM UNNEST(ARRAY<STRUCT<client_id STRING, touch_ts TIMESTAMP>>[])
         """
 
     sql = f"""
-        WITH call_touch AS (
+        WITH tx AS (
+          -- Pre-projected so _channel_case_sql()'s bare column references (um, us,
+          -- the four click ids, marketing_channel) resolve. Campaign + window
+          -- scoping happens here so the channel CASE never sees an out-of-scope row.
+          SELECT timestamp, calling_phone_number, utm_source,
+                 gclid, wbraid, gbraid, msclkid, fbclid, marketing_channel,
+                 LOWER(TRIM(utm_medium)) AS um,
+                 LOWER(TRIM(utm_source)) AS us
+          FROM `{_CLINIC_DATA}.transactions`
+          WHERE CAST(invoca_campaign_id AS STRING) IN {in_iv}
+            AND {_ts_between('timestamp', touch)}
+        ),
+        call_touch AS (
           SELECT pc.client_id AS client_id,
                  t.timestamp  AS touch_ts,
                  'call'       AS channel,
                  IF(t.utm_source IS NULL
                       OR LOWER(TRIM(t.utm_source)) IN ({noise}),
                     'direct / untagged',
-                    LOWER(TRIM(t.utm_source))) AS source
-          FROM `{_CLINIC_DATA}.transactions` t
+                    LOWER(TRIM(t.utm_source))) AS source,
+                 -- The SAME vocabulary the "Drivers of call traffic" section uses
+                 -- (channel_mix / traffic_drivers), so revenue-by-medium and
+                 -- calls-by-medium cannot describe the same traffic differently.
+                 ({_channel_case_sql()}) AS medium
+          FROM tx t
           JOIN `{_PATIENT_CONTACTS}` pc
             ON pc._clinic_id = @clinic_id AND LENGTH(pc.phone_norm) = 10
            AND pc.phone_norm = RIGHT(REGEXP_REPLACE(IFNULL(t.calling_phone_number, ''), r'\\D', ''), 10)
-          WHERE CAST(t.invoca_campaign_id AS STRING) IN {in_iv}
-            AND {_ts_between('t.timestamp', touch)}
         ),
         -- Same submitter→patient rule as webform_revenue (phone last-10 OR
         -- email), so the two readers cannot disagree about who is a form lead.
@@ -5073,6 +5943,9 @@ def pipeline_revenue_by_source(
           SELECT RIGHT(REGEXP_REPLACE(IFNULL(phone_number, ''), r'\\D', ''), 10) AS phone_norm,
                  LOWER(TRIM(IFNULL(email, '')))                                  AS email_norm,
                  submitted_at,
+                 gclid, gbraid, wbraid, gad_campaignid, fbclid,
+                 LOWER(TRIM(utm_medium)) AS fum,
+                 LOWER(TRIM(IFNULL(referrer_host, ''))) AS fref,
                  IF(utm_source IS NULL
                       OR LOWER(TRIM(utm_source)) IN ({noise}),
                     'direct / untagged',
@@ -5085,7 +5958,8 @@ def pipeline_revenue_by_source(
           SELECT p.client_id AS client_id,
                  f.submitted_at AS touch_ts,
                  'form'         AS channel,
-                 f.source       AS source
+                 f.source       AS source,
+                 ({_form_medium_case_sql()}) AS medium
           FROM form_src f
           JOIN (SELECT DISTINCT client_id, phone_norm, email_norm
                 FROM `{_PATIENT_CONTACTS}` WHERE _clinic_id = @clinic_id) p
@@ -5096,7 +5970,8 @@ def pipeline_revenue_by_source(
           SELECT CAST(patient_id AS STRING) AS client_id,
                  TIMESTAMP(appt_date)       AS touch_ts,
                  'portal'                   AS channel,
-                 '{_PORTAL_SOURCE}'         AS source
+                 '{_PORTAL_SOURCE}'         AS source,
+                 'No data'                  AS medium
           FROM `{_COUNSELEAR}.appointments`
           WHERE _clinic_id = @clinic_id AND appt_referral_type = @ztag
             AND patient_id IS NOT NULL
@@ -5114,7 +5989,7 @@ def pipeline_revenue_by_source(
         -- overlapping tallies.
         first_touch AS (
           SELECT client_id,
-                 ARRAY_AGG(STRUCT(source, channel)
+                 ARRAY_AGG(STRUCT(source, channel, medium)
                            ORDER BY touch_ts, channel, source LIMIT 1)[OFFSET(0)] AS t
           FROM touches
           WHERE client_id IS NOT NULL
@@ -5124,6 +5999,7 @@ def pipeline_revenue_by_source(
           SELECT im.order_id,
                  ANY_VALUE(ft.t.source)                             AS source,
                  ANY_VALUE(ft.t.channel)                            AS channel,
+                 ANY_VALUE(ft.t.medium)                             AS medium,
                  ANY_VALUE(CAST(im.client_id AS STRING))            AS client_id,
                  MAX(SAFE_CAST(im.order_total_with_tax AS NUMERIC)) AS amt
           FROM `{_BP}.InvoiceMaster` im
@@ -5136,12 +6012,12 @@ def pipeline_revenue_by_source(
         -- Grouped by BOTH so the two breakdowns are folded from one row set in
         -- Python. Querying them separately would let the source split and the
         -- channel split disagree about the total they are each parts of.
-        SELECT source, channel,
+        SELECT source, channel, medium,
                SUM(amt)                  AS revenue,
                COUNT(DISTINCT order_id)  AS invoices,
                COUNT(DISTINCT client_id) AS patients
         FROM inv
-        GROUP BY source, channel
+        GROUP BY source, channel, medium
     """
     params = [
         bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
@@ -5171,6 +6047,7 @@ def pipeline_revenue_by_source(
         return sorted(acc.values(), key=lambda d: (-d["revenue"], d[key]))
 
     by_source = _fold(rows, "source")
+    by_medium = _fold(rows, "medium")
     # Seeded with every channel so one that contributed nothing reports zero
     # rather than vanishing — an absent channel reads as "not configured".
     by_channel = _fold(rows, "channel", REVENUE_CHANNELS)
@@ -5178,6 +6055,7 @@ def pipeline_revenue_by_source(
     # Totals are summed from the breakdown rather than queried separately, so the
     # headline figure and the charts drawn under it cannot drift apart.
     out["by_source"] = by_source
+    out["by_medium"] = by_medium
     out["by_channel"] = by_channel
     out["revenue"] = sum(s["revenue"] for s in by_source)
     out["invoices"] = sum(s["invoices"] for s in by_source)
@@ -5834,6 +6712,14 @@ def line_item_calls(
             WHEN t.connected_raw AND t.reconciled THEN 'booked'
             WHEN t.connected_raw AND t.existing   THEN 'existing_patient'
             WHEN t.connected_raw AND led.complete_call_id IS NOT NULL THEN 'led_to_booking'
+            -- The transcript says an appointment was booked, but no PMS
+            -- appointment reconciled to it (§4) and it did not precede a booking
+            -- from the same number either. NOT a lost lead — most likely a
+            -- booking the PMS feed cannot see: booked outside the 0-3 day
+            -- created_time window, entered under a different phone, or a feed
+            -- gap. Carved out of qualified_no_conversion / other, which were
+            -- treating "we cannot confirm it" as "they did not book".
+            WHEN t.connected_raw AND t.appt_booked THEN 'unconfirmed_booking'
             WHEN t.connected_raw AND t.looking_to_book THEN 'qualified_no_conversion'
             WHEN t.connected_raw                  THEN 'other'
             ELSE 'no_conversation'

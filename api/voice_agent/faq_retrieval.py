@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 
+from google.api_core import exceptions as gapi_exceptions
 from google.cloud import bigquery
 
 from api.deps import PROJECT, bq_client
@@ -201,9 +202,32 @@ def search_faqs(
         bigquery.ScalarQueryParameter("question", "STRING", question),
         bigquery.ScalarQueryParameter("max_distance", "FLOAT64", float(max_distance)),
     ]
-    rows = bq_client.query(
-        sql, job_config=bigquery.QueryJobConfig(query_parameters=params),
-    ).result()
+    # Retrieval failure must degrade to "no match", never to an exception.
+    #
+    # This runs mid-call: an unhandled error becomes a 500 to VAPI while a
+    # caller is on the line, which loses the turn entirely. An empty result is
+    # already a state the contract defines and the prompt handles — the agent
+    # says a team member will confirm and captures the question in the ticket —
+    # so degrading costs one unanswered question instead of the call. Same
+    # reasoning the route applies to an unparseable config row: "must not take
+    # the tool down mid-call".
+    #
+    # Scoped to Google API errors so infrastructure faults degrade while
+    # programming errors still surface. The concrete case that motivated this:
+    # ``ClinicData.faq_embeddings`` does not exist until the one-time
+    # ``resources/faq-vector-setup.sql`` is run, so every call raised NotFound.
+    # Logged at ERROR because a silent zero-result FAQ tool looks identical to
+    # an empty corpus, and that is the failure you would never notice.
+    try:
+        rows = bq_client.query(
+            sql, job_config=bigquery.QueryJobConfig(query_parameters=params),
+        ).result()
+    except gapi_exceptions.GoogleAPIError as exc:
+        log.error(
+            "faq search failed clinic=%s (degrading to no-match): %s",
+            clinic_id, exc,
+        )
+        return []
     return [
         {
             "question": r["question"],

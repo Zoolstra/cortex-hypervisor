@@ -66,6 +66,17 @@ class ACNAAvailabilityConfig(BaseModel):
         default_factory=lambda: [
             TypePair(placeholder_event_type_id=200, real_event_type_id=207,
                      display_name="Annual"),
+            # Technician clean-and-check. Placeholder 8 ('Z Maintenance/RA',
+            # 30m, titled "C&C RA 1"/"C&C RA 2") → real 204 ('Service', 30m).
+            # Derived from ACNA's booked history, not guessed: of 1,786 Service
+            # appointments only the technician-grid ones are placeholder-paired
+            # at a matching duration, and 'Z Maintenance/RA' carries only the
+            # two technicians. Named for what the visit IS so the agent does
+            # not offer it as a clinician appointment — a CLINICIAN service
+            # visit has no placeholder grid (11% paired, durations mismatched)
+            # and stays unbookable by design.
+            TypePair(placeholder_event_type_id=8, real_event_type_id=204,
+                     display_name="Hearing Aid Clean and Check"),
         ]
     )
 

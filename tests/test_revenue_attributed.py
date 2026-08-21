@@ -50,9 +50,12 @@ class _FakeClient:
         return _FakeJob(self._rows)
 
 
-def _row(source, channel, revenue, invoices=1, patients=1):
-    return _FakeRow(source=source, channel=channel, revenue=revenue,
-                    invoices=invoices, patients=patients)
+def _row(source, channel, revenue, invoices=1, patients=1, medium="Paid"):
+    """`medium` is one of TRAFFIC_CHANNELS for EVERY channel — it is a marketing
+    dimension orthogonal to the acquisition channel, so there is no per-channel
+    default to infer here."""
+    return _FakeRow(source=source, channel=channel, medium=medium,
+                    revenue=revenue, invoices=invoices, patients=patients)
 
 
 WINDOW = q.Window("2026-05-01", "2026-08-31")
@@ -99,7 +102,7 @@ def test_first_touch_picks_one_source_and_channel_per_patient(run):
     # partitions instead of overlapping tallies.
     assert "LIMIT 1" in ft
     assert "GROUP BY client_id" in ft
-    assert "STRUCT(source, channel)" in ft
+    assert "STRUCT(source, channel, medium)" in ft
     # Full timestamp, not the date: same-day ties land on exactly the patients
     # most likely to have both a call and a form.
     assert "ORDER BY touch_ts, channel, source" in ft
@@ -112,10 +115,23 @@ def test_portal_leg_is_ordered_at_midnight(run):
     assert "TIMESTAMP(appt_date)" in leg
 
 
-def test_form_leg_does_not_fall_back_to_referrer_host(run):
+def test_referrer_host_never_becomes_a_campaign_SOURCE(run):
     """Contract §14a: a referrer is not a campaign source. Presenting one as the
-    other is the mislabel the ingest split was built to end."""
-    assert "referrer_host" not in run([])[1].sql[0]
+    other is the mislabel the ingest split was built to end.
+
+    The MEDIUM dimension may consult it — a search-engine referrer is real
+    evidence of organic arrival — but the source label must stay utm_source only,
+    or `by_source` starts listing hostnames as if they were campaigns. The two
+    dimensions are computed in the same CTE, so this is worth pinning.
+    """
+    _, c = run([])
+    leg = c.sql[0].split("form_touch AS (", 1)[1].split("portal_touch AS (", 1)[0]
+    source_expr = leg.split("AS source", 1)[0]
+    assert "referrer_host" not in source_expr
+    assert "fref" not in source_expr
+    # And the source projection in form_src reads utm_source, nothing else.
+    src = c.sql[0].split("form_src AS (", 1)[1].split("AS source", 1)[0]
+    assert "referrer_host" not in src.split("utm_source", 1)[1]
 
 
 def test_invoices_are_deduped_per_order(run):
@@ -176,6 +192,75 @@ def test_form_revenue_is_counted_in_the_total(run):
     assert out["revenue"] == 4200.0
     by_chan = {c["channel"]: c["revenue"] for c in out["by_channel"]}
     assert by_chan["form"] == 4200.0
+
+
+def test_medium_uses_the_canonical_traffic_channel_vocabulary(run):
+    """Reuse, not a second taxonomy: `channel_mix` already buckets call traffic
+    into Paid/Organic/Direct/Referral/Social, and a revenue chart that invented
+    its own would describe the same traffic differently on the same page."""
+    _, c = run([])
+    # Split on the NEXT CTE, not on "),": the medium CASE contains that sequence
+    # itself, which truncated the slice before the thing under test.
+    leg = c.sql[0].split("call_touch AS (", 1)[1].split("form_src AS (", 1)[0]
+    assert "AS medium" in leg
+    # The CASE from _channel_case_sql, not a raw utm_medium GROUP BY — which would
+    # split cpc / paid / 'paid search' into three slices for one medium.
+    assert "'Paid'" in leg and "'Organic'" in leg and "'Social'" in leg
+    for m in q._PAID_MEDIUMS:
+        assert f"'{m}'" in leg, m
+
+
+def test_medium_only_ever_holds_canonical_mediums(run):
+    """Channel and medium are orthogonal. "Web form" is not a medium, and a form
+    IS allowed a real one — so the medium split must never carry a channel name."""
+    out, _ = run([
+        _row("google", "form", 4200.0, medium="Paid"),
+        _row("counselear portal referral", "portal", 1000.0, medium="No data"),
+    ])
+    meds = {m["medium"]: m["revenue"] for m in out["by_medium"]}
+    assert meds == {"Paid": 4200.0, "No data": 1000.0}
+    assert not ({"Web form", "Portal referral", "Customer.io"} & set(meds))
+
+
+def test_form_medium_reads_click_ids_before_utm(run):
+    """utm_medium is populated ZERO times across all 292 submissions, so a
+    utm-first rule would file every form under 'No data' permanently. The click
+    ids — including gad_campaignid, which resolved for 13/13 — are the only paid
+    evidence a form carries."""
+    _, c = run([])
+    leg = c.sql[0].split("form_touch AS (", 1)[1].split("portal_touch AS (", 1)[0]
+    paid = leg.index("'Paid'")
+    for col in ("f.gclid", "f.gbraid", "f.wbraid", "f.gad_campaignid"):
+        assert col in leg[:paid], col
+    # The referrer fallback must sit AFTER every click-id and UTM branch, or a
+    # google.com referrer would be labelled Organic on a submission that carried
+    # real paid evidence.
+    assert leg.index("f.fref") > paid
+    assert leg.index("f.fref") > leg.index("f.fum")
+
+
+def test_referrer_host_fallback_splits_search_direct_and_referral(run):
+    """Accepted imprecision: a google.com referrer may be paid with a dropped
+    click id. Bounded by ordering — anything with real paid evidence never reaches
+    this branch. Without it, ~89 referrer-bearing submissions sit in 'No data'."""
+    _, c = run([])
+    leg = c.sql[0].split("form_touch AS (", 1)[1].split("portal_touch AS (", 1)[0]
+    assert "REGEXP_CONTAINS(f.fref" in leg
+    assert "'Organic'" in leg and "'Direct'" in leg and "'Referral'" in leg
+    # 'direct' is the ingest's no-referrer sentinel, not a hostname.
+    assert "f.fref = 'direct'" in leg
+
+
+def test_all_three_breakdowns_partition_the_same_total(run):
+    out, _ = run([
+        _row("google", "call", 600.0, 3, 2, medium="Paid"),
+        _row("bing", "call", 100.0, 1, 1, medium="Organic"),
+        _row("direct / untagged", "form", 400.0, 2, 1),
+    ])
+    total = out["revenue"]
+    assert total == 1100.0
+    for key in ("by_source", "by_medium", "by_channel"):
+        assert sum(s["revenue"] for s in out[key]) == total, key
 
 
 def test_both_breakdowns_partition_the_same_total(run):

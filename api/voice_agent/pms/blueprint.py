@@ -468,13 +468,15 @@ class BlueprintAdapter(PMSAdapter):
             if t.get("name")
         ]
 
-    def _raw_event_type(self, event_type_id: int) -> dict | None:
-        """Return the raw clinicConfiguration appointmentTypes entry by id.
+    def raw_event_types(self) -> list[dict]:
+        """The FULL clinicConfiguration appointmentTypes pool, unfiltered.
 
-        Unlike ``list_appointment_types`` this does NOT drop null-named /
-        non-online-booking types, so callers can resolve an event type's
-        duration + name even when it isn't flagged for online booking. Returns
-        None if the id isn't in the pool.
+        Unlike ``list_appointment_types`` this keeps null-named /
+        non-online-booking types. Placeholder-grid clinics book real types that
+        are deliberately not flagged for online booking (ACNA's 'Service' = 204
+        is booked into the technician clean-and-check grid), so anything that
+        needs a type's duration or name must read this pool rather than the
+        online-bookable subset.
         """
         config = self._require_http_config()
         base = _blueprint_base(config)
@@ -484,7 +486,17 @@ class BlueprintAdapter(PMSAdapter):
             timeout=15,
         )
         resp.raise_for_status()
-        for t in resp.json().get("appointmentTypes", []):
+        return resp.json().get("appointmentTypes", []) or []
+
+    def _raw_event_type(self, event_type_id: int) -> dict | None:
+        """Return the raw clinicConfiguration appointmentTypes entry by id.
+
+        Unlike ``list_appointment_types`` this does NOT drop null-named /
+        non-online-booking types, so callers can resolve an event type's
+        duration + name even when it isn't flagged for online booking. Returns
+        None if the id isn't in the pool.
+        """
+        for t in self.raw_event_types():
             if t.get("id") == event_type_id:
                 return t
         return None
@@ -957,11 +969,14 @@ class BlueprintAdapter(PMSAdapter):
         start_dt = self._combine_local(start_date, start_time, tz)
         end_dt = self._combine_local(start_date, end_time, tz)
 
-        # Caller-facing summary line. Patient name preferred; falls back
-        # to event-type-id (Blueprint uses the summary in their UI).
+        # Summary line. Patient name preferred; falls back to the appointment's
+        # NAME, never its event-type id — Blueprint renders the summary in the
+        # calendar staff work from, and an existing patient booked by
+        # patient_id carries no first/last name here, so the id fallback was
+        # what staff actually saw.
         summary = " ".join(
             p for p in [first_name, last_name] if p
-        ).strip() or f"Appointment (eventType={event_type_id})"
+        ).strip() or type_name
 
         payload: dict = {
             "apiKey": config["api_key"],
@@ -1199,6 +1214,7 @@ class BlueprintAdapter(PMSAdapter):
         phone: str | None = None,
         notes: str | None = None,
         excluded_providers: list[str] | None = None,
+        display_name: str | None = None,
     ) -> BookingResult:
         """Book a real appointment into a free placeholder space.
 
@@ -1281,7 +1297,19 @@ class BlueprintAdapter(PMSAdapter):
                     "in Blueprint — cannot derive end time."
                 ),
             )
-        type_name = (raw_type.get("name") or f"Appointment (eventType={real_event_type_id})")
+        # Name the appointment the way the CLINIC names it, never by its id.
+        # Blueprint returns name=null for any type not flagged for online
+        # booking — ACNA's 'Service' (204) is one — so the old fallback wrote
+        # "Appointment (eventType=204)" into a record staff read. The clinic
+        # noticed the equivalent on the Annual ("this weird event type 207",
+        # 2026-07-27). The TypePair display name exists precisely because
+        # Blueprint withholds this, so it is the better source; the raw name is
+        # the fallback, and the id is no longer a candidate.
+        type_name = (
+            (display_name or "").strip()
+            or raw_type.get("name")
+            or "Appointment"
+        )
         end_time = self._add_minutes(start_time, duration)
 
         return self._post_appointment(

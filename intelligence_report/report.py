@@ -1390,8 +1390,16 @@ def _section_roas(
             'linked campaigns.</div>',
         )
 
+    # `revenue_total` = call + paid-form revenue, folded on by
+    # queries.merge_campaign_forms. Read here rather than recomputed so this
+    # report and the SPA ads tab cannot print two different ROAS values for the
+    # same campaign. Falls back to the call-only `revenue` when the rows predate
+    # the merge, which keeps older cached reports rendering their prior figure.
+    def _rev(r: dict) -> float:
+        return float(r.get("revenue_total", r["revenue"]))
+
     tot_spend   = sum(r["spend"] for r in rows)
-    tot_revenue = sum(r["revenue"] for r in rows)
+    tot_revenue = sum(_rev(r) for r in rows)
     blended_roas = (tot_revenue / tot_spend) if tot_spend else 0.0
 
     def _pct(v: float) -> str:
@@ -1404,8 +1412,8 @@ def _section_roas(
     for r in rows:
         summary = (
             f'spend <b>{_fmt_money(r["spend"])}</b> &nbsp;·&nbsp; '
-            f'revenue <b>{_fmt_money(r["revenue"])}</b> &nbsp;·&nbsp; '
-            f'ROAS <b>{_roas(r["roas"])}</b>'
+            f'revenue <b>{_fmt_money(_rev(r))}</b> &nbsp;·&nbsp; '
+            f'ROAS <b>{_roas(r.get("roas_total") or r["roas"])}</b>'
         )
         stages = (
             '<div class="roi-stages">'

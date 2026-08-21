@@ -106,7 +106,16 @@ def _group_clinic_specs(db: Session, instance_id: str) -> list[dict]:
 #
 # 2026-08-17: pipeline_revenue_by_source gained the web-form channel and
 #             cross-channel first touch (methodology-contract §14b).
-_METHODOLOGY_VERSION = "2026-08-17.1"
+# 2026-08-18: added `by_medium` (a third partition of the same total). MUST bump:
+#             payloads cached by the previous revision have no `by_medium` key at
+#             all, and serving one would leave the dashboard's medium view empty
+#             with nothing to indicate why.
+# 2026-08-19: `unconfirmed_booking` carved out of qualified_not_booked / other
+#             (contract §4a). This CHANGES a parity-frozen funnel bucket, so the
+#             bump is mandatory — a cached payload would still report the old
+#             qualified_not_booked and the Recoverable tile would price a cohort
+#             the funnel no longer reports.
+_METHODOLOGY_VERSION = "2026-08-20.6"
 
 
 def _group_data_version(clinic_ids: list[str]) -> str:
@@ -604,7 +613,7 @@ def get_pipeline_revenue(
     window = _resolve_window(start, end, days)
     invoca_ids, _ = _active_campaign_ids(db, clinic_id)
 
-    from intelligence_report.queries import pipeline_revenue_by_source
+    from intelligence_report.queries import average_invoice, pipeline_revenue_by_source
 
     key = ("pipeline-revenue", clinic_id, window.start_date, window.end_date_excl,
            getattr(clinic, "pms_type", None) or "none", _data_version(clinic_id),
@@ -619,6 +628,11 @@ def get_pipeline_revenue(
     # not a change to the SQL.
     out = {
         **pipeline_revenue_by_source(clinic_id, invoca_ids, window=window),
+        # Deliberately NOT window-scoped — see the reader's docstring. The
+        # Recoverable-revenue tile needs a per-patient valuation, and a short
+        # window (or an early-in-the-month one) legitimately holds no invoices
+        # while the clinic obviously still has an average invoice value.
+        "avg_invoice": average_invoice(clinic_id),
         "window": {"start": window.start_date, "end": window.end_date_excl},
     }
     _cache_store(key, clinic_id, out, use_cache=use_cache)
@@ -742,6 +756,122 @@ def get_group_overview(
     return payload
 
 
+@router.get("/intelligence/group/{instance_id}/pipeline-revenue")
+def get_group_pipeline_revenue(
+    instance_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 365,
+    nocache: bool = False,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Instance-wide "Revenue attributed" — the same shape as the per-clinic
+    route, so the rollup renders the dashboard through the same components.
+
+    **Fans the per-clinic reader and merges in Python**, rather than a new
+    cross-clinic SQL. That is the rule for this whole section (see
+    `build_group_overview`): one implementation of the methodology, exercised N
+    times, so the rollup cannot drift from the clinic pages it sums. It also
+    reuses BigQuery's results cache warmed by those pages.
+
+    Merge rules, following the three kinds in cortex-hypervisor/CLAUDE.md:
+
+    * **Additive** — `revenue`, `invoices`, and every `by_source` / `by_medium` /
+      `by_channel` slice. An invoice belongs to exactly one clinic, so summing
+      cannot double-count it, and each patient's first touch is resolved inside
+      their own clinic.
+    * **Derived** — `avg_invoice` is recomputed as total revenue ÷ total invoice
+      count. NEVER an average of per-clinic averages, which would weight a
+      12-invoice location like a 400-invoice one.
+    * **Distinct people** — `patients` is NOT deduplicated. `client_id` is
+      clinic-scoped, so the same person at two locations is two ids and there is
+      no cross-clinic key here. It is therefore a count of patient RECORDS, and
+      the payload says so in `aggregation_notes` rather than quietly overstating
+      distinct people.
+    """
+    instance = db.get(Instance, instance_id)
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    require_read_access(instance_id, caller)
+    if not getattr(instance, "multi_location_group", False):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    window = _resolve_window(start, end, days)
+    clinic_specs = _group_clinic_specs(db, instance_id)
+
+    key = ("group-pipeline-revenue", instance_id, window.start_date, window.end_date_excl,
+           "|".join(f"{c['clinic_id']}:{c['pms_type']}"
+                    for c in sorted(clinic_specs, key=lambda c: c["clinic_id"])),
+           _group_data_version([c["clinic_id"] for c in clinic_specs]),
+           _METHODOLOGY_VERSION)
+    use_cache = not nocache
+    cached = _cache_lookup(key, instance_id, use_cache=use_cache)
+    if cached is not None:
+        return cached
+
+    from intelligence_report.queries import average_invoice, pipeline_revenue_by_source
+
+    revenue, invoices, patients = 0.0, 0, 0
+    by_source: dict[str, dict] = {}
+    by_medium: dict[str, dict] = {}
+    by_channel: dict[str, dict] = {}
+    inv_total, inv_count = 0.0, 0
+
+    def _merge(acc: dict, rows: list[dict], key_name: str) -> None:
+        for r in rows:
+            slot = acc.setdefault(r[key_name], {key_name: r[key_name],
+                                                "revenue": 0.0, "invoices": 0, "patients": 0})
+            slot["revenue"] += r.get("revenue", 0.0)
+            slot["invoices"] += r.get("invoices", 0)
+            slot["patients"] += r.get("patients", 0)
+
+    for spec in clinic_specs:
+        cid = spec["clinic_id"]
+        # Fail-safe per clinic, matching group_queries._safe: one clinic without a
+        # PMS feed must not blank the whole rollup.
+        try:
+            part = pipeline_revenue_by_source(cid, spec["invoca_ids"], window=window)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("group pipeline-revenue: clinic %s failed: %s", cid, exc)
+            continue
+        revenue += part["revenue"]
+        invoices += part["invoices"]
+        patients += part["patients"]
+        _merge(by_source, part["by_source"], "source")
+        _merge(by_medium, part["by_medium"], "medium")
+        _merge(by_channel, part["by_channel"], "channel")
+        try:
+            ai = average_invoice(cid)
+        except Exception:  # noqa: BLE001
+            ai = None
+        if ai and ai["invoice_count"]:
+            # Recompose the mean from its components, per the derived-metric rule.
+            inv_total += ai["avg_invoice"] * ai["invoice_count"]
+            inv_count += ai["invoice_count"]
+
+    desc = lambda acc, k: sorted(acc.values(), key=lambda d: (-d["revenue"], d[k]))  # noqa: E731
+    out = {
+        "revenue": revenue, "invoices": invoices, "patients": patients,
+        "by_source": desc(by_source, "source"),
+        "by_medium": desc(by_medium, "medium"),
+        "by_channel": desc(by_channel, "channel"),
+        "avg_invoice": {
+            "avg_invoice": (inv_total / inv_count) if inv_count else 0.0,
+            "invoice_count": inv_count, "first_invoice": None, "last_invoice": None,
+        },
+        "window": {"start": window.start_date, "end": window.end_date_excl},
+        "aggregation_notes": [
+            "Revenue and invoices are summed across locations; an invoice belongs "
+            "to one clinic, so nothing is double-counted.",
+            "Patient counts are RECORDS, not distinct people — client_id is "
+            "clinic-scoped, so someone seen at two locations counts twice.",
+        ],
+    }
+    _cache_store(key, instance_id, out, use_cache=use_cache)
+    return out
+
+
 @router.get("/intelligence/group/{instance_id}/calls")
 def get_group_line_item_calls(
     instance_id: str,
@@ -842,6 +972,108 @@ def get_active_leads(
     )
     _cache_store(key, clinic_id, payload, use_cache=use_cache)
     return payload
+
+
+@router.get("/intelligence/group/{instance_id}/active-leads")
+def get_group_active_leads(
+    instance_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 90,
+    nocache: bool = False,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Instance-wide active-leads inbox — every location's open leads in one list.
+
+    Fans :func:`build_active_leads` per clinic and merges, same rule as the rest of
+    this section: one implementation of the scoring, exercised N times.
+
+    **Merged on the lead key, which is phone/email — so a person who contacted two
+    locations is ONE lead, not two.** That is the cross-clinic identity rule from
+    cortex-hypervisor/CLAUDE.md: `client_id` is clinic-scoped and cannot be
+    compared across locations, but a phone number can. When the same person shows
+    up twice, the higher expected-recoverable-revenue row wins and the touch counts
+    add, because the two contacts are one person's history.
+
+    `clinic_name` is carried on every lead so a caller can tell which location to
+    ring — without it an instance-wide list is unactionable.
+    """
+    instance = db.get(Instance, instance_id)
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    require_read_access(instance_id, caller)
+    if not getattr(instance, "multi_location_group", False):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    window = _resolve_window(start, end, days)
+    clinics = db.execute(
+        select(Clinic).where(Clinic.instance_id == instance_id,
+                             Clinic.deleted_at.is_(None))
+    ).scalars().all()
+
+    key = ("group-active-leads", instance_id, window.start_date, window.end_date_excl,
+           _group_data_version([c.clinic_id for c in clinics]), _METHODOLOGY_VERSION)
+    use_cache = not nocache
+    cached = _cache_lookup(key, instance_id, use_cache=use_cache)
+    if cached is not None:
+        return cached
+
+    from intelligence_report.active_leads import build_active_leads
+
+    merged: dict[str, dict] = {}
+    counts = {"qualified_call": 0, "missed_call": 0, "form": 0}
+    for clinic in clinics:
+        invoca_ids, _ = _active_campaign_ids(db, clinic.clinic_id)
+        try:
+            part = build_active_leads(
+                clinic_id=clinic.clinic_id,
+                clinic_name=clinic.clinic_name,
+                invoca_campaign_ids=invoca_ids,
+                window=window,
+                location_hours=_location_hours(clinic),
+            )
+        except Exception as exc:  # noqa: BLE001 — one location must not blank the list
+            log.warning("group active-leads: clinic %s failed: %s", clinic.clinic_id, exc)
+            continue
+        for lead in part.get("leads", []):
+            lead = {**lead, "clinic_name": clinic.clinic_name,
+                    "clinic_id": clinic.clinic_id}
+            prev = merged.get(lead["key"])
+            if prev is None:
+                merged[lead["key"]] = lead
+                continue
+            # Same person at two locations. Keep the more valuable row, but add the
+            # touches — the contacts happened, whichever site took them.
+            keep, drop = (
+                (lead, prev)
+                if (lead.get("expected_recoverable_revenue") or 0)
+                   > (prev.get("expected_recoverable_revenue") or 0)
+                else (prev, lead)
+            )
+            keep = {**keep, "touches": (keep.get("touches") or 0) + (drop.get("touches") or 0)}
+            merged[lead["key"]] = keep
+
+    leads = sorted(merged.values(),
+                   key=lambda l: -(l.get("expected_recoverable_revenue") or 0))
+    for l in leads:
+        counts[l["subtype"]] = counts.get(l["subtype"], 0) + 1
+
+    out = {
+        "instance_id": instance_id,
+        "instance_name": instance.instance_name,
+        "is_group": True,
+        "lead_count": len(leads),
+        "source_counts": counts,
+        "leads": leads,
+        "window": {"start": window.start_date, "end": window.end_date_excl},
+        "aggregation_notes": [
+            "Leads are deduplicated across locations on phone/email, so someone "
+            "who contacted two sites appears once with their touches combined.",
+        ],
+    }
+    _cache_store(key, instance_id, out, use_cache=use_cache)
+    return out
 
 
 # ── Patient Journey (PHI — admin/super_admin only, audited) ──────────────────

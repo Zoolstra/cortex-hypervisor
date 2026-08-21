@@ -49,11 +49,35 @@ def resolve(clinic: Clinic) -> dict:
         country, _TRANSCRIBER_LANGUAGE_DEFAULT
     )
 
+    # The date in the prompt is a VAPI **template**, not `today_local`.
+    #
+    # The system prompt is compiled once and pushed to the assistant, so a
+    # baked-in date freezes at the moment of the last sync — the live ACNA
+    # assistant spent ten days telling the model it was 2026-08-10, which
+    # silently skews every relative date the caller offers ("next Tuesday").
+    # Nothing was wrong with the value; it was simply computed in the wrong
+    # place. VAPI renders the prompt through LiquidJS on each call and fills
+    # `now` from the current UTC time, so this resolves at CALL time instead:
+    #
+    #     {{"now" | date: "%A, %Y-%m-%d", "America/Edmonton"}}
+    #        -> "Wednesday, 2026-08-20"
+    #
+    # The timezone argument is what converts UTC to clinic-local; without it a
+    # call after 17:00 MST would read as tomorrow. The weekday is included
+    # because the agent has to resolve "next Tuesday" against it, and the ISO
+    # date because that is the form the availability/booking tools take.
+    #
+    # `today_local` is still returned for server-side callers, but it must NOT
+    # go back into the prompt — that is precisely the bug this replaced.
+    today_template = (
+        f'{{{{"now" | date: "%A, %Y-%m-%d", "{timezone}"}}}}'
+    )
+
     prompt_block = (
         "## Locale\n"
         f"- Country: {country}\n"
         f"- Timezone: {timezone}\n"
-        f"- Today's date (clinic local): {today_local}\n"
+        f"- Today's date (clinic local): {today_template}\n"
         "Always reason about days, hours, and appointment times in the clinic's local timezone."
     )
 

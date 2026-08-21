@@ -99,6 +99,13 @@ def build_active_leads(
 
     for c in _safe(lambda: q.qualified_lead_no_conv_detail(clinic_id, invoca_campaign_ids, window=w),
                    "qualified"):
+        # Skip unconfirmed bookings: the transcript says an appointment WAS made,
+        # it just did not reconcile to the PMS (contract §4a). Those are a
+        # reconciliation gap to investigate, not a caller to chase — leaving them
+        # in had staff ringing people who had already booked, and inflated the
+        # inbox with the clinic's least winnable "leads".
+        if c.get("appt_booked"):
+            continue
         d, _h = _parse_local(c.get("start_time_local"))
         raw.append({
             "source": "call", "subtype": "qualified_call",

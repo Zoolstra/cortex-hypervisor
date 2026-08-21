@@ -566,11 +566,19 @@ def placeholder_appointment_types(
     Returns {real_event_type_id, name, duration_minutes}. ``name`` is the
     config display name (what the agent matches against); duration comes from
     Blueprint when the real type is known there.
+
+    Durations read the FULL type pool, not the online-bookable subset: a
+    placeholder-grid real type need not be flagged for online booking (ACNA's
+    'Service' = 204 isn't), and the booking path already derives its duration
+    from the same pool. Reading the subset here would report a null duration
+    for exactly those types the agent can actually book.
     """
     pairs = _placeholder_pairs(db, clinic_id)
     adapter = BlueprintAdapter(clinic_id=clinic_id)
     adapter.load_http_config(db)
-    durations = {t.id: t.duration_minutes for t in adapter.list_appointment_types()}
+    durations = {
+        t.get("id"): t.get("duration") for t in adapter.raw_event_types()
+    }
     return {
         "appointment_types": [
             {
@@ -651,6 +659,10 @@ def placeholder_book_appointment(
         phone=body.phone,
         notes=body.notes,
         excluded_providers=_excluded_providers(db, clinic_id),
+        # The clinic's own name for the type. Blueprint returns name=null for
+        # types not flagged for online booking, so without this the record
+        # would be labelled by event-type id.
+        display_name=pair.display_name,
     )
     if body.patient_id:
         log_phi_access(

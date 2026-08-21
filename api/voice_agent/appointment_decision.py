@@ -81,11 +81,17 @@ PAYER_ALBERTA = "Alberta"
 PAYER_NIHB = "NIHB"
 PAYER_BLUE_CROSS = "Blue Cross"
 PAYER_AADL = "AADL"
+# Workers' compensation from any board other than Alberta's. A separate bucket
+# because only WCB Alberta funds an annual here — every other province's board
+# goes to staff ("Only WCB Alberta is annual… work safe BC and WSIB and
+# Worksafe other provinces, I would just put all of those onto like a real
+# person" — clinic, 2026-07-27).
+PAYER_WCB_OUT_OF_PROVINCE = "Workers Comp (out of province)"
 PAYER_OTHER = "Other"
 
 KNOWN_PAYERS: frozenset[str] = frozenset({
     PAYER_WCB, PAYER_VA, PAYER_ALBERTA, PAYER_NIHB,
-    PAYER_BLUE_CROSS, PAYER_AADL, PAYER_OTHER,
+    PAYER_BLUE_CROSS, PAYER_AADL, PAYER_WCB_OUT_OF_PROVINCE, PAYER_OTHER,
 })
 
 # What a payer program means for automated booking.
@@ -101,6 +107,7 @@ DEFAULT_PAYER_ACTIONS: dict[str, str] = {
     PAYER_NIHB: ACTION_PRIOR_AUTH,
     PAYER_BLUE_CROSS: ACTION_HUMAN_REVIEW,
     PAYER_AADL: ACTION_HUMAN_REVIEW,
+    PAYER_WCB_OUT_OF_PROVINCE: ACTION_HUMAN_REVIEW,
 }
 
 DEFAULT_PAYER_MIN_YEARS: dict[str, float] = {
@@ -129,6 +136,12 @@ DEFAULT_MIN_MONTHS_AFTER_CLEAN_CHECK = 3
 # Inside this many months to warranty expiry, bundle the annual with the
 # warranty check. Larena, 2026-07-27: "if we're six months away from the
 # warranty expiring, we're safe... if it is less than five months, move it."
+#
+# FIVE, not six. Earlier in that same call she said "coming up within the next
+# six months", then refined it under questioning into the rule above: at six
+# months out the rule does NOT apply, and "less than five months" is what
+# triggers the move. That looser first phrasing has already prompted one
+# attempt to change this to 6 — the refinement is the rule.
 DEFAULT_WARRANTY_BUNDLE_TRIGGER_MONTHS = 5
 # Target: land the visit within this many months BEFORE expiry — where the
 # clinic's own warranty-check notices go out.
@@ -569,11 +582,9 @@ def _speakable_price(amount: float) -> str:
 #
 # ACNA reality: "WCB Alberta"; "VAC" + "Veterans Affairs Canada".
 _PAYER_PATTERNS: tuple[tuple[str, str], ...] = (
-    # Workers' comp and veterans first — unambiguous, and "WCB Alberta" would
-    # otherwise be caught by the bare "alberta" pattern below.
-    ("wcb", PAYER_WCB),
-    ("workers comp", PAYER_WCB),
-    ("worker's comp", PAYER_WCB),
+    # Veterans first — unambiguous. Workers' comp is NOT here: it needs a
+    # province split rather than a single bucket, so classify_insurer handles
+    # it before this table is consulted.
     ("vac", PAYER_VA),
     ("veterans", PAYER_VA),
     # Prior-authorization programs. Bigstone is a First Nation administering
@@ -591,9 +602,34 @@ _PAYER_PATTERNS: tuple[tuple[str, str], ...] = (
 )
 
 
+# Any workers'-compensation board, in the spellings ACNA's records actually
+# use: WCB Alberta, WorkSafe BC, WSIB, WCB Manitoba/-SK/NS/NB/-NWT, and
+# "Workers Safety & Compensation Commission".
+_WORKERS_COMP_MARKERS: tuple[str, ...] = (
+    "wcb",
+    "worksafe",
+    "work safe",
+    "wsib",
+    "workers comp",
+    "worker's comp",
+    "workers' comp",
+    "workers safety",
+    "compensation board",
+    "compensation commission",
+)
+
+
 def classify_insurer(insurer_name: str | None) -> str:
     """Map a raw insurer_name to a canonical payer bucket."""
     n = (insurer_name or "").lower()
+    # Workers' comp is split by PROVINCE before anything else, because only
+    # Alberta's board funds an annual here. Matching a bare "wcb" to one
+    # fundable bucket silently gave WCB Manitoba/-SK/NS/NB/-NWT Alberta's
+    # eligibility, and the boards that don't say "WCB" at all (WorkSafe BC,
+    # WSIB) fell through to `Other`, which also funds. Alberta is the
+    # allow-list, not the fall-through.
+    if any(m in n for m in _WORKERS_COMP_MARKERS):
+        return PAYER_WCB if "alberta" in n else PAYER_WCB_OUT_OF_PROVINCE
     for pat, bucket in _PAYER_PATTERNS:
         if pat in n:
             return bucket

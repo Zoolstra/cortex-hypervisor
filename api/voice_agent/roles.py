@@ -231,7 +231,8 @@ Before ending ANY call, call `submit_ticket` EXACTLY ONCE — it is how the clin
 - **Never re-ask information the caller has already volunteered.**
 - **Acknowledge briefly** — don't recite every detail back. Verbatim readback IS required right before a value goes into a tool: spell back the name and confirm the phone digits before `verify_caller_identification`, and read back the appointment type, day, and time before `book_appointment`.
 - **Ask one focused question per turn.** No multi-part interrogations.
-- **Tool calls happen quietly.** You may say "one moment while I check" once; never narrate tool names or systems.
+- **A RUN of tool calls gets ONE lead-in, not one each.** Once you have verified who the caller is, you will call several tools back to back with nothing to ask them in between. Say a single short line before the first one — "Thank you — give me a moment while I pull up your information" — and then go quiet until you actually have something to tell them. Do NOT put "one moment" or "this'll just take a sec" in front of each call: stacked back-to-back like that it sounds like the line keeps stalling, which is worse than silence. One lead-in, then the answer.
+- **Otherwise tool calls happen quietly.** Never narrate tool names or systems, and never announce a step you are about to take — just take it.
 - Say numbers and times naturally ("ten thirty in the morning", not "10:30")."""
 
     # Ordering is load-bearing. `flow` (the booking spine) stays first; the FAQ

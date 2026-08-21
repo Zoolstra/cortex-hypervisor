@@ -144,6 +144,11 @@ _FUNNEL_COUNTS = (
     "booked_existing", "booked_existing_active", "booked_existing_lapsing",
     "booked_existing_deep_dormant", "booked_existing_never",
     "qualified_not_booked", "other",
+    # Added 2026-08-19 with contract §4a. This tuple is a WHITELIST — a funnel
+    # field absent from it is silently dropped from the rollup, which is how the
+    # group's Recoverable-revenue tile came up blank while the clinic pages were
+    # fine. Any new funnel counter has to be added here too.
+    "unconfirmed_booking", "qualified_not_booked_callers",
 )
 _MATTHEW_SPLIT_COUNTS = (
     "connected", "booked", "qualified_not_booked", "existing_customer", "other",
@@ -166,6 +171,11 @@ _AD_CLICK_COUNTS = (
 )
 
 
+# `qualified_not_booked_callers` is a DISTINCT-caller count per clinic, so summing
+# it counts a person who rang two locations twice. That is the same compromise
+# `form_submissions.patients` makes: there is no cross-clinic key on the funnel
+# (client_id is clinic-scoped), and the alternative — dedicated phone-keyed SQL —
+# is a separate reader. The rollup discloses it in `aggregation_notes`.
 def _merge_call_funnel(funnels: list[dict], pms_types: list[str]) -> dict | None:
     """Sum every bucket; recompute ``booked_rate`` from the sums.
 
@@ -208,8 +218,8 @@ def _merge_ad_campaigns(per_clinic: list[list[dict]]) -> list[dict]:
     """
     merged = _merge_by_key(
         per_clinic, "campaign_id",
-        int_fields=("clicks", "calls", "booked", "invoice_count"),
-        float_fields=("spend", "revenue"),
+        int_fields=("clicks", "calls", "booked", "invoice_count", "forms"),
+        float_fields=("spend", "revenue", "form_revenue"),
         carry=("campaign_name", "unattributed"),
     )
     # EVERY derived field is recomputed. Carrying any of them through from a
@@ -222,10 +232,64 @@ def _merge_ad_campaigns(per_clinic: list[list[dict]]) -> list[dict]:
         r["cost_per_call"] = _ratio(spend, calls) or 0.0
         r["cost_per_booking"] = _ratio(spend, booked) or 0.0
         r["roas"] = _ratio(revenue, spend) or 0.0
+        # Combined call+form revenue and its ROAS, recomputed from the merged
+        # components like every other derived field here. roas_total stays None
+        # on zero spend so the remainder row shows no ratio rather than 0.0x.
+        r["revenue_total"] = round(revenue + r.get("form_revenue", 0.0), 2)
+        r["roas_total"] = _ratio(r["revenue_total"], spend)
         r["revenue_per_booking"] = _ratio(revenue, booked) or 0.0
         r["click_to_call_pct"] = _ratio(calls, clicks) or 0.0
         r["call_to_book_pct"] = _ratio(booked, calls) or 0.0
     return sorted(merged, key=lambda r: (bool(r.get("unattributed")), -r["spend"]))
+
+
+def _merge_webform_drivers(per_clinic: list[dict | None]) -> dict | None:
+    """Merge the web-form drivers section across clinics.
+
+    `submissions` is additive (a submission belongs to one clinic). The two
+    breakdowns are merged by channel label so they keep summing to it — the
+    property the UI relies on to draw either as parts of a whole. Channels absent
+    at one clinic simply contribute nothing rather than shifting the series.
+
+    Returns None when no clinic produced a section, so the chart hides rather
+    than rendering an empty ring.
+    """
+    got = [d for d in per_clinic if d]
+    if not got:
+        return None
+    out: dict = {"submissions": sum(int(d.get("submissions") or 0) for d in got)}
+    for dim in ("by_medium", "by_source"):
+        out[dim] = sorted(
+            _merge_by_key([d.get(dim) or [] for d in got], "channel",
+                          int_fields=("count",)),
+            key=lambda r: -r["count"])
+    return out
+
+
+def _sum_paid_forms(per_clinic: list[dict | None]) -> dict | None:
+    """Additive merge of the per-clinic web-form revenue leg.
+
+    Revenue and invoice_count are exact under summation: an invoice belongs to
+    exactly one clinic, so no dollar is counted twice. The patient tallies are
+    NOT exact — one person who submitted at two locations has a client_id at
+    each and is counted at each — which is the same distinct-people limitation
+    already disclosed for summed caller counts in _AGGREGATION_NOTES. Summed
+    anyway rather than dropped: a blank is read as "none", which is further from
+    the truth than a slight over-count that the page discloses.
+
+    window_days is taken rather than summed — it describes the range, not a
+    quantity. Returns None when no clinic produced a section, so the tab hides
+    instead of rendering a row of zeros.
+    """
+    got = [d for d in per_clinic if d]
+    if not got:
+        return None
+    out = {k: sum(int(d.get(k) or 0) for d in got) for k in (
+        "submissions", "matched_patients", "invoiced_patients", "invoice_count",
+        "returning_patients")}
+    out["revenue"] = sum(float(d.get("revenue") or 0.0) for d in got)
+    out["window_days"] = got[0].get("window_days")
+    return out
 
 
 def _merge_front_desk(rows: list[dict]) -> dict:
@@ -412,8 +476,27 @@ def build_group_aggregate(
         tasks[f"channel_mix|{cid}"] = lambda cid=cid, iv=iv: q.channel_mix(cid, iv, window=window)
         tasks[f"matthew|{cid}"] = lambda cid=cid, iv=iv: q.matthew_outcomes(cid, iv, window=window)
         tasks[f"pipeline_monthly|{cid}"] = lambda cid=cid, iv=iv: q.pipeline_revenue_by_month(cid, iv, window=window)
-        tasks[f"ads|{cid}"] = lambda cid=cid, iv=iv, ga=ga: q.google_ads_roi(cid, ga, iv, window=window)
+        # Both legs in ONE task so the rows this group merges already carry the
+        # form fields — _merge_ad_campaigns sums and re-derives them. Calling
+        # google_ads_roi alone here is what made the group table call-only.
+        tasks[f"ads|{cid}"] = lambda cid=cid, iv=iv, ga=ga: q.merge_campaign_forms(
+            q.google_ads_roi(cid, ga, iv, window=window),
+            q.webform_campaign_attribution(cid, ga, window=window, invoca_campaign_ids=iv))
         tasks[f"ad_clicks|{cid}"] = lambda cid=cid, iv=iv, ga=ga: q.ad_click_attribution(cid, iv, ga, window=window)
+        # Web-form leg of ad-attributed revenue. Fanned per clinic rather than
+        # given a group-scoped reader because the INCREMENTAL exclusion is
+        # inherently per-clinic: it must subtract that clinic's own paid callers,
+        # and `client_id` is clinic-scoped so there is no cross-clinic identity to
+        # exclude on. Summing is exact for the money (an invoice belongs to one
+        # clinic) and over-counts only the PATIENT tallies, which is the
+        # already-disclosed distinct-people caveat in _AGGREGATION_NOTES.
+        tasks[f"paid_forms|{cid}"] = lambda cid=cid, iv=iv: q.paid_form_revenue(
+            cid, window=window, invoca_campaign_ids=iv)
+        # webform_drivers was absent from the rollup altogether, which is why the
+        # group ads tab's traffic fork showed no web-form branch and the group
+        # Web forms tab had no drivers chart: the UI reads by_medium from here,
+        # and a missing section is indistinguishable from "no paid forms".
+        tasks[f"webform_drivers|{cid}"] = lambda cid=cid: q.webform_drivers(cid, window=window)
 
     # Group-scoped readers: distinct-people metrics that cannot be summed, plus
     # matthew_monthly which already takes a clinic list.
@@ -614,6 +697,13 @@ def build_group_aggregate(
             int_fields=("invoices",), float_fields=("revenue",)),
         "ad_campaigns": _merge_ad_campaigns(per_clinic_lists("ads")),
         "paid_attribution": res.get("g_paid"),
+        "paid_form_attribution": _sum_paid_forms(
+            [res.get(f"paid_forms|{cid}") for cid in clinic_ids]),
+        "webform_drivers": _merge_webform_drivers(
+            [res.get(f"webform_drivers|{cid}") for cid in clinic_ids]),
+        # Campaign ids are instance-wide, so the same campaign can appear for two
+        # clinics; grouping on campaign_id sums them rather than emitting the
+        # campaign twice. `unattributed` is carried, not summed — it is a label.
         "ad_click_attribution": ad_click_attribution,
         "placeholders": ["cortex_intercept", "review_velocity"],
         "recommendations": [],
@@ -629,4 +719,6 @@ _AGGREGATION_NOTES = [
     "Patient counts under Paid attribution and Web forms are deduplicated by "
     "contact across locations, so someone on file at two clinics counts once. "
     "Portal-booking patient counts are per-location records and are summed.",
+    "Recoverable revenue counts qualified callers per location, so someone who "
+    "rang two clinics is counted at each — the funnel has no cross-clinic key.",
 ]

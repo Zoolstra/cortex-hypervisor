@@ -108,8 +108,17 @@ class AppointmentDecisionConfig(BaseModel):
             # Self-pay books the same Annual type — the difference is the price
             # conversation, not the appointment.
             "OFFER_SELF_PAY_ANNUAL_HEARING_TEST": 207,
+            # A CLINICIAN service visit has no placeholder grid to book into:
+            # across 1,786 booked Service appointments only 11% sit beside a
+            # placeholder at all, and those are duration-mismatched (a 30m
+            # Service dropped into a 60/90m clinician space). Staff book these
+            # straight onto a clinician's calendar, so the agent can't — it
+            # takes a message carrying the recommendation instead.
             "BOOK_CLINICIAN_SERVICE_VISIT": None,
-            "BOOK_TECHNICIAN_CLEAN_AND_CHECK": None,
+            # Technician clean-and-check books real type 204 ('Service') into
+            # placeholder grid 8 ('Z Maintenance/RA'). See the TypePair note in
+            # acna_placeholder.ACNAAvailabilityConfig.
+            "BOOK_TECHNICIAN_CLEAN_AND_CHECK": 204,
             "BOOK_NEW_PATIENT_INTAKE_WITH_CLINICIAN": None,
             # Referral outcomes are never bookable by the agent, by definition.
             "REFER_TO_STAFF_PRIOR_AUTHORIZATION": None,

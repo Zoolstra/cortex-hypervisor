@@ -219,3 +219,29 @@ def test_faq_tool_is_scoped_to_general_information(cfg):
 def test_faq_miss_routes_to_a_handoff_not_a_guess(cfg):
     sys = cfg["model"]["messages"][0]["content"]
     assert "NEVER answer a general clinic question from your own knowledge" in sys
+
+
+def test_tool_chain_gets_one_lead_in_not_one_per_call(cfg):
+    """A run of back-to-back tools must be prefaced ONCE, not per call.
+
+    After identity is verified the role calls determine_appointment_type and
+    then find_available_slots with nothing to ask the caller in between. The
+    earlier rule ("you may say 'one moment while I check' once") read as
+    once-per-call-site, so the live agent stalled before each one and the caller
+    heard three filler phrases in a row. The instruction now has to be explicit
+    that the whole run shares a single lead-in and then goes quiet.
+    """
+    sys = cfg["model"]["messages"][0]["content"]
+
+    assert "A RUN of tool calls gets ONE lead-in, not one each" in sys
+    assert "go quiet until you actually have something to tell them" in sys
+    # The old permissive phrasing must not come back.
+    assert 'You may say "one moment while I check" once' not in sys
+
+
+def test_agent_still_told_not_to_narrate_tools(cfg):
+    """Suppressing the repeated filler must not lose the older, still-valid
+    rule that tool names and systems are never spoken aloud."""
+    sys = cfg["model"]["messages"][0]["content"]
+
+    assert "Never narrate tool names or systems" in sys
