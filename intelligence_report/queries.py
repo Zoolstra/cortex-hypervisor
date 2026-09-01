@@ -476,7 +476,7 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
     exactly one row, so ``calls`` and ``booked`` sum EXACTLY to the §04 headline
     (:func:`paid_call_revenue`) — see the remainder row below.
 
-    Paid calls are attributed to a campaign by a two-tier **cascade**:
+    Paid calls are attributed to a campaign by a three-tier **cascade**:
 
     1. **GCLID** — the call's ``transactions.gclid`` joins
        ``ad_clicks_v2.click_view_gclid`` for one of the clinic's linked
@@ -486,16 +486,28 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
        (leading "Beta " stripped, trimmed, lower-cased) and compared to the
        Invoca campaign name on the call
        (``transactions.advertiser_campaign_name``, e.g. "Princeton").
+    3. **Sole linked campaign** — when the clinic has exactly ONE linked Google
+       Ads campaign there is nothing to disambiguate: every paid call already
+       scoped to the clinic's own Invoca campaigns must belong to it. Applied
+       only to calls carrying no *competing* paid click id (``msclkid`` is Bing,
+       ``fbclid`` is Meta) — those stay in the remainder row rather than being
+       credited to Google.
 
-    Neither tier alone is sufficient, which is why both are used. GCLID coverage
+    No tier alone is sufficient, which is why all three are used. GCLID coverage
     is sparse (~25% of paid calls carry one; Call Extension tap-to-call never
-    does), so GCLID alone collapses the per-campaign numbers toward zero. But
-    name matching only works where the client names its Invoca campaigns after
-    its Ads campaigns (Virsono's "Beta <Location>" ↔ "<Location>"); a client that
-    names Invoca campaigns per LOCATION while its Ads campaigns are named
-    anything else (e.g. Hope Hearing: Invoca "Southlake" vs Ads "Hope Hearing TX
-    PPC 8000") name-matches nothing at all. Calls are scoped to the clinic's own
-    Invoca campaigns first, so a name shared across clinics can't cross-attribute.
+    does), so GCLID alone collapses the per-campaign numbers toward zero. Name
+    matching only works where the client names its Invoca campaigns after its
+    Ads campaigns (Virsono's "Beta <Location>" ↔ "<Location>"), and it is
+    brittle in both directions: it breaks when the Ads name is anything else
+    (Hope Hearing: Invoca "Southlake" vs Ads "Hope Hearing TX PPC 8000"), and it
+    breaks on small drift in a name that looks conformant — Calgary Hearing Aid
+    and Audiology's "Sunterra Day Beta" carries "Beta" as a TRAILING token, so
+    the leading-"Beta " strip leaves "sunterra day beta" against Invoca's
+    "sunterra" and 143 of its 145 paid calls fell to the remainder row, showing
+    the campaign at 2 calls and $1,651 per call. Tier 3 catches exactly that
+    class: naming can drift, but a clinic with one campaign has no ambiguity to
+    resolve. Calls are scoped to the clinic's own Invoca campaigns first, so a
+    name shared across clinics can't cross-attribute.
 
     Paid calls that neither tier resolves are returned as a single **remainder
     row** (``campaign_id = UNATTRIBUTED_CAMPAIGN_ID``, ``unattributed=True``,
@@ -531,6 +543,19 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
     ga_in = "(" + ", ".join(f"'{c}'" for c in ga_campaign_ids) + ")"
     iv_in = "(" + ", ".join(f"'{c}'" for c in (invoca_campaign_ids or [])) + ")"
     calls_scope = f"CAST(t.invoca_campaign_id AS STRING) IN {iv_in}" if invoca_campaign_ids else "FALSE"
+
+    # Tier 3 of the cascade (see docstring). Only safe with a single linked
+    # campaign — with two or more, "which one" is exactly the question the
+    # earlier tiers exist to answer, and guessing would invent a split. Calls
+    # carrying another network's click id are excluded: 'Paid' spans Bing and
+    # paid social too, and crediting those to the sole Google campaign would
+    # overstate its calls and its ROAS. They fall through to the remainder row,
+    # which is the honest answer for a call this clinic's Google data can't claim.
+    if len(ga_campaign_ids) == 1:
+        sole_campaign_sql = (
+            f"IF(NOT c.other_network_click, '{ga_campaign_ids[0]}', NULL)")
+    else:
+        sole_campaign_sql = "CAST(NULL AS STRING)"
 
     def _norm(col: str) -> str:
         # Strip a leading "Beta " (Google Ads names) case-insensitively, trim,
@@ -596,7 +621,12 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
             -- name. Aliased ``gclid_real`` (not ``gclid``) so it can't be
             -- confused with the raw column the channel CASE below reads.
             SELECT call_id, call_ts, phone_norm, norm, genuine,
-                   IF(gclid IS NOT NULL AND gclid NOT IN ('nan', ''), gclid, NULL) AS gclid_real
+                   IF(gclid IS NOT NULL AND gclid NOT IN ('nan', ''), gclid, NULL) AS gclid_real,
+                   -- Evidence the call came from a network that is NOT this
+                   -- clinic's Google Ads account. Gates tier 3 only; the earlier
+                   -- tiers rest on Google-specific evidence already.
+                   ({_real_id_sql('msclkid')} OR {_real_id_sql('fbclid')})
+                     AS other_network_click
             FROM (
                 SELECT
                   t.complete_call_id AS call_id,
@@ -621,13 +651,15 @@ def google_ads_roi(clinic_id: str, ga_campaign_ids: list[str],
             WHERE NOT is_spam AND ({_channel_case_sql()}) = 'Paid'
         ),
         call_camp AS (
-            -- Attach each paid call to a Google Ads campaign: GCLID first, then
-            -- normalized campaign name, then the explicit remainder bucket. Every
+            -- Attach each paid call to a Google Ads campaign: GCLID first,
+            -- then normalized campaign name, then the sole linked campaign when
+            -- the clinic has only one, then the explicit remainder bucket. Every
             -- paid call appears exactly once, so per-campaign calls/booked sum to
             -- the §04 headline.
             SELECT c.call_id, c.call_ts, c.phone_norm, c.genuine,
                    COALESCE(gk.google_ads_campaign_id,
                             gn.google_ads_campaign_id,
+                            {sole_campaign_sql},
                             '{UNATTRIBUTED_CAMPAIGN_ID}') AS google_ads_campaign_id
             FROM calls c
             LEFT JOIN gclid_clicks gk ON gk.gclid = c.gclid_real

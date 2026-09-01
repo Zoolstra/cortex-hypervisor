@@ -8,6 +8,7 @@ from api.account.instances import router as instances_router
 from api.account.clinics import router as clinics_router
 from api.account.customerio_config import router as customerio_config_router
 from api.account.pms_config import router as pms_config_router
+from api.account.readiness import router as readiness_router
 from api.account.campaigns import router as campaigns_router
 from api.account.worklist_taxonomy import router as worklist_taxonomy_router
 
@@ -19,6 +20,9 @@ from api.account.worklist_taxonomy import router as worklist_taxonomy_router
 # segment as a clinic_id and 404).
 routers = [
     instances_router,
+    # Before clinics_router for the same reason as pms_config: its paths sit
+    # under /instances/{id}/… and /clinics/{id}/… prefixes.
+    readiness_router,
     pms_config_router,
     customerio_config_router,
     worklist_taxonomy_router,

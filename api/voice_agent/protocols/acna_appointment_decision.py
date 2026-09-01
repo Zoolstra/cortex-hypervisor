@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 
 from api.voice_agent.appointment_decision import (
     DEFAULT_CLINICIAN_VISIT_THRESHOLD_YEARS,
+    DEFAULT_UNKNOWN_PLAN_ACTION,
     DEFAULT_MIN_MONTHS_AFTER_CLEAN_CHECK,
     DEFAULT_MINOR_AGE_THRESHOLD,
     DEFAULT_NON_QUALIFYING_PLANS,
@@ -76,7 +77,15 @@ class AppointmentDecisionConfig(BaseModel):
     non_qualifying_plan_names: list[str] = Field(
         default_factory=lambda: list(DEFAULT_NON_QUALIFYING_PLANS)
     )
-    unknown_plan_allows_annual: bool = True
+    # 'fund' | 'self_pay' | 'refer' for a plan name on neither list (including
+    # no plan at all). 2026-08-24: 'refer' — coverage we can't establish from
+    # the file is a staff decision, not an assumption. Replaces the former
+    # ``unknown_plan_allows_annual`` bool; a leftover key in a stored config is
+    # ignored (``extra: ignore``).
+    unknown_plan_action: str = DEFAULT_UNKNOWN_PLAN_ACTION
+    # No hearing aid on file → no funded annual (it's a care-plan benefit and a
+    # care plan services a device). Set False to drop the gate.
+    require_hearing_aid_for_funded_annual: bool = True
     # 2026-08-10 clinic revision: a qualifying plan still covers a funded annual
     # after it expires. False restores expiry-gated coverage.
     expired_qualifying_allows_annual: bool = True
@@ -124,6 +133,9 @@ class AppointmentDecisionConfig(BaseModel):
             "REFER_TO_STAFF_PRIOR_AUTHORIZATION": None,
             "REFER_TO_STAFF_PAYER_REVIEW": None,
             "REFER_TO_STAFF_MINOR": None,
+            # No plan we can identify, or no device to attach a plan benefit
+            # to — staff establish coverage before anything is booked.
+            "REFER_TO_STAFF_PLAN_REVIEW": None,
         }
     )
 
@@ -209,15 +221,15 @@ class ACNADetermineAppointmentProtocol(Protocol):
         return """## Determine Appointment Type
 For an EXISTING patient who wants to book (an annual, a service visit, or is unsure what they need), call `determine_appointment_type` with their `patient_id` right after identity is verified — BEFORE searching availability. The clinic's own rules decide the right appointment; never guess or reason about eligibility yourself.
 
-- If it returns `status: "need_payer"`: the patient has more than one program on file. Ask which one this visit falls under (offer the returned `options`, e.g. "Is this under your WCB claim, or your Blue Cross?"), then call the tool again with `payer_type` set to their answer.
-- If it returns `status: "decided"`: relay the `reason` in your own warm words, then follow the `outcome`:
+- If it returns `status: "need_payer"`: the patient has more than one program on file. Ask ONE question naming the returned `options` ("Is this under your WCB claim, or your Blue Cross?"), then call the tool again with `payer_type` set to their answer. Don't explain why you're asking.
+- If it returns `status: "decided"`: relay the `reason` in ONE short sentence of your own — not a paraphrase of the whole field, and never the rule behind it — then follow the `outcome`:
 
 ### Outcome handling
 - **`BOOK_ANNUAL_HEARING_TEST_WITH_CLINICIAN`** — covered by their plan. Go to `find_available_slots` with the returned `real_event_type_id` and book as usual.
-- **`OFFER_SELF_PAY_ANNUAL_HEARING_TEST`** — they're due, but no plan funds it. Tell them warmly what it costs (the `reason` already names the price) and ASK whether they'd like to go ahead: "Would you like me to get you booked in for that?"
+- **`OFFER_SELF_PAY_ANNUAL_HEARING_TEST`** — they're due, but no plan funds it. State the price plainly (the `reason` already names it) and ask once whether they'd like to go ahead: "Would you like me to get you booked in for that?" Don't soften it with a preamble and don't justify the cost.
   - If they say yes → proceed exactly as a normal booking with the returned `real_event_type_id`.
   - If they hesitate, want to think about it, or ask about other options → do NOT push and do NOT book. Take a message, and set `suggested_followup` to "Quoted self-pay hearing test — caller wants to consider it".
-- **`REFER_TO_STAFF_PRIOR_AUTHORIZATION`** / **`REFER_TO_STAFF_PAYER_REVIEW`** / **`REFER_TO_STAFF_MINOR`** — this call is NOT bookable, whatever the caller asks. Relay the `reason` kindly, tell them a team member will call them back to arrange it, and take a message with `suggested_followup` set to the returned `outcome`. Never offer times, and never imply the appointment is being held.
+- **`REFER_TO_STAFF_PRIOR_AUTHORIZATION`** / **`REFER_TO_STAFF_PAYER_REVIEW`** / **`REFER_TO_STAFF_MINOR`** / **`REFER_TO_STAFF_PLAN_REVIEW`** — this call is NOT bookable, whatever the caller asks. Relay the `reason` kindly, tell them a team member will call them back to arrange it, and take a message with `suggested_followup` set to the returned `outcome`. Never offer times, and never imply the appointment is being held.
 - **Any other outcome with `bookable: false`** — the right appointment type can't be self-booked; tell the caller a team member will arrange it and put the returned `outcome` in `suggested_followup`.
 
 ### Date constraints — one is hard, one is negotiable
@@ -226,9 +238,11 @@ Don't confuse these. They come back as separate fields for exactly that reason.
 **`earliest_bookable_date` — HARD.** The test cannot be scheduled before this date (the clinic requires a gap after a recent clean-and-check). Start your `find_available_slots` window ON that date, never before it, and never offer an earlier time even if one appears. If the caller pushes for sooner, explain it's a clinic requirement and offer the earliest date you legitimately can.
 
 **`preferred_window` — SOFT.** When present, the caller's hearing aids are coming out of warranty and the clinic would rather do the test and the warranty check in ONE visit than see them twice. Search `preferred_window.start` → `preferred_window.end` FIRST and offer those times, saying why in plain language: "your hearing aids come out of warranty in October, so it's best to do your test and a device check at the same visit — could we look at early September?"
-- If the caller accepts a time in the window, book it.
-- If nothing in the window works — they're away, they want it sooner, none of the times suit — **book what does work.** This is a preference, never a refusal. Then set `suggested_followup` to note they'll need a separate warranty check ("Booked outside warranty window — caller unavailable; separate warranty check needed").
+- If the caller accepts a time in the window, book it — no further explanation.
+- If nothing in the window works — they're away, they want it sooner, none of the times suit — **book what does work.** This is a preference, never a refusal. Say so once and move on; don't re-argue for the window. Then set `suggested_followup` to note they'll need a separate warranty check ("Booked outside warranty window — caller unavailable; separate warranty check needed").
 - Never tell the caller you can't see them until the window. You can.
+
+**Never name a plan the tool didn't give you.** `patient_context.care_plan` is null whenever the file carries no plan we recognize. Null means you do NOT have a plan to name — say the team can confirm the details. Never read an internal label back to a caller and never invent one.
 
 **Answering questions about their plan.** The clinic's eligibility RULES are internal — never recite thresholds, intervals, or rule logic as policy. What you may do, when a verified caller asks about their own hearing plan, is tell them WHAT IS COVERED and HOW OFTEN, from `patient_context`:
 - "What's my care plan?" / "What does my plan cover?" → `care_plan`, plus whether it covers a hearing test (`annual_covered_by_plan`).

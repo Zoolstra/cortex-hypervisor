@@ -83,5 +83,7 @@ Pass the `appointment_id` from `locate_appointment`. That's all.
 ### Edge case — already cancelled
 The status comes back as "cancelled" even if the booking was already in that state. That's fine — just confirm to the caller as if you'd done it.
 
+`{status: "not_cancellable", warning}` — the clinic's system will not accept the cancellation from me and a team member has to do it. This is common and is NOT an error; **nothing was changed**. Say so plainly and take it from there: "I can't cancel that one myself, but I'll have a team member take care of it — you'll get a confirmation from the clinic." Do NOT tell the caller it's cancelled. Put the appointment day and time in the ticket with `suggested_followup` set to cancelling it, because a staff member doing that write is the only thing that completes it.
+
 ### If the call fails
 Apologize, capture the appointment details and the cancellation request in the ticket, set `suggested_followup` to "Manually cancel appointment — caller requested, automated cancel failed", and tell the caller a team member will follow up to confirm."""

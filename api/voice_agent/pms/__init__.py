@@ -153,6 +153,37 @@ class Appointment:
     status: str       # "confirmed" / "tentative" / "cancelled" / "no_show" / etc.
 
 
+# ── Booking outcome vocabulary ────────────────────────────────────────────────
+#
+# ONE definition. The HTTP boundary (``BookingResultResponse`` in
+# api/voice_agent/blueprint.py) validates its response against this same alias.
+# It used to keep a hand-copied Literal, so adding a status here and missing it
+# there turned a working refusal into a 500 at response-serialisation time.
+BookingStatus = Literal[
+    "booked", "cancelled", "rescheduled", "partial",
+    # confirm(): "confirmed" covers both a fresh write and the already-
+    # confirmed no-op. "not_confirmable" is a REFUSAL, not an error — the
+    # booking is cancelled or already past, and the agent must tell the
+    # caller rather than claim success. `warning` carries the why.
+    "confirmed", "not_confirmable",
+    # The PMS cannot accept the write, but the CALLER'S ANSWER IS STILL GOOD.
+    # Blueprint's Edit-Appointment PUT is only authorised by an
+    # ``onlineBookingSecret``, which Blueprint mints solely for appointments
+    # created through Online Appointment Booking or the Scheduling API. A
+    # booking entered by staff in the OMS desktop client has none, so its
+    # status is unwritable over the API — permanently, and for the majority of
+    # real appointments.
+    #
+    # That is a property of the appointment's provenance, NOT a fault, so it
+    # must never surface as an HTTP error: the caller said a true thing ("yes,
+    # I'll be there") and the agent has to answer them. These two mean
+    # "recorded with us, needs a human to land it in the PMS" and carry a
+    # speakable ``warning``.
+    "pending_staff_confirmation",  # confirm(): patient confirmed, PMS not updated
+    "not_cancellable",             # cancel()/reschedule(): staff must do the write
+]
+
+
 @dataclass(frozen=True)
 class BookingResult:
     """Outcome of ``book``, ``cancel``, or ``reschedule``.
@@ -164,7 +195,7 @@ class BookingResult:
     confirmation message.
     """
 
-    status: Literal["booked", "cancelled", "rescheduled", "partial"]
+    status: BookingStatus
     appointment_id: str | None
     summary: str | None
     start_time: str | None  # ISO-8601 in clinic local time

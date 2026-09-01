@@ -12,11 +12,18 @@ pipeline (see api/webforms.py). Unlike the other two types a form maps to
 exactly ONE clinic (UNIQUE on jotform_form_id) — the webhook URL is
 clinic-scoped, so a second mapping would double-ingest every submission.
 
+That one clinic is the form's DEFAULT. A form serving a whole group asks the
+patient which site they want, and `jotform_form_locations` maps each answer
+to a clinic so the submission is attributed to the site the patient chose.
+The /locations endpoints below maintain that map.
+
 URL shape:
     GET    /campaigns/{instance_id}                  → both types, all clinics
     GET    /campaigns/{instance_id}/{clinic_id}      → both types, one clinic
     POST   /campaigns/{clinic_id}  body{campaign_type, external_campaign_id, active}
     DELETE /campaigns/{campaign_type}/{id}           → explicit type required
+    GET    /campaigns/jotform/{form_id}/locations    → the form's location map
+    PUT    /campaigns/jotform/{form_id}/locations    → replace the location map
 """
 import json
 import logging
@@ -29,9 +36,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.deps import bq_client, require_read_access, require_write_access, verify_token
-from api.models import ClinicCampaignCreate
+from api.models import ClinicCampaignCreate, JotformLocationMapSet
 from api.core.db import get_session
-from api.core.orm import Clinic, GoogleAdsCampaign, Instance, InvocaCampaign, JotformForm
+from api.core.orm import (
+    Clinic, GoogleAdsCampaign, Instance, InvocaCampaign, JotformForm,
+    JotformFormLocation,
+)
 from api.core.secrets import get_secret
 
 log = logging.getLogger(__name__)
@@ -398,3 +408,201 @@ def remove_campaign(
 
     db.delete(row)
     return {"status": "success"}
+
+
+# ── Jotform location map ─────────────────────────────────────────────────────
+#
+# A form's `jotform_forms` row names ONE clinic, because the webhook URL can
+# only carry one. A group that runs every site off a single lead form needs the
+# patient's own answer to decide where the lead belongs — that map lives here.
+
+def _jotform_location_options(form_id: str) -> list[str] | None:
+    """The form's live "choose your location" options, in builder order.
+
+    Read straight off the Jotform API so the admin UI can show which options
+    exist but are unmapped — the drift that silently misattributes leads. A form
+    can carry SEVERAL location dropdowns revealed by condition (Sense of
+    Hearing's has four: adult, 6-17, APD, 10-months-up), so every dropdown's
+    options are pooled and de-duplicated; the resolver matches on the answer's
+    value and does not care which field produced it.
+
+    Returns None — distinct from [] — when the catalog could not be read at all,
+    so the caller can say "unknown" rather than "no options".
+    """
+    api_key = (get_secret("jotform-api-key") or "").strip()
+    if not api_key:
+        return None
+    try:
+        url = (f"{_JOTFORM_API}/form/{urllib.parse.quote(form_id)}/questions"
+               f"?apiKey={urllib.parse.quote(api_key)}")
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=15) as resp:
+            questions = json.loads(resp.read().decode()).get("content") or {}
+    except Exception as exc:  # network/auth/parse — the map still stands alone
+        log.warning("Jotform question fetch failed for form %s: %s", form_id, exc)
+        return None
+
+    seen: dict[str, None] = {}
+    for q in (questions or {}).values():
+        if not isinstance(q, dict) or q.get("type") != "control_dropdown":
+            continue
+        # "Choose Your Location", "Choose your location (APD)", … — the location
+        # dropdowns are the ones whose label says so. Other dropdowns on the same
+        # form (preferred contact method, appointment time) must not be pooled in.
+        if "location" not in (q.get("text") or "").lower():
+            continue
+        for opt in (q.get("options") or "").split("|"):
+            opt = opt.strip()
+            if opt:
+                seen.setdefault(opt, None)
+    return list(seen)
+
+
+def _jotform_form_or_404(db: Session, form_id: str) -> JotformForm:
+    form = db.scalars(
+        select(JotformForm).where(JotformForm.jotform_form_id == form_id)
+    ).first()
+    if form is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Form {form_id} is not registered. Add it with "
+                   f"POST /campaigns/{{clinic_id}} before mapping its locations.",
+        )
+    return form
+
+
+@router.get("/campaigns/jotform/{form_id}/locations")
+def get_jotform_locations(
+    form_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """The form's location map, merged with the options the form actually offers.
+
+    ``unmapped_options`` is the useful half: an option the form presents that no
+    row routes is a lead that will be attributed to the form's default clinic.
+    It is null (not empty) when the Jotform API could not be reached, so an
+    outage is never reported as "everything is mapped".
+    """
+    form = _jotform_form_or_404(db, form_id)
+    default_clinic = db.get(Clinic, form.clinic_id)
+    require_read_access(default_clinic.instance_id, caller)
+
+    rows = db.scalars(
+        select(JotformFormLocation)
+        .where(JotformFormLocation.jotform_form_id == form_id)
+        .order_by(JotformFormLocation.option_value)
+    ).all()
+    names = {
+        c.clinic_id: c.clinic_name
+        for c in db.scalars(
+            select(Clinic).where(Clinic.instance_id == default_clinic.instance_id)
+        ).all()
+    }
+
+    live = _jotform_location_options(form_id)
+    mapped = {r.option_value for r in rows}
+    return {
+        "jotform_form_id": form_id,
+        "form_title": form.form_title,
+        # The clinic in the webhook URL — where a submission lands when its
+        # answer resolves to nothing.
+        "default_clinic_id": form.clinic_id,
+        "default_clinic_name": default_clinic.clinic_name,
+        "locations": [
+            {
+                "option_value": r.option_value,
+                "clinic_id": r.clinic_id,
+                "clinic_name": names.get(r.clinic_id) if r.clinic_id else None,
+                "active": bool(r.active),
+                # An option that used to exist and no longer appears on the form.
+                "stale": live is not None and r.option_value not in live,
+            }
+            for r in rows
+        ],
+        "unmapped_options": None if live is None else [o for o in live if o not in mapped],
+    }
+
+
+@router.put("/campaigns/jotform/{form_id}/locations")
+def set_jotform_locations(
+    form_id: str,
+    body: JotformLocationMapSet,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Replace the form's location map. Options not listed are deleted.
+
+    Replace rather than patch for the same reason the PMS location map is a
+    replace: the set is small, a partial write leaves a half-mapped form that
+    routes some leads and misattributes the rest, and the caller always holds the
+    whole list anyway.
+    """
+    form = _jotform_form_or_404(db, form_id)
+    default_clinic = db.get(Clinic, form.clinic_id)
+    require_write_access(default_clinic.instance_id, caller)
+
+    clinics = {
+        c.clinic_id: c
+        for c in db.scalars(
+            select(Clinic).where(
+                Clinic.instance_id == default_clinic.instance_id,
+                Clinic.deleted_at.is_(None),
+            )
+        ).all()
+    }
+
+    seen: set[str] = set()
+    for entry in body.locations:
+        option = entry.option_value.strip()
+        if not option:
+            raise HTTPException(status_code=400, detail="option_value cannot be blank")
+        if option in seen:
+            # The UNIQUE index would catch this, but as a 500-shaped IntegrityError.
+            raise HTTPException(
+                status_code=400,
+                detail=f"Option {option!r} appears twice — an option routes to "
+                       f"exactly one clinic, or routing depends on row order.",
+            )
+        seen.add(option)
+
+        if entry.clinic_id and entry.clinic_id not in clinics:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Option {option!r} maps to clinic {entry.clinic_id}, which is "
+                       f"not a clinic of this instance.",
+            )
+        # Unlike the PMS map, active-with-no-clinic is legal: it records an option
+        # whose clinic has not been created yet, which is a rollout state worth
+        # keeping visible. Retired-with-a-clinic is not — a later reader would
+        # act on the clinic named there.
+        if not entry.active and entry.clinic_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Option {option!r} is retired, so it must not name a clinic.",
+            )
+
+    existing = {
+        r.option_value: r
+        for r in db.scalars(
+            select(JotformFormLocation)
+            .where(JotformFormLocation.jotform_form_id == form_id)
+        ).all()
+    }
+    for entry in body.locations:
+        option = entry.option_value.strip()
+        row = existing.pop(option, None)
+        if row is None:
+            db.add(JotformFormLocation(
+                jotform_form_id=form_id,
+                option_value=option,
+                clinic_id=entry.clinic_id,
+                active=entry.active,
+            ))
+        else:
+            row.clinic_id = entry.clinic_id
+            row.active = entry.active
+    for row in existing.values():
+        db.delete(row)
+
+    return {"status": "success", "mapped": len(body.locations),
+            "removed": len(existing)}

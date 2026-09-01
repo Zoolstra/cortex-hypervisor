@@ -43,6 +43,27 @@ class _FakeClient:
         return _FakeJob(self._batches.pop(0) if self._batches else [])
 
 
+def _cte(sql: str, name: str) -> str:
+    """Body of a named CTE, matched on balanced parentheses.
+
+    Splitting on the first ")," is not enough: the cascade's own COALESCE
+    contains nested calls (``CAST(NULL AS STRING),``, ``IF(..., NULL),``) that
+    end in exactly that sequence, so a naive split silently truncates the text
+    the assertion then searches — and a truncated haystack fails as "cascade
+    reordered" no matter what the cascade actually says.
+    """
+    body = sql.split(f"{name} AS (", 1)[1]
+    depth = 0
+    for i, ch in enumerate(body):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                return body[:i]
+            depth -= 1
+    raise AssertionError(f"unbalanced parentheses in CTE {name}")
+
+
 def _row(campaign_id, **kw):
     base = dict(campaign_name=None, clicks=0, calls=0, booked=0,
                 spend=0.0, revenue=0.0, invoice_count=0)
@@ -76,7 +97,7 @@ def test_gclid_tier_is_present_and_scoped_to_linked_campaigns(run):
 
 def test_attribution_cascade_prefers_gclid_then_name_then_remainder(run):
     _, sql = run([])
-    cascade = sql.split("call_camp AS (", 1)[1].split("),", 1)[0]
+    cascade = _cte(sql, "call_camp")
     # COALESCE order IS the cascade: gclid wins, then the name map, then the
     # sentinel. Reordering these silently changes attribution.
     gk = cascade.index("gk.google_ads_campaign_id")
@@ -87,6 +108,41 @@ def test_attribution_cascade_prefers_gclid_then_name_then_remainder(run):
     assert "LEFT JOIN gclid_clicks gk" in cascade
     assert "LEFT JOIN ga_name_map gn" in cascade
     assert "JOIN ga_norm g ON" not in cascade
+
+
+def test_sole_linked_campaign_claims_calls_the_name_match_missed(run):
+    """Tier 3: one linked campaign leaves nothing to disambiguate.
+
+    Guards the CHAA "Sunterra Day Beta" failure — an Ads name carrying "Beta" as
+    a TRAILING token normalizes to "sunterra day beta", never matches Invoca's
+    "sunterra", and dropped 143 of 145 paid calls into the remainder row.
+    """
+    _, sql = run([], ga=("111",))
+    cascade = _cte(sql, "call_camp")
+    gn = cascade.index("gn.google_ads_campaign_id")
+    sole = cascade.index("'111'")
+    un = cascade.index(q.UNATTRIBUTED_CAMPAIGN_ID)
+    # Strictly LAST before the sentinel: it is the weakest evidence in the
+    # cascade and must never pre-empt a gclid or a name match.
+    assert gn < sole < un
+    # Bing/Meta calls are excluded — 'Paid' is not Google-only, and crediting
+    # them here would overstate the sole campaign's calls and its ROAS.
+    assert "other_network_click" in cascade
+
+
+def test_sole_tier_is_inert_when_several_campaigns_are_linked(run):
+    """With 2+ campaigns, "which one" is the question the earlier tiers answer.
+
+    Guessing would invent a split, so the tier must contribute nothing — and it
+    must not smuggle a campaign id into the COALESCE.
+    """
+    _, sql = run([], ga=("111", "222"))
+    cascade = _cte(sql, "call_camp")
+    gn = cascade.index("gn.google_ads_campaign_id")
+    un = cascade.index(q.UNATTRIBUTED_CAMPAIGN_ID)
+    between = cascade[gn:un]
+    assert "CAST(NULL AS STRING)" in between
+    assert "'111'" not in between and "'222'" not in between
 
 
 def test_duplicate_campaign_names_resolve_to_one_campaign(run):

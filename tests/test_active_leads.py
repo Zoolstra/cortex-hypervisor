@@ -133,6 +133,16 @@ def test_active_leads_endpoint_ok(monkeypatch):
     def _session():
         yield _Session()
 
+    # The endpoint's cache key now carries data_version + methodology (so the
+    # untimed shared tier can invalidate at all). Both must be neutralised here:
+    # `_data_version` would otherwise reach BigQuery, and the shared tier would
+    # let an object written by an earlier run answer this request.
+    from api import intelligence as _I
+    monkeypatch.setattr(_I, "_SHARED_CACHE_ENABLED", False)
+    _I._json_cache.clear()
+    _I._data_version_cache.clear()
+    monkeypatch.setattr(_I, "_data_version", lambda *_a, **_k: "test-version")
+
     app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
     app.dependency_overrides[get_session] = _session
     monkeypatch.setattr("intelligence_report.active_leads.build_active_leads",

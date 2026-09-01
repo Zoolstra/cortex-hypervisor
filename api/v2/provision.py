@@ -37,6 +37,8 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from firebase_admin import auth as fb_auth
+from typing import Literal
+
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -68,15 +70,41 @@ class ProvisionInstanceFields(BaseModel):
     invoca_profile_id: str | None = None
 
 
+class ProvisionPmsFields(BaseModel):
+    """The PMS account, configured at provisioning time.
+
+    PMS credentials are account-level (alembic 0030), so they are known at
+    onboarding: one login for the business, whatever number of sites it has. Set
+    them here and the next step can ask the PMS what those sites are rather than
+    having them typed out — see `GET /instances/{id}/pms/discover` and
+    `POST /instances/{id}/pms/locations/import`.
+
+    `config` fields are per-vendor:
+        blueprint    clinic_code, api_url, aws_url
+        counselear   counselear_location_code, counselear_sftp_username
+    """
+    pms_type: Literal["blueprint", "counselear"]
+    config: dict = Field(default_factory=dict)
+    secrets: dict = Field(default_factory=dict)
+
+
 class ProvisionRequestV2(BaseModel):
     primary_contact_email: str
     primary_contact_name: str
     instance: ProvisionInstanceFields
+    # The PMS account. Optional only because a client can be onboarded for ads
+    # reporting before their PMS credentials arrive.
+    pms: ProvisionPmsFields | None = None
     clinics: list[ClinicCreate] = Field(
         default_factory=list,
-        description="Clinics to create with the instance. Each may carry a "
-                    "`ref_id`, echoed back in `clinic_ids` so the caller can "
-                    "match its own draft rows to the generated clinic ids.")
+        description="Usually EMPTY. Clinics come from the PMS: provision the "
+                    "instance with its account config, then import the locations "
+                    "the PMS reports (POST /instances/{id}/pms/locations/import), "
+                    "which creates a clinic per site and maps it. Pass clinics "
+                    "here only for a business with no PMS, or to add one the PMS "
+                    "does not report. Each may carry a `ref_id`, echoed back in "
+                    "`clinic_ids` so the caller can match its own draft rows to "
+                    "the generated clinic ids.")
 
 
 @router.post("/provision", status_code=201)
@@ -147,6 +175,22 @@ def provision(body: ProvisionRequestV2,
         primary_contact_uid=user.uid,
     )
 
+    # The PMS account, if supplied. Written through the same validation the
+    # settings editor uses so the two cannot diverge on what a valid account is.
+    pms_configured = None
+    if body.pms is not None:
+        from api.account.pms_config import set_instance_pms_config
+        from api.models import InstancePmsConfigSet
+
+        set_instance_pms_config(
+            result["instance_id"],
+            InstancePmsConfigSet(pms_type=body.pms.pms_type,
+                                 config=body.pms.config,
+                                 secrets=body.pms.secrets),
+            caller, db,
+        )
+        pms_configured = body.pms.pms_type
+
     # No SMTP here — the Next route created accounts with no password and no way
     # in, which meant a manual Firebase-console trip per client. Hand the admin a
     # link to forward instead, exactly as POST /v2/admin/users does.
@@ -157,14 +201,22 @@ def provision(body: ProvisionRequestV2,
         except Exception as exc:  # noqa: BLE001 — the account exists either way
             log.warning("reset link generation failed for %s: %s", email, exc)
 
-    log.info("instance provisioned by=%s uid=%s email=%s instance=%s clinics=%d",
+    log.info("instance provisioned by=%s uid=%s email=%s instance=%s clinics=%d pms=%s",
              caller["uid"], user.uid, email, result["instance_id"],
-             len(body.clinics))
+             len(body.clinics), pms_configured or "none")
     return {
         "status": "success",
         "uid": user.uid,
         "created_user": created_user,
         "instance_id": result["instance_id"],
         "clinic_ids": result["clinic_id_map"],
+        "pms_type": pms_configured,
+        # The clinics come next, from the PMS rather than from a typed list.
+        "next_step": (
+            f"GET /instances/{result['instance_id']}/pms/discover"
+            f"?pms_type={pms_configured} to list the account's locations, then "
+            f"POST /instances/{result['instance_id']}/pms/locations/import to "
+            f"create a clinic per location."
+        ) if pms_configured and not body.clinics else None,
         "password_reset_link": reset_link,
     }

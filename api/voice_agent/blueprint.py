@@ -37,6 +37,7 @@ from api.deps import require_read_access, require_write_access, verify_token
 from api.core.db import get_session
 from api.core.orm import ClinicBlueprintEntityNote
 from api.core.secrets import get_secret
+from api.voice_agent.pms import BookingStatus
 from api.voice_agent.pms.blueprint import (
     BlueprintAdapter,
     _blueprint_base,
@@ -129,6 +130,10 @@ class CancelAppointmentRequest(BaseModel):
     appointment_id: str
 
 
+class ConfirmAppointmentRequest(BaseModel):
+    appointment_id: str
+
+
 class RescheduleAppointmentRequest(BaseModel):
     appointment_id: str
     new_start_date: str   # YYYY-MM-DD
@@ -136,10 +141,18 @@ class RescheduleAppointmentRequest(BaseModel):
 
 
 class BookingResultResponse(BaseModel):
-    """Echo of an act-on-appointment operation. ``warning`` is set only
-    for partial-success rescheduling — see BlueprintAdapter.reschedule."""
+    """Echo of an act-on-appointment operation.
 
-    status: Literal["booked", "cancelled", "rescheduled", "partial"]
+    ``status`` is validated against ``BookingStatus`` — the adapter's own
+    vocabulary — rather than a copy of it, so a new outcome cannot pass the
+    adapter and then fail here at serialisation time.
+
+    ``warning`` carries the reason on every non-success branch: a partial
+    reschedule, a refused confirm/cancel, or an appointment whose status the
+    PMS will not let us write at all.
+    """
+
+    status: BookingStatus
     appointment_id: str | None = None
     summary: str | None = None
     start_time: str | None = None
@@ -715,7 +728,8 @@ def appointment_decision(
         the self-pay offer.
     """
     from api.voice_agent.appointment_decision import (
-        DecisionInputs, DecisionRules, decide, resolve_payer,
+        DecisionInputs, DecisionRules, decide, plan_name_is_recognized,
+        resolve_payer,
     )
     from api.voice_agent.protocols import load_protocol_config
     from api.voice_agent.protocols.acna_appointment_decision import (
@@ -786,11 +800,15 @@ def appointment_decision(
             last_clean_check_date=inputs_raw["last_clean_check_date"],
             date_of_birth=inputs_raw["date_of_birth"],
             warranty_expiry_date=inputs_raw["warranty_expiry_date"],
+            has_hearing_aid=inputs_raw["has_hearing_aid"],
         ),
         DecisionRules(
             qualifying_plan_names=tuple(cfg.qualifying_plan_names),
             non_qualifying_plan_names=tuple(cfg.non_qualifying_plan_names),
-            unknown_plan_allows_annual=cfg.unknown_plan_allows_annual,
+            unknown_plan_action=cfg.unknown_plan_action,
+            require_hearing_aid_for_funded_annual=(
+                cfg.require_hearing_aid_for_funded_annual
+            ),
             expired_qualifying_allows_annual=cfg.expired_qualifying_allows_annual,
             payer_min_years=dict(cfg.payer_min_years),
             payer_actions=dict(cfg.payer_actions),
@@ -854,7 +872,23 @@ def appointment_decision(
         # and get agreement on before booking.
         "self_pay_price": decision.self_pay_price,
         "patient_context": {
-            "care_plan": inputs_raw["care_plan_name"],
+            # Only a RECOGNIZED plan name is exposed for the agent to speak. The
+            # feed carries placeholder labels ('Other') that mean nothing to a
+            # patient — relaying one produced "you're covered under a plan
+            # labeled as other" on a live test call. An unrecognized label is
+            # sent as null, which the prompt already handles ("the team can
+            # check"). The raw value stays in the audit trace either way.
+            "care_plan": (
+                inputs_raw["care_plan_name"]
+                if plan_name_is_recognized(
+                    inputs_raw["care_plan_name"],
+                    DecisionRules(
+                        qualifying_plan_names=tuple(cfg.qualifying_plan_names),
+                        non_qualifying_plan_names=tuple(cfg.non_qualifying_plan_names),
+                    ),
+                )
+                else None
+            ),
             "care_plan_active": bool(expiry and expiry >= today),
             "annual_covered_by_plan": decision.annual_covered_by_plan,
             "last_hearing_test": last_test.isoformat() if last_test else None,
@@ -954,6 +988,48 @@ def book_appointment(
 
 
 @router.post(
+    "/{clinic_id}/appointments/confirm",
+    response_model=BookingResultResponse,
+)
+def confirm_appointment(
+    clinic_id: str,
+    body: ConfirmAppointmentRequest,
+    _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
+):
+    """Mark an upcoming appointment Confirmed via Blueprint Edit Appointment.
+
+    Blueprint models a status change as a PUT to /appointments/{id} carrying
+    the ``onlineBookingSecret`` — the same write ``cancel`` issues, with
+    status=0 instead of 3. There is no PATCH on this resource. The secret is
+    re-resolved server-side and never crosses the agent's view.
+
+    A refusal (cancelled, already past, mid-visit) comes back as
+    ``status="not_confirmable"`` with a ``warning`` rather than an HTTP error:
+    the agent has to say something true to the caller either way, and a 4xx
+    would just become a generic "something went wrong".
+    """
+    adapter = BlueprintAdapter(clinic_id=clinic_id)
+    adapter.load_http_config(db)
+    result = adapter.confirm(appointment_id=body.appointment_id)
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="appointment_confirm",
+        patient_id="",  # the write is keyed on the appointment, not the patient
+        outcome=result.status,
+        detail=f"appointment_id={body.appointment_id} warning={result.warning or ''}",
+    )
+    return BookingResultResponse(
+        status=result.status,
+        appointment_id=result.appointment_id,
+        summary=result.summary,
+        start_time=result.start_time,
+        end_time=result.end_time,
+        warning=result.warning,
+    )
+
+
+@router.post(
     "/{clinic_id}/appointments/cancel",
     response_model=BookingResultResponse,
 )
@@ -1020,9 +1096,13 @@ def reschedule_appointment(
 
 
 class PatientMatchRequest(BaseModel):
-    first_name: str
+    # Surname + last-4 is the identifying pair the agent asks for. first_name
+    # and dob are tie-breakers sent only on a retry after `ambiguous`.
+    # first_name stays accepted (not removed) so an older assistant config
+    # still mid-call against a new server keeps working.
     last_name: str
     last4_phone: str
+    first_name: str | None = None
     dob: str | None = None  # YYYY-MM-DD; optional tie-breaker when ambiguous
 
 
@@ -1093,6 +1173,10 @@ def match_patient_by_name(
     """
     Server-side patient match against Blueprint_PHI.ClientDemographics.
 
+    Identifies on SURNAME + last-4 of any phone on file. ``first_name`` and
+    ``dob`` are optional tie-breakers the agent sends only on a retry after an
+    ``ambiguous`` result — it never asks the caller for them up front.
+
     **The _clinic_id filter is mandatory and non-negotiable** — a match for a
     patient belonging to clinic A must never be returnable when querying
     clinic B's endpoint. This is a PHI isolation requirement, not a style
@@ -1105,9 +1189,9 @@ def match_patient_by_name(
     """
     adapter = BlueprintAdapter(clinic_id=clinic_id)
     result = adapter.find_patient(
-        first_name=body.first_name,
         last_name=body.last_name,
         last4_phone=body.last4_phone,
+        first_name=body.first_name,
         dob=body.dob,
     )
     log_phi_access(

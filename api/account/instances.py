@@ -8,6 +8,9 @@ from api.deps import (
 )
 from api.models import InstanceUpdate, ProvisionRequest
 from api.core.db import get_session
+from api.core.grouping import (
+    is_multi_location, is_multi_location_for_count,
+)
 from api.core.orm import Clinic, ClinicAdmin, Instance
 from api.account.provisioning import provision_full_account
 
@@ -15,7 +18,22 @@ from api.account.provisioning import provision_full_account
 router = APIRouter()
 
 
-def _instance_dict(i: Instance) -> dict:
+def _instance_dict(i: Instance, *, clinic_count: int | None = None,
+                   db: Session | None = None) -> dict:
+    """Serialise an instance.
+
+    ``multi_location_group`` is derived from the clinic count rather than stored
+    (see ``api.core.grouping``). Callers that have already counted pass
+    ``clinic_count`` so a listing does not issue a query per row; the rest pass
+    ``db`` and let it count.
+    """
+    if clinic_count is not None:
+        is_group = is_multi_location_for_count(clinic_count)
+    elif db is not None:
+        is_group = is_multi_location(db, i.instance_id)
+    else:
+        # No way to count, and guessing "yes" would offer a rollup that 404s.
+        is_group = False
     return {
         "instance_id": i.instance_id,
         "instance_name": i.instance_name,
@@ -24,7 +42,7 @@ def _instance_dict(i: Instance) -> dict:
         "primary_contact_uid": i.primary_contact_uid,
         "google_ads_customer_id": i.google_ads_customer_id,
         "invoca_profile_id": i.invoca_profile_id,
-        "multi_location_group": bool(i.multi_location_group),
+        "multi_location_group": is_group,
     }
 
 
@@ -118,7 +136,8 @@ def list_instances(
 
     rows = db.execute(q).all()
     return [
-        {**_instance_dict(inst), "clinic_count": int(count)}
+        {**_instance_dict(inst, clinic_count=int(count)),
+         "clinic_count": int(count)}
         for inst, count in rows
     ]
 
@@ -155,7 +174,7 @@ def get_instance_by_id(
             if not granted:
                 raise HTTPException(status_code=403, detail="Access denied")
 
-    return _instance_dict(instance)
+    return _instance_dict(instance, db=db)
 
 
 @router.get("/instance/{uid}")
@@ -185,7 +204,7 @@ def get_instance(
     # each key. Dropped routers (staff/services/insurance/users) are no longer
     # returned — those tables are gone.
     return {
-        "instance": [_instance_dict(instance)],
+        "instance": [_instance_dict(instance, clinic_count=len(clinics))],
         "clinics": [_clinic_dict(c) for c in clinics],
     }
 

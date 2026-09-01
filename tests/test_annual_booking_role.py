@@ -58,6 +58,11 @@ def test_exact_tool_set(cfg):
     names = [t["name"] for t in cfg["model"]["tools"]]
     assert names == [
         "verify_caller_identification",
+        # Existing-appointment path (2026-08-24). Before these, a caller
+        # ringing to CONFIRM an upcoming appointment got "I can't check
+        # existing appointments right now" and a message taken.
+        "locate_appointment",
+        "confirm_appointment",
         "determine_appointment_type",
         "find_available_slots",
         "book_appointment",
@@ -66,6 +71,46 @@ def test_exact_tool_set(cfg):
         "answer_clinic_question",
         "submit_ticket",
     ]
+
+
+def test_existing_appointment_branch_is_reachable_and_ordered(cfg):
+    """The lookup branch must sit BEFORE the new-booking spine.
+
+    A caller saying "confirm my appointment" has to hit 3A before the
+    decision tool, or the agent runs the new-booking eligibility rules
+    against someone who already has what they called about.
+    """
+    sysp = cfg["model"]["messages"][0]["content"]
+    i_route = sysp.find("About an appointment they ALREADY have")
+    i_3a = sysp.find("### Step 3A — An appointment they already have")
+    i_decide = sysp.find("### Step 3 — Determine the right appointment")
+    assert -1 < i_route < i_3a < i_decide
+
+
+def test_confirmed_wording_ban_is_scoped_to_new_bookings(cfg):
+    """The tentative-wording rule must not forbid confirming an existing appt.
+
+    Regression: the hard-rules block said flatly "bookings are tentative until
+    staff confirm (...not 'confirmed')". That block is LAST in the assembled
+    prompt and framed as non-negotiable, so it overrode the confirm protocol's
+    permission earlier in the prompt and the live agent told a caller it
+    couldn't confirm an appointment directly.
+    """
+    sysp = cfg["model"]["messages"][0]["content"]
+    # The unscoped blanket ban must not come back.
+    assert 'bookings are tentative until staff confirm' not in sysp
+    # The rule must survive for NEW bookings...
+    assert "A booking YOU CREATE on this call is tentative" in sysp
+    # ...and explicitly carve out the confirm path.
+    assert "does NOT apply to an existing appointment you confirmed" in sysp
+    assert "Do not tell a caller you can't confirm an appointment directly" in sysp
+
+
+def test_agent_is_told_it_can_look_up_appointments(cfg):
+    """Regression: the live agent claimed it could not, and took a message."""
+    sysp = cfg["model"]["messages"][0]["content"]
+    assert "You CAN look up existing appointments" in sysp
+    assert "NEVER tell a caller you cannot look up their existing appointments" in sysp
 
 
 def test_list_appointment_types_excluded(cfg):
@@ -124,13 +169,18 @@ def test_referral_and_price_rules_present(cfg):
     assert "NEVER state a price the decision tool didn't give you" in sys
 
 
-def test_identity_check_is_prefaced_before_the_spell_back(cfg):
+def test_identity_check_is_prefaced_before_the_readback(cfg):
     # The framing must land BEFORE the verify fragment's letter-by-letter
-    # instructions, or the agent spells names back cold.
+    # instructions, or the agent spells the surname back cold.
+    #
+    # 2026-08-24: the preface is now a FIXED line rather than "something like
+    # X or Y" (the model improvised a longer one every call), and the check
+    # itself is a single combined readback of surname + last-4 rather than two
+    # separate spell-backs.
     sys = cfg["model"]["messages"][0]["content"]
-    i_preface = sys.find("We really need to get your identity right")
-    i_spellback = sys.find("Confirm the spelling of BOTH names")
-    assert -1 < i_preface < i_spellback
+    i_preface = sys.find("So I'm sure I've got the right file")
+    i_readback = sys.find("Confirm both back in ONE turn")
+    assert -1 < i_preface < i_readback
 
 
 def test_time_preference_precedes_offering_slots(cfg):
@@ -221,22 +271,33 @@ def test_faq_miss_routes_to_a_handoff_not_a_guess(cfg):
     assert "NEVER answer a general clinic question from your own knowledge" in sys
 
 
-def test_tool_chain_gets_one_lead_in_not_one_per_call(cfg):
-    """A run of back-to-back tools must be prefaced ONCE, not per call.
+def test_tool_calls_are_silent_with_no_lead_in_at_all(cfg):
+    """Tool calls get NO spoken preface — not one per call, not one per run.
 
-    After identity is verified the role calls determine_appointment_type and
-    then find_available_slots with nothing to ask the caller in between. The
-    earlier rule ("you may say 'one moment while I check' once") read as
-    once-per-call-site, so the live agent stalled before each one and the caller
-    heard three filler phrases in a row. The instruction now has to be explicit
-    that the whole run shares a single lead-in and then goes quiet.
+    Third iteration of this rule, and the history is the argument for the
+    current shape:
+      1. "you may say 'one moment while I check' once" → read as
+         once-per-call-site; the agent stalled before every tool.
+      2. "a RUN of tool calls gets ONE lead-in, not one each" → still produced
+         "Just a sec." / "Hold on a sec." back to back on the 2026-08-24 test
+         call, because gpt-4o emits a content chunk per tool call and cannot
+         reliably amortise one preface across a run it hasn't made yet.
+    Budgeting a filler the model is then trusted to ration does not work. The
+    only enforceable budget is zero, so the rule is now absolute and names the
+    offending phrases explicitly.
     """
     sys = cfg["model"]["messages"][0]["content"]
 
-    assert "A RUN of tool calls gets ONE lead-in, not one each" in sys
-    assert "go quiet until you actually have something to tell them" in sys
-    # The old permissive phrasing must not come back.
+    assert "TOOL CALLS ARE SILENT" in sys
+    # The specific phrases heard on the live call must be named, not implied.
+    for phrase in ("hold on a sec", "one moment", "let me check"):
+        assert phrase in sys, f"{phrase!r} must be explicitly forbidden"
+    # And it must be a hard rule, not only a style note.
+    assert "NEVER speak a stalling phrase" in sys
+
+    # None of the earlier permissive phrasings may come back.
     assert 'You may say "one moment while I check" once' not in sys
+    assert "A RUN of tool calls gets ONE lead-in" not in sys
 
 
 def test_agent_still_told_not_to_narrate_tools(cfg):
@@ -244,4 +305,4 @@ def test_agent_still_told_not_to_narrate_tools(cfg):
     rule that tool names and systems are never spoken aloud."""
     sys = cfg["model"]["messages"][0]["content"]
 
-    assert "Never narrate tool names or systems" in sys
+    assert "Never narrate tool names, systems, or steps" in sys

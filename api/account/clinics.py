@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from api.deps import bq_client, require_read_access, require_write_access, verify_token
 from api.models import ClinicCreate, ClinicUpdate
 from api.core.db import get_session
+from api.core.grouping import is_multi_location
 from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, Instance, InvocaCampaign
 from api.account.provisioning import provision_clinic
 
@@ -264,7 +265,7 @@ def get_clinic_instance(
     return {
         "instance_id": clinic.instance_id,
         "instance_name": getattr(instance, "instance_name", None),
-        "multi_location_group": bool(getattr(instance, "multi_location_group", False)),
+        "multi_location_group": is_multi_location(db, instance.instance_id),
     }
 
 

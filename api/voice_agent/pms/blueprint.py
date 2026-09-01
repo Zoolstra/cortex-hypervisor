@@ -33,7 +33,11 @@ from fastapi import HTTPException
 from google.cloud import bigquery
 from sqlalchemy.orm import Session
 
-from api.core.orm import Clinic, ClinicBlueprintConfig
+from sqlalchemy import select
+
+from api.core.orm import (
+    CATCH_ALL_LOCATION_KEY, Clinic, InstancePmsConfig, PmsClinicLocation,
+)
 from api.core.secrets import get_secret
 from api.deps import PROJECT, bq_client
 from api.voice_agent.pms import (
@@ -59,12 +63,71 @@ log = logging.getLogger(__name__)
 # Blueprint appointment status codes (see API docs):
 #   0=Confirmed, 1=No show, 2=Tentative, 3=Cancelled, 4=Left Message,
 #   5=Arrived, 6=In Progress, 7=Completed, 8=No answer, 9=Ready
+_STATUS_CONFIRMED = 0
+_STATUS_TENTATIVE = 2
 _STATUS_CANCELLED = 3
+
+# Statuses a caller may confirm attendance for. Deliberately narrow: an
+# appointment that already ran, was cancelled, or is mid-visit is not something
+# a caller can promise to attend, and flipping one back to Confirmed would
+# corrupt the clinic's own record of what happened. 'Left message', 'No answer'
+# and 'Ready' are outreach states on a still-upcoming booking, so they confirm.
+_CONFIRMABLE_STATUSES = frozenset({
+    _STATUS_TENTATIVE,   # 2 — the main case: staff (or the agent) pencilled it in
+    4,                   # Left message — clinic tried to reach them; this IS the reply
+    8,                   # No answer   — same
+    9,                   # Ready
+})
 _STATUS_NAMES = {
     0: "confirmed", 1: "no_show", 2: "tentative", 3: "cancelled",
     4: "left_message", 5: "arrived", 6: "in_progress", 7: "completed",
     8: "no_answer", 9: "ready",
 }
+
+
+# ── The onlineBookingSecret constraint ────────────────────────────────────────
+#
+# Blueprint's Edit Appointment endpoint —
+#     PUT /rest/appointments/{eventId}_{recurrenceId}
+# is documented as editing "a previously created (through OAB or the Scheduling
+# API) appointment", and lists `onlineBookingSecret` as MANDATORY. That secret
+# is minted per-appointment at creation time by Online Appointment Booking or
+# by POST /rest/appointments/ — the two paths Blueprint considers "ours".
+#
+# An appointment a receptionist typed into the Blueprint OMS desktop client has
+# no secret. Search returns it as null, and there is no way to derive, request,
+# or mint one after the fact. So the status of a staff-booked appointment is
+# UNWRITABLE over this API — which is to say, unwritable for most appointments
+# a caller would ring up about, since those are precisely the ones staff made.
+#
+# The one status write that needs no secret is
+#     POST /rest/appointments/markArrived   (apiKey + appointmentId + userId)
+# and it is hardwired to status 5 (Arrived). We deliberately do NOT reach for it
+# as a stand-in for Confirmed: "Arrived" asserts the patient is physically in
+# the clinic, so writing it days ahead would put them in the front desk's
+# waiting-room queue and corrupt the clinic's own record of the visit. Its
+# existence is still useful evidence — it proves Blueprint's server CAN change
+# an appointment's status on apiKey alone, so the secret requirement on PUT is
+# an OAB design choice rather than a security floor. That is the argument to
+# take to Blueprint (see _SECRET_MISSING_WARNING callers).
+#
+# Until they relax it, the honest behaviour is to refuse the write, keep the
+# caller's answer, and hand the appointment to staff.
+_SECRET_MISSING_WARNING = (
+    "This appointment was created in the clinic's own system, so it cannot be "
+    "updated automatically — a team member has to do it."
+)
+
+
+def _booking_secret(raw: dict) -> str | None:
+    """The appointment's ``onlineBookingSecret``, or None if it has none.
+
+    One accessor for all three write paths (confirm / cancel / reschedule).
+    Each used to inline `raw.get(...)` and raise its own 502; keeping the read
+    and the refusal in one place is the same fix as consolidating on
+    ``_local_iso`` — two copies of a rule is how they drift.
+    """
+    return raw.get("onlineBookingSecret") or None
 
 
 # ── Config helpers ────────────────────────────────────────────────────────────
@@ -74,12 +137,27 @@ def _get_blueprint_config(db: Session, clinic_id: str) -> dict:
     """
     Resolve Blueprint config + API key + timezone for a clinic.
 
+    Credentials are account-level (alembic 0030), so this reads the clinic's
+    *instance* config and then the clinic's row in the location map — which is
+    the only per-clinic PMS config there is.
+
     Reads:
-      - clinics + clinic_blueprint_config + clinic_location_details (Cloud SQL)
-      - clinic_{clinic_id}_blueprint_api_key (Secret Manager)
+      - clinics + instance_pms_config + pms_clinic_locations
+        + clinic_location_details (Cloud SQL)
+      - instance_{instance_id}_blueprint_api_key (Secret Manager), falling back
+        to clinic_{clinic_id}_blueprint_api_key
 
     Returns dict with: clinic_name, api_url, clinic_code, api_key, timezone,
-    instance_id (for the admin access check).
+    instance_id (for the admin access check), prompt_for_location, user_id,
+    location_id.
+
+    ``location_id`` is new here and closes a real gap. Three call sites already
+    read it (``_int_field(config, "location_id")``) and nothing ever populated
+    it, so ``_resolve_location_id`` raised "a location_id is required to book" for
+    any account with more than one location. The mapping row is exactly that
+    value: the vendor location this clinic fronts. It stays None for a clinic
+    mapped by the catch-all key, which is the single-location case where
+    Blueprint infers the location itself.
     """
     clinic = db.get(Clinic, clinic_id)
     if not clinic or clinic.deleted_at is not None:
@@ -88,26 +166,80 @@ def _get_blueprint_config(db: Session, clinic_id: str) -> dict:
     if clinic.pms_type != "blueprint":
         raise HTTPException(status_code=400, detail="Clinic is not configured for Blueprint OMS")
 
-    bp = db.get(ClinicBlueprintConfig, clinic_id)
-    if not bp or not bp.api_url:
-        raise HTTPException(status_code=400, detail="Blueprint config incomplete: api_url is missing")
+    cfg = db.get(InstancePmsConfig, (clinic.instance_id, "blueprint"))
+    if not cfg or not cfg.api_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Blueprint config incomplete: the account has no api_url. "
+                   "Set it under the instance's PMS settings.")
 
-    try:
-        api_key = get_secret(f"clinic_{clinic_id}_blueprint_api_key")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Blueprint API key not found in Secret Manager")
+    # The clinic's mapping. More than one means this clinic fronts several vendor
+    # locations, so no single location_id applies and the caller must choose —
+    # which is what prompt_for_location exists for.
+    rows = list(db.scalars(
+        select(PmsClinicLocation).where(
+            PmsClinicLocation.instance_id == clinic.instance_id,
+            PmsClinicLocation.pms_type == "blueprint",
+            PmsClinicLocation.clinic_id == clinic_id,
+            PmsClinicLocation.active.is_(True),
+        ).order_by(PmsClinicLocation.vendor_location_key)
+    ))
+
+    location_id = None
+    if len(rows) == 1 and rows[0].vendor_location_key != CATCH_ALL_LOCATION_KEY:
+        try:
+            location_id = int(rows[0].vendor_location_key)
+        except ValueError:
+            # A non-numeric key is a CounselEar-shaped id; Blueprint's are ints,
+            # so a bad value here should surface as "unset" rather than a crash.
+            log.warning("clinic %s maps to non-numeric Blueprint location %r",
+                        clinic_id, rows[0].vendor_location_key)
+
+    api_key = _blueprint_api_key(clinic.instance_id, clinic_id)
 
     location = clinic.location  # 1:1
     return {
         "clinic_name": clinic.clinic_name,
-        "api_url": bp.api_url,
-        "clinic_code": bp.clinic_code,
+        "api_url": cfg.api_url,
+        "clinic_code": cfg.clinic_code,
         "api_key": api_key,
         "timezone": location.time_zone if location else None,
         "instance_id": clinic.instance_id,
-        "prompt_for_location": bool(bp.prompt_for_location),
-        "user_id": bp.user_id,
+        "prompt_for_location": any(r.prompt_for_location for r in rows),
+        "user_id": next((r.booking_user_id for r in rows if r.booking_user_id), None),
+        "location_id": location_id,
     }
+
+
+def _blueprint_api_key(instance_id: str, clinic_id: str) -> str:
+    """The account's Blueprint API key, with a transitional per-clinic fallback.
+
+    Migration 0030 moved config to the account but cannot write Secret Manager,
+    so a client configured before the cutover still has its key under the clinic
+    scope. Reading it is better than refusing to book; logging loudly is what
+    keeps the fallback temporary rather than permanent
+    (``scripts/copy_pms_secrets_to_instance.py`` retires it).
+    """
+    try:
+        key = get_secret(f"instance_{instance_id}_blueprint_api_key")
+        if key:
+            return key
+    except Exception:
+        pass
+
+    try:
+        key = get_secret(f"clinic_{clinic_id}_blueprint_api_key")
+    except Exception:
+        key = None
+    if not key:
+        raise HTTPException(status_code=400,
+                            detail="Blueprint API key not found in Secret Manager")
+
+    log.warning(
+        "Blueprint api_key for instance %s read from clinic %s's secret — copy it "
+        "to instance_%s_blueprint_api_key to retire the fallback",
+        instance_id, clinic_id, instance_id)
+    return key
 
 
 def _blueprint_base(config: dict) -> str:
@@ -189,47 +321,67 @@ class BlueprintAdapter(PMSAdapter):
     def find_patient(
         self,
         *,
-        first_name: str,
         last_name: str,
         last4_phone: str,
+        first_name: str | None = None,
         dob: str | None = None,
     ) -> PatientMatchResult:
         """
         Server-side patient match against `Blueprint_PHI.ClientDemographics`.
 
         The `_clinic_id` filter is **mandatory and non-negotiable** —
-        cross-clinic PHI must never be returnable. Matches on first + last
-        name (case-insensitive), then filters by any phone field
-        (mobile/home/work) ending in `last4_phone`. If `>1` candidates remain
-        and dob is provided, adds dob as a tie-breaker.
+        cross-clinic PHI must never be returnable.
+
+        Identifies on SURNAME (case-insensitive, exact) + any phone field
+        (mobile/home/work) ending in `last4_phone`. First name is deliberately
+        NOT part of the identifying pair: it is the field voice transcription
+        mangles most and the one callers give a short form of ("Bob" for
+        "Robert"), and an exact-match miss there returned `unmatched` for a
+        patient who is plainly on file.
+
+        `first_name` and `dob` are OPTIONAL tie-breakers, added to the WHERE
+        only when supplied — the agent sends them on a retry after `ambiguous`.
+        Surname + last-4 is a weaker identifier than the old triple, so
+        `ambiguous` is now the EXPECTED outcome for a household sharing a
+        surname and a landline; that is why both tie-breakers exist and why
+        `candidates_count` comes back.
         """
         last4 = "".join(c for c in last4_phone if c.isdigit())
         if len(last4) != 4:
             raise HTTPException(status_code=400, detail="last4_phone must be exactly 4 digits")
 
+        if not (last_name or "").strip():
+            raise HTTPException(status_code=400, detail="last_name is required")
+
         params = [
             bigquery.ScalarQueryParameter("clinic_id", "STRING", self.clinic_id),
-            bigquery.ScalarQueryParameter("first_name", "STRING", first_name.strip()),
             bigquery.ScalarQueryParameter("last_name", "STRING", last_name.strip()),
             bigquery.ScalarQueryParameter("last4", "STRING", last4),
         ]
-        dob_clause = ""
+
+        # Tie-breakers. Each is appended to the WHERE only when the agent
+        # actually supplied it, so an omitted one widens the match rather than
+        # matching on empty string.
+        tiebreak_clauses = ""
+        if (first_name or "").strip():
+            tiebreak_clauses += "\n          AND LOWER(given_name) = LOWER(@first_name)"
+            params.append(
+                bigquery.ScalarQueryParameter("first_name", "STRING", first_name.strip())
+            )
         if dob:
-            dob_clause = "AND birthdate = @dob"
+            tiebreak_clauses += "\n          AND birthdate = @dob"
             params.append(bigquery.ScalarQueryParameter("dob", "STRING", dob))
 
         sql = f"""
         SELECT client_id
         FROM `{PROJECT}.Blueprint_PHI.ClientDemographics`
         WHERE _clinic_id = @clinic_id
-          AND LOWER(given_name) = LOWER(@first_name)
           AND LOWER(surname) = LOWER(@last_name)
           AND (
             ENDS_WITH(IFNULL(mobile_telephone_no, ''), @last4)
             OR ENDS_WITH(IFNULL(home_telephone_no, ''), @last4)
             OR ENDS_WITH(IFNULL(work_telephone_no, ''), @last4)
-          )
-          {dob_clause}
+          ){tiebreak_clauses}
     """
         rows = list(bq_client.query(
             sql,
@@ -314,8 +466,17 @@ class BlueprintAdapter(PMSAdapter):
                                                         # practitioner in clinician_names
               "last_clean_check_date": date | None,    # max completed appt with a
                                                         # practitioner NOT on that list
-              "warranty_expiry_date": date | None      # soonest UPCOMING device
-            }                                          # warranty expiry
+              "warranty_expiry_date": date | None,     # soonest UPCOMING device
+              "has_hearing_aid": bool                  # warranty expiry
+            }
+
+        ``has_hearing_aid`` reuses the intelligence report's authoritative
+        device definition (``queries.py`` ``_ACTIVE_AID_STATUS_LIKE`` +
+        ``_hearing_aid_join_sql``): status 'Active%' AND a HearingAidModel row
+        with ``is_hearing_aid``. ClientAids also holds accessories (chargers,
+        dry-kits, TV streamers) and returned/cancelled orders, so an
+        unqualified row count is NOT device ownership — which is exactly how a
+        patient with no aid still carried a ``service_plan_name``.
 
         ``last_clean_check_date`` uses the practitioner list as the
         clinician/technician discriminator — the same convention
@@ -354,6 +515,21 @@ class BlueprintAdapter(PMSAdapter):
             AND service_plan_name IS NOT NULL AND TRIM(service_plan_name) != ''
           ORDER BY expiry DESC
           LIMIT 1
+        ),
+        aids AS (
+          -- Does the patient currently own a HEARING AID (not an accessory,
+          -- not a returned/cancelled order)? Same definition the intelligence
+          -- report uses, so the voice agent and the reporting layer can't
+          -- disagree about who owns a device.
+          SELECT COUNT(*) > 0 AS owns
+          FROM `{PROJECT}.Blueprint_PHI.ClientAids` a
+          JOIN `{PROJECT}.Blueprint_PHI.HearingAidModel` m
+            ON m._clinic_id = a._clinic_id
+           AND m.model_id = a.model_id
+           AND LOWER(TRIM(m.is_hearing_aid)) = 'true'
+          WHERE a._clinic_id = @clinic_id
+            AND CAST(a.client_id AS STRING) = @patient_id
+            AND a.status LIKE 'Active%'
         ),
         warranty AS (
           -- Soonest UPCOMING device warranty expiry. MIN over FUTURE dates
@@ -414,7 +590,8 @@ class BlueprintAdapter(PMSAdapter):
           (SELECT d      FROM last_test) AS last_hearing_test_date,
           (SELECT d      FROM last_clin) AS last_clinician_visit_date,
           (SELECT d      FROM last_tech) AS last_clean_check_date,
-          (SELECT d      FROM warranty)  AS warranty_expiry_date
+          (SELECT d      FROM warranty)  AS warranty_expiry_date,
+          (SELECT owns   FROM aids)      AS has_hearing_aid
         """
         params = [
             bigquery.ScalarQueryParameter("clinic_id", "STRING", self.clinic_id),
@@ -435,6 +612,7 @@ class BlueprintAdapter(PMSAdapter):
             "last_clinician_visit_date": row["last_clinician_visit_date"],
             "last_clean_check_date": row["last_clean_check_date"],
             "warranty_expiry_date": row["warranty_expiry_date"],
+            "has_hearing_aid": bool(row["has_hearing_aid"]),
         }
 
     # ── Appointment types ─────────────────────────────────────────────────────
@@ -724,25 +902,27 @@ class BlueprintAdapter(PMSAdapter):
         return {t.id: t.name for t in types if t.name}
 
     @staticmethod
-    def _parse_blueprint_time(s: str | None) -> str | None:
-        """Blueprint returns times like "2026-05-30 14:30:00 GMT" or
-        "2026-05-30 14:30:00 +0000". Normalize to ISO-8601 (drop the
-        suffix; we keep clinic-local wall-clock semantics, matching how
-        the agent quoted slots earlier in the call).
+    def _local_iso(raw: str | None, tz: ZoneInfo) -> str | None:
+        """Blueprint UTC time → clinic-local ISO-8601 ``YYYY-MM-DDTHH:MM``.
+
+        Replaces ``_parse_blueprint_time``, which stripped the " GMT" marker
+        and kept the UTC digits while *claiming* they were clinic-local. They
+        are not: Blueprint labels these UTC, so a 2pm Edmonton appointment
+        comes back "20:00:00 GMT" and the agent read it out as 8pm.
+
+        ``tz`` is a REQUIRED parameter, not an optional one with a default.
+        The whole bug was a conversion that could be skipped silently; making
+        the timezone impossible to omit is what stops it recurring.
+
+        Delegates to ``_to_local_hhmm`` so the availability path (which was
+        always correct) and the locate/cancel/confirm path share ONE parser
+        and cannot drift apart again.
         """
-        if not s:
+        parts = BlueprintAdapter._to_local_hhmm(raw, tz)
+        if parts is None:
             return None
-        s = s.strip()
-        for suffix in (" GMT", " UTC"):
-            if s.endswith(suffix):
-                s = s[: -len(suffix)]
-        # Convert "YYYY-MM-DD HH:MM:SS" → "YYYY-MM-DDTHH:MM"
-        if " " in s and "T" not in s:
-            date_part, _, time_part = s.partition(" ")
-            time_part = time_part.split("+")[0].split("-")[0].strip()
-            hhmm = ":".join(time_part.split(":")[:2])
-            return f"{date_part}T{hhmm}"
-        return s
+        date_str, hhmm = parts
+        return f"{date_str}T{hhmm}"
 
     def list_patient_appointments(
         self,
@@ -779,8 +959,8 @@ class BlueprintAdapter(PMSAdapter):
                 event_type_id=event_type_id,
                 event_type_name=type_names.get(event_type_id) if event_type_id else None,
                 summary=r.get("summary"),
-                start_time=self._parse_blueprint_time(r.get("start_time")) or "",
-                end_time=self._parse_blueprint_time(r.get("end_time")) or "",
+                start_time=self._local_iso(r.get("start_time"), tz) or "",
+                end_time=self._local_iso(r.get("end_time"), tz) or "",
                 provider_name=r.get("provider"),
                 location_name=r.get("location"),
                 status=_STATUS_NAMES.get(status_code, "unknown") if status_code is not None else "unknown",
@@ -1331,21 +1511,128 @@ class BlueprintAdapter(PMSAdapter):
 
     # ── Cancel ────────────────────────────────────────────────────────────────
 
-    def cancel(self, *, appointment_id: str) -> BookingResult:
+    def confirm(self, *, appointment_id: str) -> BookingResult:
+        """Mark an upcoming appointment Confirmed (Blueprint status 0).
+
+        Same Edit-Appointment write ``cancel`` uses — Blueprint exposes status
+        changes as a PUT to /appointments/{id} carrying the
+        ``onlineBookingSecret``; there is no PATCH on this resource. The secret
+        is recovered server-side and never crosses the agent's view.
+
+        Refuses anything that is not an UPCOMING, confirmable booking. Both
+        halves matter: a past appointment can't be attended, and a cancelled
+        one must not be silently revived by a caller who says "yes I'll be
+        there". An already-confirmed appointment is a no-op echo (mirroring
+        ``cancel``) so the agent can reassure the caller naturally instead of
+        surfacing a duplicate-action error.
+        """
         config = self._require_http_config()
         base = _blueprint_base(config)
 
+        # Resolved up front: every time below is clinic-local, including the
+        # already-passed gate.
+        tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
+
+        raw = self._find_raw_appointment(appointment_id)
+        status_code = raw.get("status")
+        start_local = self._local_iso(raw.get("start_time"), tz)
+
+        def _echo(status: str, warning: str | None = None) -> BookingResult:
+            return BookingResult(
+                status=status,
+                appointment_id=appointment_id,
+                summary=raw.get("summary"),
+                start_time=start_local,
+                end_time=self._local_iso(raw.get("end_time"), tz),
+                warning=warning,
+            )
+
+        if status_code == _STATUS_CONFIRMED:
+            return _echo("confirmed")
+
+        if status_code not in _CONFIRMABLE_STATUSES:
+            name = _STATUS_NAMES.get(status_code, "unknown") if status_code is not None else "unknown"
+            return _echo(
+                "not_confirmable",
+                warning=f"Appointment is '{name}' — only an upcoming booking can be confirmed.",
+            )
+
+        # Upcoming check, in CLINIC-LOCAL time. `_local_iso` returns a naive
+        # clinic-local ISO string, so compare against clinic-local now.
+        # (Before the 2026-08-24 timezone fix this compared UTC digits against
+        # local now — 6 hours adrift for Edmonton, in the permissive
+        # direction, so a just-passed appointment still looked confirmable.)
+        if start_local:
+            try:
+                if datetime.fromisoformat(start_local) < datetime.now(tz).replace(tzinfo=None):
+                    return _echo(
+                        "not_confirmable",
+                        warning="Appointment start time has already passed.",
+                    )
+            except ValueError:
+                log.warning(
+                    "confirm: unparseable start_time clinic_id=%s appointment_id=%s raw=%r",
+                    self.clinic_id, appointment_id, start_local,
+                )
+
+        # No secret → Blueprint will not accept the write (see
+        # _SECRET_MISSING_WARNING). This is NOT a 502. The caller has just told
+        # us a true and useful thing; a tool error throws that away and leaves
+        # the agent improvising, which is exactly what happened on call
+        # 01a03f5c (appointment 451098_0, staff-booked, Tentative). Return 200
+        # with a status the agent can act on and a warning it can speak.
+        secret = _booking_secret(raw)
+        if not secret:
+            log.info(
+                "confirm: no onlineBookingSecret clinic_id=%s appointment_id=%s "
+                "status=%s — returning pending_staff_confirmation",
+                self.clinic_id, appointment_id, status_code,
+            )
+            return _echo("pending_staff_confirmation", warning=_SECRET_MISSING_WARNING)
+
+        user_id = _int_field(config, "user_id") or raw.get("provider_id")
+
+        payload = {
+            "apiKey": config["api_key"],
+            "onlineBookingSecret": secret,
+            "userId": user_id,
+            "status": _STATUS_CONFIRMED,
+        }
+        resp = httpx.put(f"{base}/appointments/{appointment_id}", json=payload, timeout=15)
+        resp.raise_for_status()
+
+        return _echo("confirmed")
+
+    def cancel(self, *, appointment_id: str) -> BookingResult:
+        config = self._require_http_config()
+        base = _blueprint_base(config)
+        _tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
+
         # Recover the onlineBookingSecret (never exposed to the agent).
         raw = self._find_raw_appointment(appointment_id)
-        secret = raw.get("onlineBookingSecret")
+        secret = _booking_secret(raw)
 
         # "User" performing the cancel: configured service-account user if
         # set, else the appointment's own provider (a valid Blueprint user).
         user_id = _int_field(config, "user_id") or raw.get("provider_id")
+
+        # A staff-booked appointment cannot be cancelled over the API either —
+        # same constraint, same reasoning as confirm(). A refusal the agent can
+        # speak beats a 502 it cannot: "I can't cancel that myself, but I'll
+        # have the team do it" is a true and useful answer.
         if not secret:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Appointment {appointment_id!r} has no onlineBookingSecret — cannot cancel via API",
+            log.info(
+                "cancel: no onlineBookingSecret clinic_id=%s appointment_id=%s "
+                "— returning not_cancellable",
+                self.clinic_id, appointment_id,
+            )
+            return BookingResult(
+                status="not_cancellable",
+                appointment_id=appointment_id,
+                summary=raw.get("summary"),
+                start_time=self._local_iso(raw.get("start_time"), _tz),
+                end_time=self._local_iso(raw.get("end_time"), _tz),
+                warning=_SECRET_MISSING_WARNING,
             )
 
         # If it's already cancelled, no-op echo so the agent can confirm
@@ -1355,8 +1642,8 @@ class BlueprintAdapter(PMSAdapter):
                 status="cancelled",
                 appointment_id=appointment_id,
                 summary=raw.get("summary"),
-                start_time=self._parse_blueprint_time(raw.get("start_time")),
-                end_time=self._parse_blueprint_time(raw.get("end_time")),
+                start_time=self._local_iso(raw.get("start_time"), _tz),
+                end_time=self._local_iso(raw.get("end_time"), _tz),
             )
 
         payload = {
@@ -1372,8 +1659,8 @@ class BlueprintAdapter(PMSAdapter):
             status="cancelled",
             appointment_id=appointment_id,
             summary=raw.get("summary"),
-            start_time=self._parse_blueprint_time(raw.get("start_time")),
-            end_time=self._parse_blueprint_time(raw.get("end_time")),
+            start_time=self._local_iso(raw.get("start_time"), _tz),
+            end_time=self._local_iso(raw.get("end_time"), _tz),
         )
 
     # ── Reschedule (cancel-then-book) ─────────────────────────────────────────
@@ -1388,6 +1675,9 @@ class BlueprintAdapter(PMSAdapter):
         """Blueprint's PUT can't change start/end time — only status. So
         a true reschedule is book-new-then-cancel-old. Order matters:
 
+        0. Preflight the old appointment's ``onlineBookingSecret``. Without it
+           step 4 can never succeed, so booking first would leave the patient
+           double-booked every single time.
         1. Look up the old appointment to recover event_type_id +
            duration + patient_id (needed to recreate at the new slot).
         2. Compute the new end_time from the old appointment's duration.
@@ -1403,6 +1693,32 @@ class BlueprintAdapter(PMSAdapter):
             raise HTTPException(
                 status_code=502,
                 detail=f"Appointment {appointment_id!r} has no eventTypeId — cannot reschedule",
+            )
+
+        # PREFLIGHT the secret before booking anything. Step 4 below cancels the
+        # old appointment, and cancel needs the secret — so on a staff-booked
+        # appointment this method would book the new slot, fail the cancel, and
+        # return "partial" EVERY time: a guaranteed duplicate booking for the
+        # patient, dressed up as a warning. Checking first turns a certain
+        # double-booking into a clean refusal with nothing written.
+        if not _booking_secret(raw):
+            log.info(
+                "reschedule: no onlineBookingSecret clinic_id=%s appointment_id=%s "
+                "— refusing before booking to avoid a duplicate",
+                self.clinic_id, appointment_id,
+            )
+            _tz = ZoneInfo(self._require_http_config().get("timezone") or "America/Vancouver")
+            return BookingResult(
+                status="not_cancellable",
+                appointment_id=appointment_id,
+                summary=raw.get("summary"),
+                start_time=self._local_iso(raw.get("start_time"), _tz),
+                end_time=self._local_iso(raw.get("end_time"), _tz),
+                warning=(
+                    "This appointment was created in the clinic's own system, so it "
+                    "cannot be moved automatically — a team member has to do it. "
+                    "Nothing was booked or changed."
+                ),
             )
 
         # Pull patient_id from the existing record. `book` derives end_time

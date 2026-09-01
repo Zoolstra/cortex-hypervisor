@@ -13,7 +13,7 @@ number:
   * the payload keeping the same SHAPE as the clinic payload, which is what lets
     the two share React components.
 
-Plus the endpoint wiring: the multi_location_group capability gate and skip_llm.
+Plus the endpoint wiring: the clinic-count gate and skip_llm.
 
 All BigQuery / LLM work is stubbed — no external calls.
 """
@@ -388,13 +388,12 @@ def test_group_pms_type_is_mixed_only_across_different_systems(stub_queries):
                    {**_spec("B"), "pms_type": "blueprint"}])["pms_type"] == "mixed"
 
 
-# ── Endpoint: capability-flag gate ───────────────────────────────────────────
+# ── Endpoint: clinic-count gate ──────────────────────────────────────────────
 
 class _FakeInstance:
-    def __init__(self, flag):
+    def __init__(self):
         self.instance_id = "INST"
         self.instance_name = "Virsono"
-        self.multi_location_group = flag
 
 
 class _FakeScalars:
@@ -410,12 +409,16 @@ class _FakeResult:
         return _FakeScalars()
 
 
-def _use_session(instance):
+def _use_session(instance, clinic_count=2):
+    """`clinic_count` is what gates the rollup — two or more locations makes it
+    available (api/core/grouping.py). Defaults to a multi-location instance since
+    that is the case most of these tests exercise."""
     def _override():
         yield type("S", (), {
             "get": lambda self, m, i: instance,
             "execute": lambda self, *a, **k: _FakeResult(),
             "scalars": lambda self, *a, **k: [],
+            "scalar": lambda self, *a, **k: clinic_count,
         })()
     app.dependency_overrides[get_session] = _override
 
@@ -427,9 +430,11 @@ def client():
     app.dependency_overrides.clear()
 
 
-def test_group_overview_flag_off_404(client, monkeypatch):
+def test_group_overview_single_location_404(client, monkeypatch):
+    """One clinic: a rollup would just repeat it, so the section is invisible
+    (404, not 403) rather than empty."""
     app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
-    _use_session(_FakeInstance(flag=False))
+    _use_session(_FakeInstance(), clinic_count=1)
     r = client.get("/intelligence/group/INST/overview?days=30")
     assert r.status_code == 404
 
@@ -441,9 +446,9 @@ def test_group_overview_missing_instance_404(client, monkeypatch):
     assert r.status_code == 404
 
 
-def test_group_overview_flag_on_ok(client, monkeypatch):
+def test_group_overview_multi_location_ok(client, monkeypatch):
     app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
-    _use_session(_FakeInstance(flag=True))
+    _use_session(_FakeInstance(), clinic_count=2)
     monkeypatch.setattr("intelligence_report.payloads.build_group_overview",
                         lambda **k: {"clinic_id": k["instance_id"], "ok": True})
     r = client.get("/intelligence/group/INST/overview?days=30")
@@ -453,7 +458,7 @@ def test_group_overview_flag_on_ok(client, monkeypatch):
 
 def test_group_overview_bad_date_range_422(client, monkeypatch):
     app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
-    _use_session(_FakeInstance(flag=True))
+    _use_session(_FakeInstance(), clinic_count=2)
     monkeypatch.setattr("intelligence_report.payloads.build_group_overview", lambda **k: {"ok": True})
     r = client.get("/intelligence/group/INST/overview?start=2026-06-10&end=2026-06-01")
     assert r.status_code == 422
@@ -475,7 +480,7 @@ def test_group_overview_skip_llm_disables_recommendations_and_bypasses_cache(cli
     JSON cache is bypassed in both directions (mirrors the clinic overview)."""
     _isolate_cache(monkeypatch)
     app.dependency_overrides[verify_token] = lambda: {"role": "super_admin", "uid": "sa"}
-    _use_session(_FakeInstance(flag=True))
+    _use_session(_FakeInstance(), clinic_count=2)
     calls = []
 
     def _fake_build(**k):

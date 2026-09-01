@@ -17,6 +17,11 @@ Two entry points land in the same table:
     The Jotform field payload arrives JSON-encoded in ``rawRequest`` and is
     mapped onto the same columns.
 
+    A URL can only name one clinic, which is wrong for a group running every
+    site off one form. When such a form asks the patient to choose a location,
+    ``jotform_form_locations`` maps that answer to a clinic and the path clinic
+    becomes a fallback — see ``_resolve_location_clinic``.
+
 Auth
 ----
 A single shared secret (Secret Manager: ``webform-webhook-secret``) guards both
@@ -47,7 +52,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.core.db import get_session
-from api.core.orm import Clinic, JotformForm
+from api.core.orm import Clinic, JotformForm, JotformFormLocation
 from api.core.secrets import get_secret
 from api.deps import bq_client, verify_token
 from api.models import WebformSubmission
@@ -458,6 +463,82 @@ def _parse_jotform(raw_request: str) -> dict:
     }
 
 
+def _resolve_location_clinic(
+    db: Session, form_id: str | None, fields: dict, default: Clinic,
+) -> Clinic:
+    """Pick the clinic a submission belongs to from its "choose your location" answer.
+
+    One form can serve a whole group — Sense of Hearing's appointment-request
+    form covers all 14 Ontario sites — but the webhook URL names a single clinic
+    (``JotformForm``), so without this every submission lands on whichever clinic
+    that URL points at. ``jotform_form_locations`` maps each dropdown answer to a
+    clinic; this resolves one submission against that map.
+
+    Matching is by VALUE, not by field name, and deliberately so. Forms reveal
+    different location dropdowns by condition — the Sense of Hearing form has
+    four (adult, 6-17, APD, 10-months-up) with overlapping option lists, and only
+    the one its conditions revealed is answered. Naming the fields would mean
+    re-configuring every time the builder adds a fifth; scanning the values costs
+    nothing and cannot go stale. Option strings are long and address-bearing
+    ("Burlington: 11 - 1960 Appleby Line"), so a collision with an unrelated
+    field's value is not a practical concern.
+
+    Falls back to ``default`` (the clinic in the webhook path) whenever the answer
+    is missing, unmapped, mapped to nothing yet, or points at a soft-deleted
+    clinic. A lead attributed to the group's default site is recoverable — the
+    verbatim answer is kept in ``raw_fields`` — where a dropped lead is not. Each
+    fallback logs the value that caused it so the gap is visible rather than
+    silent.
+    """
+    if not form_id:
+        return default
+
+    rows = db.execute(
+        select(JotformFormLocation).where(
+            JotformFormLocation.jotform_form_id == form_id,
+            JotformFormLocation.active.is_(True),
+        )
+    ).scalars().all()
+    if not rows:
+        return default
+
+    by_option = {r.option_value: r.clinic_id for r in rows}
+    for value in (fields.get("raw_fields") or {}).values():
+        if not isinstance(value, str):
+            continue
+        answer = value.strip()
+        if answer not in by_option:
+            continue
+
+        mapped_id = by_option[answer]
+        if mapped_id is None:
+            # Known option, clinic not created yet — an expected state during a
+            # group's rollout, not a misconfiguration.
+            log.warning(
+                "Jotform location %r on form %s has no clinic yet; "
+                "attributing to %s", answer, form_id, default.clinic_id,
+            )
+            return default
+
+        clinic = db.get(Clinic, mapped_id)
+        if clinic is None or clinic.deleted_at is not None:
+            log.warning(
+                "Jotform location %r on form %s maps to missing/deleted clinic %s; "
+                "attributing to %s", answer, form_id, mapped_id, default.clinic_id,
+            )
+            return default
+        return clinic
+
+    # The form has a location map but this submission matched none of it: either
+    # an option was renamed in the builder, or a new site was added and never
+    # mapped. Both are drift the provisioning script should reconcile.
+    log.warning(
+        "Jotform form %s has %d mapped location(s) but the submission matched "
+        "none; attributing to %s", form_id, len(by_option), default.clinic_id,
+    )
+    return default
+
+
 @router.post("/webforms/jotform/{clinic_id}")
 async def ingest_jotform_webform(
     request: Request,
@@ -471,6 +552,10 @@ async def ingest_jotform_webform(
     against the same ``webform-webhook-secret``. ``clinic_id`` is path-scoped and
     validated against Cloud SQL. Jotform POSTs multipart form-data; the field
     values arrive JSON-encoded in the ``rawRequest`` part.
+
+    The path clinic is the form's DEFAULT, not necessarily the row's: a form that
+    serves a whole group asks which site the patient wants, and
+    ``_resolve_location_clinic`` re-points the row at that one.
     """
     expected = (get_secret("webform-webhook-secret") or "").strip()
     if not expected or token.strip() != expected:
@@ -494,9 +579,13 @@ async def ingest_jotform_webform(
     fields["form_title"] = _clean(form.get("formTitle"))
     fields["pretty"] = _clean(form.get("pretty"))
 
+    # A group's shared form names one clinic in its webhook URL but asks the
+    # patient which site they want; that answer wins over the path.
+    clinic = _resolve_location_clinic(db, fields["form_id"], fields, clinic)
+
     _store_submission(clinic, fields)
-    log.info("Stored Jotform submission clinic_id=%s form=%s submission=%s",
-             clinic_id, form.get("formID"), form.get("submissionID"))
+    log.info("Stored Jotform submission clinic_id=%s (path %s) form=%s submission=%s",
+             clinic.clinic_id, clinic_id, form.get("formID"), form.get("submissionID"))
     return {"status": "accepted"}
 
 

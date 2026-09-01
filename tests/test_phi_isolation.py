@@ -182,6 +182,7 @@ def test_dob_omitted_does_not_add_tiebreaker(capture, client):
 
 
 def test_name_match_is_case_insensitive_in_sql(capture, client):
+    # first_name here is the optional TIE-BREAKER, so both clauses appear.
     resp = client.post(
         "/blueprint/X/patient/match",
         json={"first_name": "Alice", "last_name": "Smith", "last4_phone": "1234"},
@@ -190,6 +191,60 @@ def test_name_match_is_case_insensitive_in_sql(capture, client):
     sql, _ = capture.calls[0]
     assert "LOWER(given_name) = LOWER(@first_name)" in sql
     assert "LOWER(surname) = LOWER(@last_name)" in sql
+
+
+# ── Identifying pair: surname + last-4 ────────────────────────────────────────
+#
+# The agent asks for a LAST NAME and four digits, nothing else. first_name is a
+# tie-breaker it may send on an `ambiguous` retry — never something it collects
+# up front. These pin that the identifying query works without it.
+
+
+def test_surname_and_last4_alone_is_a_valid_lookup(capture, client):
+    resp = client.post(
+        "/blueprint/X/patient/match",
+        json={"last_name": "Smith", "last4_phone": "1234"},
+    )
+    assert resp.status_code == 200, resp.text
+    sql, params = capture.calls[0]
+    assert "LOWER(surname) = LOWER(@last_name)" in sql
+    # No first-name clause and no bound parameter — an omitted tie-breaker must
+    # widen the match, never match on an empty string.
+    assert "given_name" not in sql
+    assert all(n != "first_name" for (n, _) in params)
+
+
+def test_blank_first_name_does_not_add_a_clause(capture, client):
+    resp = client.post(
+        "/blueprint/X/patient/match",
+        json={"last_name": "Smith", "last4_phone": "1234", "first_name": "   "},
+    )
+    assert resp.status_code == 200, resp.text
+    sql, params = capture.calls[0]
+    assert "given_name" not in sql
+    assert all(n != "first_name" for (n, _) in params)
+
+
+def test_first_name_is_accepted_as_an_ambiguous_retry_tiebreaker(capture, client):
+    resp = client.post(
+        "/blueprint/X/patient/match",
+        json={"last_name": "Smith", "last4_phone": "1234", "first_name": "Alice"},
+    )
+    assert resp.status_code == 200, resp.text
+    sql, params = capture.calls[0]
+    assert "LOWER(given_name) = LOWER(@first_name)" in sql
+    assert ("first_name", "Alice") in params
+
+
+def test_last_name_is_required(capture, client):
+    # Missing entirely → pydantic 422; present but blank → the adapter's 400.
+    assert client.post(
+        "/blueprint/X/patient/match", json={"last4_phone": "1234"},
+    ).status_code == 422
+    assert client.post(
+        "/blueprint/X/patient/match",
+        json={"last_name": "  ", "last4_phone": "1234"},
+    ).status_code == 400
 
 
 def test_last4_matches_any_phone_field(capture, client):

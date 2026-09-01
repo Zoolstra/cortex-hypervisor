@@ -50,6 +50,7 @@ api/
 | users | `/users/{instance_id}`, `/users/{uid}` |
 | appointment_types | `/appointment_types/{instance_id}`, `/appointment_types/{appointment_type_id}` |
 | review_snapshots | `/review_snapshots/{instance_id}` |
+| pms_config (`api/account/pms_config.py`) | **Two scopes.** Per clinic: `GET/POST/DELETE /clinics/{clinic_id}/pms` (→ `clinic_blueprint_config` + `clinic_{clinic_id}_blueprint_*` secrets). Per **account**, for one PMS login serving several locations: `GET/POST/DELETE /instances/{instance_id}/pms` (→ `instance_pms_config` + `pms_clinic_locations` + `instance_{instance_id}_blueprint_*`). See PMS config scopes below. |
 | worklist_taxonomy (`api/account/worklist_taxonomy.py`) | `GET/PUT /clinics/{clinic_id}/worklist-taxonomy` — per-clinic reactivation cohort config (JSON on `clinic_worklist_taxonomy`, validated by `WorklistTaxonomyConfig`). Consumed by `api/worklists.py`: `/worklists/cohorts`, `/worklists/cohort/{key}`, `/worklists/cohort/{key}/export.csv` (contact CSV, super_admin+admin, PHI-audit-logged), `/worklists/pms-taxonomy` (discovery). |
 
 `websites.router` is imported and registered but the router is empty — remove it (see Pending Work 2-E).
@@ -162,16 +163,26 @@ listed the same businesses and clinics, differing only in the chrome hung off
 them. Note that the picker's single-clinic auto-redirect is suppressed for
 super_admins, or a one-clinic tenant would strand them away from these buttons.
 
-**Settings → Details** (`cortex-spa/src/routes/settings/ClinicDetails.tsx`) is
-where both of the above are edited after the fact, in two panels split by blast
-radius: the instance's **name** + upstream account ids (changes every location of
-the business) and this clinic's **name** / address / phone / time zone / **hours**.
+Both are edited after the fact under settings, and settings is **split by blast
+radius** — which is the organising principle, not a detail:
 
-`instance_name` and `clinic_name` became mutable here — neither was in its
-update model before, so a typo from an onboarding call could only be fixed in
-Cloud SQL. Renaming is safe: **nothing joins on a name.** Scope, FKs, mart keys
-and the per-clinic PMS secrets (`clinic_{clinic_id}_{pms}_{key}` — id-keyed, not
-the name-derived layout the root CLAUDE.md still documents) all key on ids, and
+| Scope | Route | Holds |
+|---|---|---|
+| Business | `/settings/instance/$instanceId` (`InstanceSettingsShell.tsx`) | Overview (config status + the location list), Details (`instance_name`, `google_ads_customer_id`, `invoca_profile_id`; Group Intelligence shown read-only since it is derived), PMS (account config + location map) |
+| Location | `/settings/$clinicId` (`ClinicSettingsShell.tsx`) | Overview (cards, read-only PMS summary, ETL status), Details (`clinic_name` / address / phone / time zone / **hours**), Customer.io, Campaigns, Worklists, Voice Agent |
+
+The business fields used to be a panel on the *clinic* Details page, which meant
+a save on what read as one location's settings changed every location. They are
+now only reachable where they apply. The clinic shell's business name is a link
+up; `ClinicPicker` carries a **Business settings** link per business, since
+reaching business-wide config by first picking a location has the hierarchy
+backwards.
+
+`instance_name` and `clinic_name` are mutable — neither was in its update model
+originally, so a typo from an onboarding call could only be fixed in Cloud SQL.
+Renaming is safe: **nothing joins on a name.** Scope, FKs, mart keys
+and the PMS secrets (`instance_{instance_id}_{pms}_{key}` — id-keyed, not
+the name-derived layout the root CLAUDE.md documented) all key on ids, and
 every other reader treats the name as a display label. Two spots are *not*
 retroactive: the live VAPI assistant keeps the old name in its prompt until
 republished, and `ClinicData.webforms` rows already written keep the name they
@@ -215,13 +226,189 @@ immediately on sign-out/in) — role changes are not instant.
 > accounts are unverified `password` accounts and would drop to `viewer`. Close
 > it by disabling self-signup, or verify those 3 accounts first.
 
+## PMS configuration — account-level, for every vendor
+
+A PMS login belongs to the **business**, not to a location: one account covers
+however many sites the client has, and each site is a clinic here. So config is
+instance-scoped for Blueprint and CounselEar alike (alembic 0030), and the only
+per-clinic PMS config is which vendor location feeds the clinic.
+
+| Table | Holds |
+|---|---|
+| `instance_pms_config` | One row per (instance, pms_type). Blueprint: `clinic_code`, `api_url`, `aws_url`. CounselEar: `counselear_location_code`, `counselear_sftp_username`. Plus `primary_clinic_id`. |
+| `pms_clinic_locations` | Vendor location → clinic, plus the two settings that really are per-clinic: `prompt_for_location`, `booking_user_id`. |
+
+Before 0030 the same thing could be configured in two places with the clinic
+winning, which made the losing one invisible — a clinic wired directly kept
+claiming its whole account's feed while the account config sat there looking
+correct. Calgary is the worked example: one clinic reported five locations'
+appointments and revenue as its own.
+
+**There is no per-clinic PMS editor.** `GET /clinics/{clinic_id}/pms` is read-only
+and answers "where does this clinic's data come from"; the writes are all
+instance-scoped.
+
+| Endpoint | Does |
+|---|---|
+| `GET /instances/{id}/pms?pms_type=` | Account config + location map + the instance's clinics |
+| `POST /instances/{id}/pms` | Set config, secrets, fallback clinic, and the whole map |
+| `DELETE /instances/{id}/pms?pms_type=` | Remove the account config and its map (clinics keep `pms_type`) |
+| `GET /instances/{id}/pms/discover?pms_type=` | Ask the PMS which locations exist |
+| `POST /instances/{id}/pms/locations/import` | Create a clinic per location and map it |
+| `GET /clinics/{clinic_id}/pms` | Read-only: how this clinic is fed |
+
+### The catch-all key
+
+A single-location account still needs a map row, or "configured" and "ingesting"
+come apart. `vendor_location_key = '*'` means *every row of this feed belongs to
+this clinic*. It must be the **only** row for its account — a catch-all beside
+specific ids has no defined meaning, so the API rejects the combination and the
+ETL raises rather than double-loading every routable row. Importing real
+locations removes it. Migration 0030 gave every pre-existing Blueprint clinic a
+catch-all, which is deliberately behaviour-preserving: splitting an account is a
+config change, not something a schema migration should do silently.
+
+### Retired locations
+
+`active=0` with `clinic_id` NULL records a site we have stopped ingesting. A
+closed location's rows arrive in the shared feed indefinitely, and the ETL has to
+tell them from a site nobody mapped — that one is a wiring gap it must report.
+Deleting the row instead of retiring it collapses that distinction and leaves the
+sync permanently `partial`.
+
+### Write-time validation
+
+`POST /instances/{id}/pms` rejects what the ETL would otherwise get wrong
+*silently*: a location mapped twice (double ingest), an active location with no
+clinic (routes nowhere), a retired location naming a clinic (records a mapping a
+reader would act on), a clinic from another instance, a catch-all beside real
+keys, a retired catch-all. It also sets `pms_type` on each mapped clinic —
+the ETL scopes an account to clinics of the matching PMS, so a mapping to a
+`pms_type='none'` clinic stores fine and ingests nothing. It deliberately does
+**not** touch `etl_enabled` (that gates Google Ads and Invoca too) and reports
+`mapped_not_etl_enabled` instead.
+
+`locations` replaces the whole map when present and is left alone when omitted,
+so credentials can be saved without resending the map, and clearing it is an
+explicit `[]`.
+
+### Secrets
+
+`instance_{instance_id}_{pms_type}_{key}`. Readers try that first and fall back
+to a mapped clinic's `clinic_{clinic_id}_…` with a loud warning, because 0030
+could not write Secret Manager — which is what let the migration land without
+being sequenced against a secret copy.
+`scripts/copy_pms_secrets_to_instance.py` (dry-run by default) retires the
+fallback.
+
+**CounselEar is deliberately exempt.** Its secrets are named after the SFTP login
+(`{Username}_COUNSELEAR_SFTP_password`, from `provision_sftp.sh`), and that
+username is now account config — so the account row already locates them and no
+live credential was renamed. The endpoint accepts no CounselEar secrets.
+
+### Onboarding: clinics come from the PMS
+
+`POST /v2/admin/provision` takes the contact, the instance name, the Google Ads
+and Invoca ids, and the **PMS account** — and normally **no clinics**. The
+clinics come from the PMS afterwards:
+
+1. `GET /instances/{id}/pms/discover` — ask the PMS what sites exist.
+2. `POST /instances/{id}/pms/locations/import` — create a clinic per site (via
+   `provision_clinic`, so each gets its 1:1 sub-tables and seeded voice-agent
+   defaults) and map it.
+
+The response from provision carries `next_step` naming exactly that.
+
+> **Discovery is not guaranteed complete.** Blueprint's `clinicConfiguration`
+> returns only locations enabled for online booking and its `name` can be unset,
+> so a site that exists, bills and books by phone can be missing. The complete
+> list is the `Location` table in the S3 data feed
+> (`pms.blueprint.sync --discover`), which needs one sync to have run. The
+> response states this rather than presenting a partial list as the whole truth.
+> CounselEar has no locations endpoint at all — its per-row clinic ids come from
+> a landed feed (`pms.counselear.api_backfill --verify-clinics`).
+
+Pass `clinics` at provision time only for a business with no PMS, or to add a
+location the PMS does not report.
+
+### Deprecated
+
+`clinic_blueprint_config` and `clinic_counselear_config` are read by nothing and
+carry a table COMMENT saying so. Their rows are kept as 0030's rollback path and
+are dropped in a follow-up. **Do not add readers.** `configure_blueprint.py` was
+removed with them — it wrapped the deleted per-clinic endpoint, and the dashboard
+does the job.
+
+Frontend: `cortex-spa/src/components/manage/InstancePmsSection.tsx` on
+`/settings/instance/$instanceId/pms`. The map lists the locations
+`clinicConfiguration` reports (fetched on load, not behind a button), so
+assigning them to clinics does not depend on remembering to look. There is no
+clinic-level PMS route — `ClinicPmsSummary.tsx` renders the read-only "how this
+clinic is fed" panel on the clinic Overview instead, because a tab implies an
+editor.
+
+## Jotform lead forms — one form, many clinics
+
+A Jotform webhook URL carries exactly one `clinic_id` in its path, so
+`jotform_forms` maps a form to one clinic. That is wrong for a group running
+every site off a single lead form: Sense of Hearing's appointment-request form
+(262174010008038) serves all 14 Ontario locations, and of its first 78
+submissions only 11 chose Burlington — wiring it to the group's one existing
+clinic would have misattributed 86% of the leads.
+
+`jotform_form_locations` (alembic 0032) maps each "choose your location" answer
+to a clinic; `api/webforms.py::_resolve_location_clinic` applies it and the path
+clinic becomes the fallback. Three things about it are deliberate:
+
+- **The answer is matched verbatim, not parsed.** Option strings are marketing
+  copy maintained in the Jotform builder and already disagree with our clinic
+  names on 3 of those 14 ("Limestone Hearing Care Centre (Kingston)" vs. clinic
+  *Kingston*, "Mississauga (Eglinton)" vs. *Mississauga Central*, "St Catharines
+  West" vs. *St. Catharines West*). A name-matching resolver breaks silently on
+  the next copy edit.
+- **Matching is by value, across all fields.** Forms reveal several location
+  dropdowns by condition — that form has four (adult, 6-17, APD,
+  10-months-up) — and naming the fields means reconfiguring when a fifth
+  appears.
+- **`active=True` with a NULL `clinic_id` is legal here**, unlike
+  `pms_clinic_locations` where an active row must route somewhere. A group's
+  form lists every site from day one while the clinics are created over days;
+  recording the option with no clinic is what makes that gap visible. Such a
+  submission falls back to the form's clinic and the resolver logs it.
+
+Maintain the map with `configure_jotform_webhooks.py --locations` (dry-run by
+default; `--apply` records unmapped options with no clinic, `--link-by-name`
+also links options whose leading label is exactly a clinic name of the same
+instance) or through `GET`/`PUT /campaigns/jotform/{form_id}/locations`.
+
+Wire a group's webhook only after its map exists — the leads that arrive in
+between all land on the default clinic.
+
 ## Group Intelligence (multi-location rollup)
 
 `GET /intelligence/group/{instance_id}/overview` returns the **per-clinic
 Overview payload aggregated across the instance's clinics** — the same shape as
 `GET /intelligence/{clinic_id}/overview`, so the SPA renders both through the
 same `OverviewView` and every clinic-page section exists on the group page by
-construction. Gated by the instance `multi_location_group` flag (404 when off).
+construction. Gated on the instance having **two or more clinics** — 404 (not
+403) for a single location, so the section is invisible rather than empty.
+
+**Derived, not a setting** (alembic 0031, `api/core/grouping.py`). It was a stored
+`instances.multi_location_group` flag a super_admin toggled, which restated what
+the data already said and could disagree with it: an instance provisioned with
+four locations kept 404ing its rollup because nobody flipped the switch. The rule
+now lives in one place because there are six readers (four rollup gates, two
+payload fields) and a derivation copied six times will eventually differ in one.
+
+Deleted clinics don't count. `etl_enabled` deliberately does **not** enter into
+it — whether a business *has* several locations is a different question from
+whether we're currently ingesting for them, and folding the second in would make
+the rollup vanish mid-onboarding while clinics are switched on one at a time.
+
+The column survives with a deprecating COMMENT rather than being dropped: its
+values are the only record of which instances had the rollup deliberately OFF
+while having several locations, which is the seed for a nullable override column
+if that distinction is ever wanted back.
 
 Merge rules live in `intelligence_report/group_aggregate.py`. Three kinds, and
 picking the wrong one yields a plausible wrong number:
@@ -349,7 +536,6 @@ pms_type: Literal["none", "blueprint"] = "none"
 | Router file | Purpose |
 |---|---|
 | `voice_agent.py` | `POST /clinics/{clinic_id}/voice_agent/activate`, `DELETE`, `POST .../verify_caller_id` |
-| `pms_config.py` | Blueprint OMS credentials per clinic |
 | `scripts.py` | Call scripts per clinic per call type |
 | `campaigns.py` | Multi-campaign ID management per clinic (new table, old column kept) |
 
@@ -361,7 +547,32 @@ no second image to keep in sync.
 
 | Job | Command | Schedule (PT) | Purpose |
 |---|---|---|---|
-| `payload-prewarm` | `python scripts/prewarm_payloads.py` | hourly, as the **last step of the `etl-hourly-chain` workflow** (no longer its own `payload-prewarm-hourly` cron) | Warm the intelligence JSON payload cache so the first real visitor after a data-version rotation never pays the cold cost. 13 clinics × (4 windows + biweekly) + 1 group × 4 = **69 requests**. The 4 group requests are now the expensive ones — each fans the per-clinic readers across every clinic in the instance (see Group Intelligence below), so they cost roughly N clinic pages apiece rather than one. Warming them matters more than it used to: a cold group page is minutes. |
+| `payload-prewarm` | `python scripts/prewarm_payloads.py` | hourly, as the **last step of the `etl-hourly-chain` workflow** (no longer its own `payload-prewarm-hourly` cron) | Warm the intelligence JSON payload cache so the first real visitor after a data-version rotation never pays the cold cost. Covers every **cached** endpoint the SPA requests — `overview`, `pipeline-revenue` and `active-leads` per scope × 4 windows, plus per-clinic `biweekly`: 14 scopes × 4 × 3 + 13 = **181 requests**, run 4 at a time (`--concurrency`). The group requests are the expensive ones — each fans the per-clinic readers across every clinic in the instance (see Group Intelligence below), so they cost roughly N clinic pages apiece rather than one. Warming them matters more than it used to: a cold group page is minutes. |
+
+**Coverage is defined by what the SPA fetches AND what the backend caches** —
+both halves, or the job silently warms nothing useful. `scripts/prewarm_payloads.py`
+carries the page-by-page table; the rules that keep it honest:
+
+- It calls the HTTP endpoints, never the payload builders, so the cache key is
+  always built by the code that serves it.
+- It sends the *exact* query string the SPA sends, **including sending none where
+  the SPA sends none**. `biweekly` is the cautionary case: the SPA passes no
+  dates, so the window comes from the endpoint's `days=14` default
+  (`Window.from_days(14)` = today−14 … today, a 15-day span). The job used to
+  compute `today−13 … today` itself and warmed a key no page ever asked for.
+- `/calls` and the four `*.html` drill-downs are **not cached**, so they are not
+  warmed — a request would do the work and keep nothing. Adding a cache tier to
+  them is the prerequisite, not adding them here.
+- Work is ordered in tiers (every scope's landing Dashboard at the default window
+  first, presets and tabs after) so a run cut short by the task timeout has
+  warmed the pages people actually land on. It is not serial: when
+  `blueprint-sync` lands, every clinic's `data_version` rotates at once and the
+  summed cold cost of a serial run runs past the hour-long task timeout.
+
+Anything cached that the SPA requests but this job skips shows up as a page that
+is permanently cold — `pipeline-revenue` (fired by the landing Dashboard on both
+the clinic and the rollup) and `active-leads` (the Leads tab) were exactly that
+until 2026-08-21.
 
 Why **hourly** and not pinned to `blueprint-sync`: the cache key rotates on the
 PMS snapshot date (see `_data_version` in `api/intelligence.py`), and an hourly

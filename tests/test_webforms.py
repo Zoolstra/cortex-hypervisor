@@ -29,17 +29,34 @@ SECRET = "test-webform-secret"
 
 class _FakeDb:
     """``get(Clinic, id)`` resolves clinics from an in-memory map; unknown ids
-    return None. Pass ``deleted=True`` clinics to exercise the soft-delete path."""
+    return None. Pass ``deleted=True`` clinics to exercise the soft-delete path.
 
-    def __init__(self, clinics: dict[str, SimpleNamespace] | None = None):
+    ``execute`` serves the one select the ingest path makes — the form's
+    ``jotform_form_locations`` rows. It applies the same ``active`` filter the
+    real query does; scoping to a form id stays a SQL concern, so pass only the
+    rows belonging to the form under test."""
+
+    def __init__(self, clinics: dict[str, SimpleNamespace] | None = None,
+                 locations: list[SimpleNamespace] | None = None):
         self._clinics = clinics or {}
+        self._locations = locations or []
 
     def get(self, model, key):
         return self._clinics.get(key)
 
+    def execute(self, stmt):
+        rows = [r for r in self._locations if r.active]
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
+
 
 def _clinic(clinic_id="C1", name="Test Clinic", deleted_at=None):
     return SimpleNamespace(clinic_id=clinic_id, clinic_name=name, deleted_at=deleted_at)
+
+
+def _location(option_value, clinic_id="C2", form_id="F1", active=True):
+    """One ``jotform_form_locations`` row: a dropdown answer -> a clinic."""
+    return SimpleNamespace(jotform_form_id=form_id, option_value=option_value,
+                           clinic_id=clinic_id, active=active)
 
 
 @pytest.fixture
@@ -330,6 +347,154 @@ def test_jotform_garbage_rawrequest_stores_nulls(harness):
     assert row["clinic_id"] == "C1"
     assert row["first_name"] is None and row["email"] is None
     assert row["submitted_at"]  # still stamped
+
+
+# ── Location routing (jotform_form_locations) ─────────────────────────────────
+#
+# A group's single lead form names ONE clinic in its webhook path but asks the
+# patient which site they want. These cover the answer overriding the path, and
+# every way that override can fail without losing the lead.
+
+# The Sense of Hearing appointment form: four location dropdowns revealed by
+# condition (adult / 6-17 / APD / 10-months-up), of which exactly one is
+# answered. Option strings are the real ones, addresses and all.
+_BURLINGTON = "Burlington: 11 - 1960 Appleby Line"
+_OAKVILLE = "Oakville: 240 North Service Road West Oakville"
+_KINGSTON = "Limestone Hearing Care Centre (Kingston): 102 - 817 Bayridge Drive"
+
+
+def _location_raw_request(answer, field="q19_chooseYour"):
+    return json.dumps({
+        "q24_name": {"first": "Ada", "last": "Byron"},
+        "q5_email3": "ada@example.com",
+        "q26_phoneNumber": {"full": "(905) 555-0100"},
+        field: answer,
+    })
+
+
+def _post_location(client, answer, field="q19_chooseYour", form_id="F1"):
+    return client.post(
+        "/webforms/jotform/C1",
+        params={"token": SECRET},
+        data={"rawRequest": _location_raw_request(answer, field), "formID": form_id},
+    )
+
+
+def test_jotform_location_answer_overrides_the_path_clinic(harness):
+    make_client, captured = harness
+    client = make_client(_FakeDb(
+        {"C1": _clinic("C1", "Burlington"), "C2": _clinic("C2", "Oakville")},
+        [_location(_BURLINGTON, "C1"), _location(_OAKVILLE, "C2")],
+    ))
+
+    assert _post_location(client, _OAKVILLE).status_code == 200
+    row = captured[0]
+    # Path said C1; the patient chose Oakville, so the row belongs to C2.
+    assert row["clinic_id"] == "C2"
+    assert row["clinic_name"] == "Oakville"
+
+
+def test_jotform_location_found_in_whichever_dropdown_was_answered(harness):
+    # The condition engine reveals one of four location fields. The resolver
+    # matches on the VALUE, so it must not care which field carried it.
+    make_client, captured = harness
+    client = make_client(_FakeDb(
+        {"C1": _clinic("C1", "Burlington"), "C3": _clinic("C3", "Kingston")},
+        [_location(_KINGSTON, "C3")],
+    ))
+
+    # q21_chooseYour21 is the APD-specific dropdown, not the default one.
+    assert _post_location(client, _KINGSTON, field="q21_chooseYour21").status_code == 200
+    assert captured[0]["clinic_id"] == "C3"
+
+
+def test_jotform_unmapped_location_falls_back_to_the_path_clinic(harness):
+    # An option renamed in the builder, or a site added and never mapped. The
+    # lead must still land — the verbatim answer survives in raw_fields.
+    make_client, captured = harness
+    client = make_client(_FakeDb(
+        {"C1": _clinic("C1", "Burlington")},
+        [_location(_BURLINGTON, "C1")],
+    ))
+
+    assert _post_location(client, "Somewhere Else: 1 Nowhere Rd").status_code == 200
+    row = captured[0]
+    assert row["clinic_id"] == "C1"
+    assert json.loads(row["raw_fields"])["chooseYour"] == "Somewhere Else: 1 Nowhere Rd"
+
+
+def test_jotform_location_mapped_to_no_clinic_yet_falls_back(harness):
+    # Known option, clinic not created yet (clinic_id NULL) — the expected state
+    # part-way through a group's rollout, not a misconfiguration.
+    make_client, captured = harness
+    client = make_client(_FakeDb(
+        {"C1": _clinic("C1", "Burlington")},
+        [_location(_OAKVILLE, clinic_id=None)],
+    ))
+
+    assert _post_location(client, _OAKVILLE).status_code == 200
+    assert captured[0]["clinic_id"] == "C1"
+
+
+def test_jotform_inactive_location_mapping_is_ignored(harness):
+    make_client, captured = harness
+    client = make_client(_FakeDb(
+        {"C1": _clinic("C1", "Burlington"), "C2": _clinic("C2", "Oakville")},
+        [_location(_OAKVILLE, "C2", active=False)],
+    ))
+
+    assert _post_location(client, _OAKVILLE).status_code == 200
+    assert captured[0]["clinic_id"] == "C1"
+
+
+def test_jotform_location_mapped_to_deleted_clinic_falls_back(harness):
+    make_client, captured = harness
+    client = make_client(_FakeDb(
+        {"C1": _clinic("C1", "Burlington"),
+         "C2": _clinic("C2", "Oakville", deleted_at="2026-01-01")},
+        [_location(_OAKVILLE, "C2")],
+    ))
+
+    assert _post_location(client, _OAKVILLE).status_code == 200
+    assert captured[0]["clinic_id"] == "C1"
+
+
+def test_jotform_form_with_no_location_map_keeps_the_path_clinic(harness):
+    # Every single-site form: no rows, no override, unchanged behaviour.
+    make_client, captured = harness
+    client = make_client(_FakeDb({"C1": _clinic("C1", "Burlington")}))
+
+    assert _post_location(client, _OAKVILLE).status_code == 200
+    assert captured[0]["clinic_id"] == "C1"
+
+
+def test_jotform_submission_without_form_id_keeps_the_path_clinic(harness):
+    # No formID part means nothing to look the map up by.
+    make_client, captured = harness
+    client = make_client(_FakeDb(
+        {"C1": _clinic("C1", "Burlington"), "C2": _clinic("C2", "Oakville")},
+        [_location(_OAKVILLE, "C2")],
+    ))
+
+    resp = client.post(
+        "/webforms/jotform/C1",
+        params={"token": SECRET},
+        data={"rawRequest": _location_raw_request(_OAKVILLE)},
+    )
+
+    assert resp.status_code == 200
+    assert captured[0]["clinic_id"] == "C1"
+
+
+def test_jotform_location_match_tolerates_surrounding_whitespace(harness):
+    make_client, captured = harness
+    client = make_client(_FakeDb(
+        {"C1": _clinic("C1", "Burlington"), "C2": _clinic("C2", "Oakville")},
+        [_location(_OAKVILLE, "C2")],
+    ))
+
+    assert _post_location(client, f"  {_OAKVILLE} ").status_code == 200
+    assert captured[0]["clinic_id"] == "C2"
 
 
 # ── Coverage endpoint ──────────────────────────────────────────────────────────

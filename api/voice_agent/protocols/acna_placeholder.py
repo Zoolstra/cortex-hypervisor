@@ -329,7 +329,7 @@ Use this to actually create the booking, AFTER the caller has agreed on an appoi
 ### What you get back
 `{status: "booked", summary, start_time, end_time}` — confirm in plain language ("You're on the schedule — Annual on Tuesday July 21 at 11 AM. A team member will reach out if anything changes.").
 
-Bookings land as **Tentative**; staff confirm them. Say "you're booked" / "we've got you on the schedule", not "confirmed".
+A booking created HERE lands as **Tentative** and staff review it, so say "you're booked" / "we've got you on the schedule", not "confirmed". That wording rule is about NEW bookings only — it says nothing about an appointment the caller already had and confirmed through `confirm_appointment`, which is genuinely Confirmed.
 
 ### If it fails
 If `book_appointment` errors or returns a non-success status, apologize, capture the requested slot in the ticket's `details`, set `suggested_followup` to "Staff to manually book — automated booking failed", and tell the caller a team member will follow up."""

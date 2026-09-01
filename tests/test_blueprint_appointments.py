@@ -24,6 +24,9 @@ isolation rely on:
   - reschedule books the new slot BEFORE cancelling the old one
   - reschedule reports status="partial" if cancel-old fails after book-new succeeds
   - reschedule aborts cleanly (no PUT issued) if book-new fails
+  - confirm sends Blueprint Edit-Appointment with status=0 for a TENTATIVE
+    booking, is a no-op echo when already confirmed, and REFUSES (no PUT) for
+    a cancelled / completed / already-past appointment
 """
 from __future__ import annotations
 
@@ -227,7 +230,10 @@ def test_locate_filters_to_requested_patient_only(stub, client):
     a = body["appointments"][0]
     assert a["appointment_id"] == "10995_0"
     assert a["event_type_name"] == "Hearing Test"
-    assert a["start_time"] == "2026-06-03T10:00"  # ISO-trimmed, no tz suffix
+    # Clinic-local, NOT the raw UTC "10:00" Blueprint returned. This line
+    # asserted 10:00 until 2026-08-24 — it was pinning the timezone bug that
+    # made the agent read a 2pm appointment out as 8pm.
+    assert a["start_time"] == "2026-06-03T03:00"
     assert a["status"] == "confirmed"
 
 
@@ -762,3 +768,357 @@ def test_list_locations_endpoint_returns_locations_and_flag(stub, client):
     assert body["prompt_for_location"] is False  # from _FAKE_CONFIG
     assert {loc["id"] for loc in body["locations"]} == {1, 2}
     assert body["locations"][0]["address"] == "1 North St"
+
+
+# ── Confirm attendance ────────────────────────────────────────────────────────
+#
+# The whole risk of this endpoint is which statuses it will write. Blueprint
+# status codes: 0=Confirmed, 1=No show, 2=Tentative, 3=Cancelled, 4=Left
+# message, 5=Arrived, 6=In progress, 7=Completed, 8=No answer, 9=Ready.
+#
+# `_appt` defaults start_time to 2026-06-03, which is in the past relative to
+# any real run — so every test that expects a WRITE must pass a future start.
+# That is deliberate: it means the upcoming-check is exercised by default and
+# a regression that drops it turns these tests red rather than green.
+
+_FUTURE = "2099-06-03 10:00:00 GMT"
+_FUTURE_END = "2099-06-03 10:30:00 GMT"
+
+TENTATIVE, CONFIRMED, CANCELLED, COMPLETED = 2, 0, 3, 7
+
+
+def _confirm(client, appointment_id="10995_0"):
+    return client.post(
+        "/blueprint/CLINIC_X/appointments/confirm",
+        json={"appointment_id": appointment_id},
+    )
+
+
+def test_confirm_tentative_sends_put_with_status_0_and_secret(stub, client):
+    """The core case: a tentative upcoming booking becomes Confirmed."""
+    puts: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=TENTATIVE, secret="THE_SECRET",
+              start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("PUT", "/appointments/10995_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+
+    resp = _confirm(client)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "confirmed"
+    assert body["appointment_id"] == "10995_0"
+
+    assert len(puts) == 1
+    assert puts[0]["status"] == 0
+    assert puts[0]["onlineBookingSecret"] == "THE_SECRET"
+    assert puts[0]["userId"] == 42
+
+
+def test_confirm_already_confirmed_is_a_noop_echo(stub, client):
+    # Mirrors cancel-an-already-cancelled: the caller hears a natural
+    # confirmation, and we don't issue a pointless write.
+    puts: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=CONFIRMED, start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("PUT", "/appointments/10995_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+
+    resp = _confirm(client)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "confirmed"
+    assert puts == []
+
+
+@pytest.mark.parametrize("status", [CANCELLED, COMPLETED, 1, 5, 6])
+def test_confirm_refuses_non_confirmable_statuses_without_writing(stub, client, status):
+    """A cancelled/finished/in-progress appointment must never be revived.
+
+    Returns 200 with status='not_confirmable' rather than an HTTP error: the
+    agent has to say something true to the caller, and a 4xx would collapse
+    into a generic failure message.
+    """
+    puts: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=status, start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("PUT", "/appointments/10995_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+
+    resp = _confirm(client)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "not_confirmable"
+    assert body["warning"]
+    assert puts == [], "must not write a status change"
+
+
+def test_confirm_refuses_an_appointment_already_in_the_past(stub, client):
+    # Tentative, but the start time has gone — you cannot promise to attend it.
+    puts: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=TENTATIVE, start="2020-06-03 10:00:00 GMT",
+              end="2020-06-03 10:30:00 GMT"),
+    ]))
+    stub.set("PUT", "/appointments/10995_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+
+    resp = _confirm(client)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "not_confirmable"
+    assert "passed" in body["warning"]
+    assert puts == []
+
+
+@pytest.mark.parametrize("status", [4, 8, 9])
+def test_confirm_accepts_outreach_states_on_an_upcoming_booking(stub, client, status):
+    # 'Left message' / 'No answer' / 'Ready' are states on a still-upcoming
+    # booking — a caller ringing back IS the reply the clinic was chasing.
+    puts: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=status, start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("PUT", "/appointments/10995_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+
+    resp = _confirm(client)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "confirmed"
+    assert len(puts) == 1 and puts[0]["status"] == 0
+
+
+def test_confirm_404s_when_appointment_not_in_lookup_window(stub, client):
+    stub.set("POST", "/appointments/search", StubResp(200, []))
+    assert _confirm(client, "ghost_0").status_code == 404
+
+
+def test_confirm_never_returns_the_online_booking_secret(stub, client):
+    # Same PHI/credential invariant locate_appointment holds.
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=TENTATIVE, secret="THE_SECRET",
+              start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("PUT", "/appointments/10995_0", StubResp(200, {}))
+
+    resp = _confirm(client)
+    assert "THE_SECRET" not in resp.text
+    assert "onlineBookingSecret" not in resp.text
+
+
+# ── Timezone: Blueprint returns UTC, the agent must speak clinic-local ────────
+#
+# Reported 2026-08-24: a 2pm Edmonton appointment was read out as 8pm. Blueprint
+# labels its times UTC ("...20:00:00 +0000"); the locate/cancel/confirm path
+# stripped the marker and kept the digits, asserting they were already local.
+# _FAKE_CONFIG is America/Vancouver (UTC-7 in June), so 10:00Z → 03:00 local.
+
+def _locate(client, patient_id="316"):
+    return client.post("/blueprint/CLINIC_X/appointments/locate",
+                       json={"patient_id": patient_id})
+
+
+def test_locate_converts_utc_to_clinic_local(stub, client):
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(start="2026-06-03 10:00:00 GMT", end="2026-06-03 10:30:00 GMT"),
+    ]))
+    body = _locate(client).json()
+    appt = body["appointments"][0]
+    assert appt["start_time"] == "2026-06-03T03:00", appt
+    assert appt["end_time"] == "2026-06-03T03:30"
+    # The pre-fix behaviour, pinned so it cannot come back.
+    assert appt["start_time"] != "2026-06-03T10:00"
+
+
+def test_locate_rolls_the_date_back_when_utc_is_next_day(stub, client):
+    """01:00Z on the 4th is 18:00 on the 3rd in Vancouver — the DATE moves too.
+
+    The old parser kept the UTC date, so this read as the wrong day as well as
+    the wrong time.
+    """
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(start="2026-06-04 01:00:00 GMT", end="2026-06-04 01:30:00 GMT"),
+    ]))
+    appt = _locate(client).json()["appointments"][0]
+    assert appt["start_time"] == "2026-06-03T18:00"
+
+
+def test_confirm_echo_is_clinic_local(stub, client):
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=TENTATIVE, secret="S",
+              start="2099-06-03 21:00:00 GMT", end="2099-06-03 21:30:00 GMT"),
+    ]))
+    stub.set("PUT", "/appointments/10995_0", StubResp(200, {}))
+    body = client.post("/blueprint/CLINIC_X/appointments/confirm",
+                       json={"appointment_id": "10995_0"}).json()
+    assert body["status"] == "confirmed"
+    assert body["start_time"] == "2099-06-03T14:00"
+
+
+def test_cancel_echo_is_clinic_local(stub, client):
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(secret="S", start="2026-06-03 10:00:00 GMT",
+              end="2026-06-03 10:30:00 GMT"),
+    ]))
+    stub.set("PUT", "/appointments/10995_0", StubResp(200, {}))
+    body = client.post("/blueprint/CLINIC_X/appointments/cancel",
+                       json={"appointment_id": "10995_0"}).json()
+    assert body["start_time"] == "2026-06-03T03:00"
+
+
+def test_confirm_past_gate_uses_local_time_not_utc_digits(stub, client):
+    """The gate compares against clinic-local now, so the UTC/local skew
+    cannot make a past appointment look upcoming (or vice versa)."""
+    puts = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=TENTATIVE, secret="S", start="2020-06-03 10:00:00 GMT",
+              end="2020-06-03 10:30:00 GMT"),
+    ]))
+    stub.set("PUT", "/appointments/10995_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+    body = client.post("/blueprint/CLINIC_X/appointments/confirm",
+                       json={"appointment_id": "10995_0"}).json()
+    assert body["status"] == "not_confirmable"
+    assert "passed" in body["warning"]
+    assert puts == []
+
+
+# ── The onlineBookingSecret constraint ────────────────────────────────────────
+#
+# Blueprint's Edit Appointment PUT is authorised by an `onlineBookingSecret`
+# it mints only for appointments created through OAB or the Scheduling API.
+# A staff-booked appointment has none, so its status cannot be written at all.
+#
+# That is provenance, not a fault. These tests pin the requirement that it
+# NEVER surfaces as an HTTP error — on VAPI call 01a03f5c a 502 reached the
+# agent as `Tool execution completed with errors` on appointment 451098_0, so
+# the caller's "yes, I'll be there" was thrown away and the agent improvised.
+
+
+def test_confirm_without_secret_returns_200_pending_staff_confirmation(stub, client):
+    """The reported failure. A tentative, upcoming, staff-booked appointment.
+
+    Must be 200 + 'pending_staff_confirmation' + a speakable warning, and must
+    NOT issue the PUT (Blueprint would reject it) and must NOT 502.
+    """
+    puts: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(appointment_id="451098_0", status=TENTATIVE, secret=None,
+              start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("PUT", "/appointments/451098_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+
+    resp = _confirm(client, appointment_id="451098_0")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "pending_staff_confirmation"
+    assert body["appointment_id"] == "451098_0"
+    assert body["warning"], "the agent needs something true to say"
+    assert puts == [], "must not attempt a write Blueprint will refuse"
+    # The appointment is still real and still needs reading back to the caller.
+    assert body["start_time"] and body["end_time"]
+
+
+def test_confirm_treats_empty_string_secret_as_missing(stub, client):
+    """Blueprint has returned "" as well as null. Both mean unauthorised —
+    an empty secret would 403 at Blueprint, not confirm the appointment.
+    """
+    puts: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=TENTATIVE, secret="", start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("PUT", "/appointments/10995_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+
+    resp = _confirm(client)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "pending_staff_confirmation"
+    assert puts == []
+
+
+def test_confirm_status_gate_still_precedes_the_secret_gate(stub, client):
+    """A CANCELLED staff-booked appointment is 'not_confirmable', not
+    'pending_staff_confirmation'. Ordering matters: the second status tells
+    staff "go mark this Confirmed", and a cancelled booking must never
+    generate that work item.
+    """
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=CANCELLED, secret=None, start=_FUTURE, end=_FUTURE_END),
+    ]))
+    resp = _confirm(client)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "not_confirmable"
+
+
+def test_confirm_past_appointment_without_secret_is_not_confirmable(stub, client):
+    """Same ordering rule for the already-passed gate."""
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=TENTATIVE, secret=None,
+              start="2020-01-01 10:00:00 GMT", end="2020-01-01 10:30:00 GMT"),
+    ]))
+    resp = _confirm(client)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "not_confirmable"
+
+
+def test_cancel_without_secret_returns_200_not_cancellable(stub, client):
+    """cancel() carried the identical 502. Same fix."""
+    puts: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(secret=None, start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("PUT", "/appointments/10995_0",
+             lambda p: (puts.append(p), StubResp(200, {}))[1])
+
+    resp = client.post("/blueprint/CLINIC_X/appointments/cancel",
+                       json={"appointment_id": "10995_0"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "not_cancellable"
+    assert body["warning"]
+    assert puts == []
+
+
+def test_reschedule_without_secret_refuses_before_booking_anything(stub, client):
+    """The worst of the three. reschedule books the new slot BEFORE cancelling
+    the old, and the cancel needs the secret — so without a preflight this
+    returned 'partial' every single time on a staff-booked appointment, i.e. a
+    guaranteed double-booking reported as a warning.
+
+    Assert no POST /appointments/ was made at all.
+    """
+    books: list[dict] = []
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(secret=None, start=_FUTURE, end=_FUTURE_END),
+    ]))
+    stub.set("GET", "/clinicConfiguration/", StubResp(200,
+        _clinic_config([{"id": 1, "name": "Hearing Test", "duration": 30}])))
+    stub.set("GET", "/availability/", StubResp(200, _avail("2026-06-15", "14:00")))
+    stub.set("POST", "/appointments/",
+             lambda p: (books.append(p), StubResp(201, {}))[1])
+
+    resp = client.post(
+        "/blueprint/CLINIC_X/appointments/reschedule",
+        json={
+            "appointment_id": "10995_0",
+            "new_start_date": "2026-06-15",
+            "new_start_time": "14:00",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "not_cancellable"
+    assert body["warning"]
+    assert books == [], "must not book a second appointment it cannot undo"
+
+
+def test_no_secret_response_never_leaks_the_secret_field(stub, client):
+    """The refusal path is new; re-assert the standing rule on it."""
+    stub.set("POST", "/appointments/search", StubResp(200, [
+        _appt(status=TENTATIVE, secret=None, start=_FUTURE, end=_FUTURE_END),
+    ]))
+    resp = _confirm(client)
+    assert "onlineBookingSecret" not in resp.text

@@ -41,6 +41,7 @@ from api.voice_agent.protocols.acna_troubleshooting import ACNATroubleshootingPr
 from api.voice_agent.protocols.base import EmptyConfig, Protocol
 from api.voice_agent.protocols.book_appointment import BookAppointmentProtocol
 from api.voice_agent.protocols.cancel_appointment import CancelAppointmentProtocol
+from api.voice_agent.protocols.confirm_appointment import ConfirmAppointmentProtocol
 from api.voice_agent.protocols.faq_lookup import FaqLookupProtocol
 from api.voice_agent.protocols.locate_appointment import LocateAppointmentProtocol
 from api.voice_agent.protocols.reschedule_appointment import RescheduleAppointmentProtocol
@@ -68,6 +69,7 @@ PROTOCOL_REGISTRY: dict[str, type[Protocol]] = {
     BookAppointmentProtocol.id:               BookAppointmentProtocol,
     CancelAppointmentProtocol.id:             CancelAppointmentProtocol,
     RescheduleAppointmentProtocol.id:         RescheduleAppointmentProtocol,
+    ConfirmAppointmentProtocol.id:            ConfirmAppointmentProtocol,
     FaqLookupProtocol.id:                     FaqLookupProtocol,
     # Clinic-scoped (ACNA placeholder-grid availability/booking, decision,
     # troubleshooting).
@@ -90,6 +92,7 @@ PROTOCOL_METADATA: list[type[Protocol]] = [
     BookAppointmentProtocol,
     CancelAppointmentProtocol,
     RescheduleAppointmentProtocol,
+    ConfirmAppointmentProtocol,
     FaqLookupProtocol,
     ACNASearchAvailabilityProtocol,
     ACNABookAppointmentProtocol,

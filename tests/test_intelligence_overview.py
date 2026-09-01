@@ -295,7 +295,10 @@ class _FakeClinic:
 
 def _use_session(clinic):
     def _override():
+        # `scalar` answers the clinic-count query behind the overview payload's
+        # `group_intelligence` field (api/core/grouping.py). 1 = single location.
         yield type("S", (), {"get": lambda self, m, i: clinic,
+                             "scalar": lambda self, *a, **k: 1,
                              "scalars": lambda self, *a, **k: []})()
     app.dependency_overrides[get_session] = _override
 

@@ -29,7 +29,10 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api.deps import bq_client, bq_table, require_read_access, require_write_access, verify_token
+from api.deps import (
+    PROJECT, bq_client, bq_table, require_read_access, require_write_access,
+    verify_token,
+)
 from api.services import notify
 from api.voice_agent import vapi as vapi_client
 from api.voice_agent.blueprint import verify_vapi_secret
@@ -51,6 +54,14 @@ from api.voice_agent.factory import build_agent_config, build_first_message
 
 
 router = APIRouter()
+
+# Transcript-extracted FAQ suggestions written by the ETL. Fully qualified,
+# because it lives in ClinicData — `bq_table()` hardcodes the Users dataset and
+# is only correct for the Users-resident tables here (voice_agent_tickets).
+# Using it for this table produced `Users.faq`, which does not exist, so the
+# import endpoint 404'd inside BigQuery and surfaced as a bare 500.
+# Same convention as faq_retrieval.FAQ_EMBEDDINGS_TABLE / webforms.WEBFORMS_TABLE.
+FAQ_SUGGESTIONS_TABLE = f"{PROJECT}.ClinicData.faq"
 
 
 def _get_clinic_or_404(db: Session, clinic_id: str) -> Clinic:
@@ -1575,7 +1586,7 @@ def import_voice_agent_faq_suggestions(
     sql = f"""
     SELECT question, ANY_VALUE(answer) AS answer,
            ANY_VALUE(complete_call_id) AS complete_call_id
-    FROM {bq_table('faq')}
+    FROM `{FAQ_SUGGESTIONS_TABLE}`
     WHERE clinic_id = @clinic_id
       AND question IS NOT NULL AND TRIM(question) != ''
       AND answer   IS NOT NULL AND TRIM(answer)   != ''

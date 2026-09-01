@@ -7,7 +7,7 @@ accept.
 """
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 def _require_non_empty(v: str, field_name: str) -> str:
@@ -89,9 +89,10 @@ class InstanceUpdate(BaseModel):
     primary_contact_email: Optional[str] = None
     google_ads_customer_id: Optional[str] = None
     invoca_profile_id: Optional[str] = None
-    # Capability flag for the multi-location Group Intelligence section. Toggled
-    # by super_admins; None = leave unchanged (update_instance drops None values).
-    multi_location_group: Optional[bool] = None
+    # multi_location_group was here. It is now derived from the clinic count
+    # (api/core/grouping.py) rather than stored, because a flag restating what the
+    # data already says can disagree with it — and did: an instance that grew to
+    # four locations kept 404ing its rollup until someone remembered the switch.
 
     @field_validator(
         "instance_name", "primary_contact_name", "primary_contact_email",
@@ -163,21 +164,124 @@ class ClinicCampaignCreate(BaseModel):
 
 # ── PMS Config ────────────────────────────────────────────────────────────────
 
-class PmsConfigSet(BaseModel):
-    """
-    Sets the PMS configuration for a clinic.
+class PmsLocationEntry(BaseModel):
+    """One vendor location of a shared PMS account, mapped to a clinic.
 
-    Non-secret config goes in the `config` field. Shape depends on pms_type:
-      blueprint  → {"clinic_code": str, "api_url": str, "aws_url": str}
-      audit_data → reserved (table not yet created)
-      none       → ignored
+    ``vendor_location_key`` is the vendor's own id for the site as a string —
+    Blueprint uses a numeric ``location_id``, CounselEar a string clinic id, and
+    neither space is ours to renumber.
 
-    Secrets are passed in `secrets` and stored in Secret Manager under
-    `clinic_{clinic_id}_blueprint_{key}` for Blueprint clinics. Never in the DB.
+    The two states, which the ETL treats very differently:
+
+      active=True,  clinic_id set    route this location's rows to that clinic
+      active=False, clinic_id null   known site, deliberately not ingested
+
+    The second is how a closed location is recorded. Its rows keep arriving in
+    the account's feed indefinitely, and the ETL has to tell them apart from a
+    site nobody mapped — the latter is a wiring gap that must be reported, the
+    former a decision already taken. Retiring rather than deleting the row is
+    what preserves that distinction.
     """
-    pms_type: Literal["none", "blueprint", "counselear", "audit_data"]
-    config: Optional[dict] = None
-    secrets: Optional[dict] = None
+    vendor_location_key: str = Field(min_length=1, max_length=64)
+    clinic_id: str | None = None
+    location_name: str | None = Field(default=None, max_length=255)
+    active: bool = True
+    # The only genuinely per-clinic PMS settings, which is why they ride on the
+    # mapping rather than beside the account's credentials.
+    prompt_for_location: bool = False
+    booking_user_id: int | None = None
+
+
+class PmsLocationImportEntry(BaseModel):
+    """One PMS location to import as a clinic.
+
+    Either names an existing clinic (`clinic_id`) or asks for one to be created
+    from `clinic_name` — falling back to `location_name`, since that is what the
+    PMS calls the site. Blueprint leaves some locations unnamed, so those need an
+    explicit `clinic_name`.
+    """
+    vendor_location_key: str = Field(min_length=1, max_length=64)
+    location_name: str | None = Field(default=None, max_length=255)
+    clinic_id: str | None = None
+    clinic_name: str | None = Field(default=None, max_length=255)
+    address: str | None = None
+    country: str | None = Field(default=None, max_length=2)
+    time_zone: str | None = None
+
+
+class PmsLocationImport(BaseModel):
+    """Create clinics from what the PMS reports and map them.
+
+    The step that lets onboarding start from the PMS: an instance is provisioned
+    with its account config and no clinics, then the clinics come from the sites
+    the PMS says exist.
+    """
+    pms_type: Literal["blueprint", "counselear"]
+    locations: list[PmsLocationImportEntry]
+
+
+class JotformLocationEntry(BaseModel):
+    """One "choose your location" answer on a Jotform, mapped to a clinic.
+
+    ``option_value`` is the dropdown answer **verbatim** as it arrives in the
+    webhook — ``"Burlington: 11 - 1960 Appleby Line"``, address and all. It is
+    not a location name we parse out: these strings are maintained in the Jotform
+    builder and routinely disagree with our clinic names, so the literal answer
+    is the only stable key.
+
+    The three states:
+
+      active=True,  clinic_id set    route this option's submissions there
+      active=True,  clinic_id null   known option, clinic not created yet
+      active=False, clinic_id null   retired option, ignore
+
+    The middle state is the one that differs from :class:`PmsLocationEntry`,
+    where an active row must route somewhere. A group's form lists every site
+    from day one while the clinics are created over days or weeks, and recording
+    the option with no clinic is what makes that gap visible — the submission
+    falls back to the form's own clinic and the resolver logs it.
+    """
+    option_value: str = Field(min_length=1, max_length=255)
+    clinic_id: str | None = None
+    active: bool = True
+
+
+class JotformLocationMapSet(BaseModel):
+    """Replace a form's whole location map. Omitted options are deleted."""
+    locations: list[JotformLocationEntry]
+
+
+class InstancePmsConfigSet(BaseModel):
+    """
+    Sets the PMS configuration for an *account* — one PMS login serving several
+    physical sites, each its own clinic.
+
+    `config` is per-vendor and validated against that vendor's field list:
+
+        blueprint    clinic_code, api_url, aws_url
+        counselear   counselear_location_code, counselear_sftp_username
+
+    `secrets` are stored under `instance_{instance_id}_{pms_type}_{key}`.
+    CounselEar accepts none — its secrets are named after the SFTP login, which
+    is itself account config here, so no rename of live credentials is needed.
+
+    `primary_clinic_id` receives feed rows that carry no location at all. Most of
+    Blueprint's tables are like this — only appointments and invoices identify a
+    site, while the patient-level tables carry an account-wide branch id. Those
+    rows must land on exactly one clinic: copying them to all of them makes every
+    patient look dormant at the locations they don't attend, inflating the
+    reactivation worklist by the number of sites.
+
+    `locations` REPLACES the whole map when present, and is left untouched when
+    omitted — so the editor can save credentials without having to resend the
+    map, and clearing the map is explicit (send `[]`) rather than a side effect
+    of a partial save.
+    """
+    pms_type: Literal["blueprint", "counselear"]
+    config: dict | None = None
+    secrets: dict | None = None
+    primary_clinic_id: str | None = None
+    locations: list[PmsLocationEntry] | None = None
 
 
 class CustomerIOConfigSet(BaseModel):

@@ -15,6 +15,7 @@ from api.voice_agent.appointment_decision import (
     DecisionRules,
     classify_insurer,
     decide,
+    plan_name_is_recognized,
     resolve_payer,
 )
 
@@ -138,16 +139,31 @@ def test_expiry_gating_is_restorable_by_config():
     assert d.outcome == "OFFER_SELF_PAY_ANNUAL_HEARING_TEST"
 
 
-def test_no_plan_defaults_to_allowed():
+def test_no_plan_defaults_to_staff_referral():
+    """2026-08-24 spec change: no plan on file is UNDETERMINABLE, not covered.
+
+    This previously asserted a funded annual (``unknown_plan_allows_annual``
+    defaulted True). Booking a covered test off a plan we can't identify is the
+    exact failure that reached a live caller.
+    """
     d = decide(_inputs(care_plan_name=None, care_plan_active=False,
                        last_hearing_test_date=years_ago(2)))
+    assert d.outcome == "REFER_TO_STAFF_PLAN_REVIEW"
+    assert d.annual_covered_by_plan is False
+
+
+def test_no_plan_still_funds_when_configured_to():
+    # The old behavior remains reachable per-clinic.
+    d = decide(_inputs(care_plan_name=None, care_plan_active=False,
+                       last_hearing_test_date=years_ago(2)),
+               DecisionRules(unknown_plan_action="fund"))
     assert d.outcome == "BOOK_ANNUAL_HEARING_TEST_WITH_CLINICIAN"
 
 
 def test_unknown_plan_default_can_be_tightened():
     # Tightening still denies the FUNDED annual; a due caller then gets the
     # self-pay offer instead of a covered booking.
-    rules = DecisionRules(unknown_plan_allows_annual=False)
+    rules = DecisionRules(unknown_plan_action="self_pay")
     d = decide(_inputs(care_plan_name="Mystery Plan", care_plan_active=True,
                        last_hearing_test_date=years_ago(2),
                        last_clinician_visit_date=years_ago(2)), rules)
@@ -156,7 +172,7 @@ def test_unknown_plan_default_can_be_tightened():
 
 
 def test_unknown_plan_tightened_and_not_due_goes_to_service():
-    rules = DecisionRules(unknown_plan_allows_annual=False)
+    rules = DecisionRules(unknown_plan_action="self_pay")
     d = decide(_inputs(care_plan_name="Mystery Plan", care_plan_active=True,
                        last_hearing_test_date=years_ago(0.2),
                        last_clinician_visit_date=years_ago(2)), rules)
@@ -183,8 +199,8 @@ def test_plan_name_matching_tolerates_whitespace_and_case():
 def test_whitespace_only_plan_name_treated_as_no_plan():
     d = decide(_inputs(care_plan_name="   ", care_plan_active=False,
                        last_hearing_test_date=years_ago(2)))
-    # unknown/no plan → default allowed → due → annual
-    assert d.outcome == "BOOK_ANNUAL_HEARING_TEST_WITH_CLINICIAN"
+    # unknown/no plan → undeterminable → staff referral (2026-08-24)
+    assert d.outcome == "REFER_TO_STAFF_PLAN_REVIEW"
 
 
 # ── Payer intervals ───────────────────────────────────────────────────────────
@@ -312,6 +328,120 @@ def test_duplicate_funded_bucket_is_single():
 def test_reason_mentions_active_plan_when_covered():
     d = decide(_inputs(last_hearing_test_date=years_ago(2)))
     assert "Complete Care Plan" in d.reason
+
+
+def test_unrecognized_plan_never_claims_coverage():
+    """An unrecognized plan label must not become a coverage promise.
+
+    'Other' is a real ClientAids.service_plan_name value. It matches neither
+    list, so `allows` comes from the unknown-plan fail-open — a booking policy,
+    not a coverage fact. Regression: it used to render "your Other covers it",
+    which the live agent relayed as "it's covered by your plan".
+    """
+    d = decide(_inputs(care_plan_name="Other", care_plan_active=False,
+                       last_hearing_test_date=years_ago(2)),
+               DecisionRules(unknown_plan_action="fund"))
+    assert d.outcome == "BOOK_ANNUAL_HEARING_TEST_WITH_CLINICIAN"
+    assert "Other" not in d.reason
+    assert "covers it" not in d.reason
+    assert "You're due for an annual hearing test" in d.reason
+
+
+def test_unrecognized_plan_not_named_in_self_pay_offer():
+    # Same rule on the self-pay branch: "your Other doesn't include a funded
+    # hearing test" is equally unspeakable, so it falls back to no-plan wording.
+    d = decide(_inputs(care_plan_name="Other", care_plan_active=False,
+                       last_hearing_test_date=years_ago(2),
+                       last_clinician_visit_date=years_ago(2)),
+               DecisionRules(unknown_plan_action="self_pay"))
+    assert d.outcome == "OFFER_SELF_PAY_ANNUAL_HEARING_TEST"
+    assert "Other" not in d.reason
+    assert "we don't have a plan on file that covers a hearing test" in d.reason
+
+
+def test_evan_aristotle_regression_unknown_plan_refers():
+    """The live 2026-08-24 test call: plan 'Other', no insurer, last test 2020.
+
+    Was BOOK_ANNUAL_HEARING_TEST_WITH_CLINICIAN with "your Other covers it".
+    """
+    d = decide(_inputs(care_plan_name="Other", care_plan_active=False,
+                       payer_type="Other",
+                       last_hearing_test_date=date(2020, 10, 6)))
+    assert d.outcome == "REFER_TO_STAFF_PLAN_REVIEW"
+    assert d.annual_covered_by_plan is False
+    assert "Other" not in d.reason
+
+
+def test_no_hearing_aid_blocks_funded_annual_even_on_a_qualifying_plan():
+    # The device gate is independent of the plan: a Complete Care Plan with no
+    # device on file still goes to staff.
+    d = decide(_inputs(last_hearing_test_date=years_ago(2), has_hearing_aid=False))
+    assert d.outcome == "REFER_TO_STAFF_PLAN_REVIEW"
+    assert "hearing aid on file" in d.reason
+
+
+def test_device_gate_can_be_disabled():
+    d = decide(_inputs(last_hearing_test_date=years_ago(2), has_hearing_aid=False),
+               DecisionRules(require_hearing_aid_for_funded_annual=False))
+    assert d.outcome == "BOOK_ANNUAL_HEARING_TEST_WITH_CLINICIAN"
+
+
+def test_gates_only_bite_when_due():
+    # Not due → no funded annual is on the table → the service/C&C branches
+    # still apply, and neither gate fires.
+    d = decide(_inputs(care_plan_name="Other", care_plan_active=False,
+                       has_hearing_aid=False,
+                       last_hearing_test_date=years_ago(0.2),
+                       last_clinician_visit_date=years_ago(2)))
+    assert d.outcome == "BOOK_CLINICIAN_SERVICE_VISIT"
+
+
+def test_device_gate_precedes_the_plan_gate():
+    # Both would refer; the device reason is the more actionable one for staff.
+    d = decide(_inputs(care_plan_name="Other", care_plan_active=False,
+                       has_hearing_aid=False,
+                       last_hearing_test_date=years_ago(2)))
+    assert d.outcome == "REFER_TO_STAFF_PLAN_REVIEW"
+    assert "hearing aid on file" in d.reason
+
+
+def test_referral_outcomes_are_never_bookable_by_name():
+    # roles.py's hard rule keys off the REFER_TO_STAFF_ prefix; keep the new
+    # outcome inside that namespace so the prompt rule keeps covering it.
+    assert "REFER_TO_STAFF_PLAN_REVIEW".startswith("REFER_TO_STAFF_")
+
+
+def test_no_unrecognized_plan_label_is_ever_spoken():
+    """Invariant sweep: an unrecognized plan name must never reach the caller.
+
+    There are three places a plan name enters `reason` (funded annual,
+    self-pay offer, not-due service path). Rather than pin each, sweep the
+    reachable input space — a fourth one added later fails here.
+    """
+    import re
+    for plan in ("Other", None, "   ", "Mystery Plan", "Complete Care Plan", "Pre-Plan"):
+        for aid in (True, False):
+            for last in (years_ago(6), years_ago(0.2), None):
+                for action in ("fund", "self_pay", "refer"):
+                    d = decide(
+                        _inputs(care_plan_name=plan,
+                                care_plan_active=(plan == "Complete Care Plan"),
+                                last_hearing_test_date=last, has_hearing_aid=aid),
+                        DecisionRules(unknown_plan_action=action),
+                    )
+                    for bad in ("Other", "Mystery Plan"):
+                        assert not re.search(rf"\b{re.escape(bad)}\b", d.reason), (
+                            f"leaked {bad!r} via {d.outcome}: {d.reason}"
+                        )
+
+
+def test_plan_name_is_recognized_covers_both_lists():
+    r = DecisionRules()
+    assert plan_name_is_recognized("Complete Care Plan", r) is True
+    assert plan_name_is_recognized("  pre-plan ", r) is True   # trimmed + folded
+    assert plan_name_is_recognized("Other", r) is False
+    assert plan_name_is_recognized(None, r) is False
+    assert plan_name_is_recognized("", r) is False
 
 
 def test_trace_carries_rule_inputs():

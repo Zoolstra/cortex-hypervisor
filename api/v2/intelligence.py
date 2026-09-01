@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from api.core.db import get_session
+from api.core.grouping import is_multi_location
 from api.core.orm import Clinic, Instance
 from api.deps import verify_token, require_read_access
 from api.intelligence import _resolve_window, _active_campaign_ids, _location_hours
@@ -127,7 +128,7 @@ def get_overview_v2(
 
     payload["instance_id"] = clinic.instance_id
     payload["group_intelligence"] = bool(
-        getattr(db.get(Instance, clinic.instance_id), "multi_location_group", False))
+        is_multi_location(db, clinic.instance_id))
     # Only the sections actually served from the marts — a section that deferred
     # to v1 must not be reported as mart-backed, or a drift report would blame
     # the wrong layer.

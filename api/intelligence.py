@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from api.audit import log_phi_access
 from api.core.db import get_session
+from api.core.grouping import is_multi_location
 from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, Instance, InvocaCampaign
 from api.deps import require_read_access, require_write_access, verify_token
 
@@ -559,8 +560,7 @@ def get_intelligence_overview(
     # So the clinic page can link up to instance-wide Group Intelligence when
     # this clinic belongs to a multi-location group.
     payload["instance_id"] = clinic.instance_id
-    payload["group_intelligence"] = bool(
-        getattr(db.get(Instance, clinic.instance_id), "multi_location_group", False))
+    payload["group_intelligence"] = is_multi_location(db, clinic.instance_id)
     if not skip_llm:
         _cache_store(key, clinic_id, payload, use_cache=use_cache)
     return payload
@@ -713,16 +713,17 @@ def get_group_overview(
     JSON cache both ways (parity-harness use; no behavior change unless
     passed — see the overview endpoint's docstring).
 
-    Gated by the instance ``multi_location_group`` capability flag: when off, the
-    endpoint 404s (not 403) so the whole section is invisible to instances that
-    don't have it, not merely empty. Aggregate-only (counts / sums / labels) — no
+    Gated on the instance having two or more clinics (``core.grouping``): a
+    single-location business 404s (not 403) so the section is invisible rather
+    than merely empty. Derived rather than a stored flag, so it cannot lag behind
+    a business that has just gained locations. Aggregate-only (counts / sums / labels) — no
     PHI, so no audit path; patient-level drill-down stays on the per-clinic
     ``/intelligence/{clinic_id}/patients/…`` endpoints."""
     instance = db.get(Instance, instance_id)
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found")
     require_read_access(instance_id, caller)
-    if not getattr(instance, "multi_location_group", False):
+    if not is_multi_location(db, instance_id):
         raise HTTPException(status_code=404, detail="Not found")
 
     window = _resolve_window(start, end, days)
@@ -794,7 +795,7 @@ def get_group_pipeline_revenue(
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found")
     require_read_access(instance_id, caller)
-    if not getattr(instance, "multi_location_group", False):
+    if not is_multi_location(db, instance_id):
         raise HTTPException(status_code=404, detail="Not found")
 
     window = _resolve_window(start, end, days)
@@ -885,13 +886,13 @@ def get_group_line_item_calls(
     """Instance-wide line-item calls — every clinic's calls in one table, each
     reconciled against ITS OWN clinic's PMS patients (so a caller isn't matched
     across locations) and tagged with the clinic. Gated by the instance
-    ``multi_location_group`` flag (404 when off) and PHI (admin/super_admin),
+    clinic count (404 for a single location) and PHI (admin/super_admin),
     audited."""
     instance = db.get(Instance, instance_id)
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found")
     require_write_access(instance_id, caller)
-    if not getattr(instance, "multi_location_group", False):
+    if not is_multi_location(db, instance_id):
         raise HTTPException(status_code=404, detail="Not found")
 
     window = _resolve_window(start, end, days)
@@ -902,18 +903,45 @@ def get_group_line_item_calls(
         .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
     ).all()
 
+    from concurrent.futures import ThreadPoolExecutor
+
     from intelligence_report.queries import line_item_calls
 
-    calls: list[dict] = []
+    # Cloud SQL reads FIRST, and serially: `db` is one request-scoped Session and
+    # is not thread-safe. Only the BigQuery fan-out below runs in parallel.
+    specs = []
     for clinic_id, clinic_name, tz in clinics:
         invoca_ids, _ = _active_campaign_ids(db, clinic_id)
-        if not invoca_ids:
-            continue
-        rows = line_item_calls(clinic_id, invoca_ids, window, limit=limit, clinic_tz=tz)
+        if invoca_ids:
+            specs.append((clinic_id, clinic_name, tz, invoca_ids))
+
+    def _one(spec: tuple) -> list[dict]:
+        clinic_id, clinic_name, tz, invoca_ids = spec
+        rows = line_item_calls(clinic_id, invoca_ids, window, limit=limit,
+                               clinic_tz=tz)
         for r in rows:
             r["clinic_id"] = clinic_id
             r["clinic_name"] = clinic_name
-        calls.extend(rows)
+        return rows
+
+    # This endpoint does not cache (see the note above the return), so its cost is
+    # paid on EVERY load — and it was the only group endpoint still fanning its
+    # per-clinic readers out serially, so a 7-location instance paid 7× the clinic
+    # page's ~10-15s. Same idiom as group_queries.group_comparison: independent
+    # BigQuery reads, wall-clock ≈ the slowest single clinic.
+    #
+    # Deliberately NOT fail-safe per clinic, unlike group_comparison and
+    # /pipeline-revenue. `pool.map` re-raises on iteration, so a clinic that
+    # errors still fails the request exactly as it did serially. That is the right
+    # trade HERE and not there: this table is a PHI worklist people call people
+    # from, and a silently short list reads as "nobody to call" rather than as a
+    # failure. An aggregate can absorb a missing location; a work queue cannot.
+    calls: list[dict] = []
+    if specs:
+        with ThreadPoolExecutor(max_workers=min(8, len(specs)),
+                                thread_name_prefix="group-calls") as pool:
+            for rows in pool.map(_one, specs):
+                calls.extend(rows)
     calls.sort(key=lambda r: r.get("datetime") or "", reverse=True)
     calls = calls[:limit]
     log_phi_access(
@@ -954,7 +982,16 @@ def get_active_leads(
     invoca_ids, _ = _active_campaign_ids(db, clinic_id)
     hours = _location_hours(clinic)
 
-    key = ("active-leads", clinic_id, window.start_date, window.end_date_excl)
+    # data_version + methodology belong in the key for the same reason they do on
+    # every other payload: the shared (GCS) tier has no TTL — an object's
+    # existence IS its validity — so a key that never rotates is served forever.
+    # This key didn't rotate at all, which was survivable only while nothing
+    # warmed it and the in-process tier's 6h TTL was doing the invalidating.
+    # `payload-prewarm` now warms it, and a warmed entry lives in GCS: without
+    # this, a fixed window's inbox would be pinned to whatever the leads looked
+    # like the first time that window was ever asked for.
+    key = ("active-leads", clinic_id, window.start_date, window.end_date_excl,
+           _data_version(clinic_id), _METHODOLOGY_VERSION)
     use_cache = not nocache
     if use_cache:
         cached = _cache_lookup(key, clinic_id, use_cache=use_cache)
@@ -1003,7 +1040,7 @@ def get_group_active_leads(
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found")
     require_read_access(instance_id, caller)
-    if not getattr(instance, "multi_location_group", False):
+    if not is_multi_location(db, instance_id):
         raise HTTPException(status_code=404, detail="Not found")
 
     window = _resolve_window(start, end, days)

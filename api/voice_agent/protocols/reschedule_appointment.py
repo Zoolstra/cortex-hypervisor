@@ -50,7 +50,8 @@ class RescheduleAppointmentProtocol(Protocol):
                 "books the new slot first, then cancels the old; if the new "
                 "booking fails the old appointment is untouched. The same "
                 "appointment type (and duration) carries over to the new slot. "
-                "Returns {status: 'rescheduled' | 'partial', summary, start_time, "
+                "Returns {status: 'rescheduled' | 'partial' | 'not_cancellable', "
+                "summary, start_time, "
                 "end_time, warning?}. status='partial' means the new booking "
                 "landed but the old one couldn't be cancelled — surface this to "
                 "the caller and capture it in the ticket."
@@ -103,6 +104,8 @@ Pass `appointment_id` (from locate), `new_start_date`, and `new_start_time`. End
 ### What you get back
 - `status: "rescheduled"` — clean success. Confirm to the caller ("You're all set — your hearing test is now Friday June 2 at 2 PM.").
 - `status: "partial"` — the new booking landed but the old one couldn't be cancelled. The `warning` field describes what staff must clean up. Tell the caller honestly: "I've booked your new time, but I had trouble cancelling the old appointment — a team member will sort that out so you don't end up double-booked." Capture the partial state in the ticket's `details` field; set `suggested_followup` to the warning text.
+
+- `status: "not_cancellable"` — the clinic's system will not let me move this one and a team member has to. **Nothing was booked or changed**, so the caller still has their original appointment. Say exactly that: "I can't move that one myself — your appointment on [day] at [time] is still as it was, and I'll have a team member call you to change it." Do NOT say they're rescheduled, and do NOT try to book the new time separately, which would leave them with two appointments. Put the requested new day and time in the ticket with `suggested_followup` set to making the move.
 
 ### If the call fails entirely
 If the new booking itself fails (PMS returns an error before the cancel even runs), the old appointment is untouched. Apologize, capture the request in the ticket, and let the caller know a team member will reach out to confirm the move.

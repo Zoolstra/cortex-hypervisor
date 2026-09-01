@@ -6,11 +6,11 @@ booking requests. The LLM voice agent NEVER evaluates these rules: it calls the
 and the agent narrates the result. That split (conversation in the model,
 business rules in code) is the core fix for rule-following reliability.
 
-Spec (confirmed with the clinic 2026-07-21, revised 2026-08-10):
+Spec (confirmed with the clinic 2026-07-21, revised 2026-08-10 and 2026-08-24):
 
   Inputs: today, patient_is_existing, care_plan (name + active?), payer_type,
   last_hearing_test_date, last_clinician_visit_date, last_clean_check_date,
-  date_of_birth. Missing dates = infinitely old.
+  date_of_birth, has_hearing_aid. Missing dates = infinitely old.
 
   Payer handling is two-dimensional — an ACTION (does this program let us book
   at all?) and, for funding programs, an INTERVAL:
@@ -22,7 +22,19 @@ Spec (confirmed with the clinic 2026-07-21, revised 2026-08-10):
   "Care Plan, No Batts" — **regardless of expiry** (2026-08-10 revision; expiry
   used to gate them). "Pre-Plan" never qualifies, but a Pre-Plan patient who is
   otherwise due is OFFERED the test as self-pay at ``self_pay_annual_price``.
-  Unknown/no plan defaults to allowed (config can tighten later).
+
+  A plan name on NEITHER list (including no plan at all) is UNDETERMINABLE, not
+  covered: a due caller goes to staff (``unknown_plan_action='refer'``,
+  2026-08-24 revision). This default used to be "allowed", which told a patient
+  whose only plan label was the feed placeholder 'Other' that a hearing test was
+  covered. ``'self_pay'`` and ``'fund'`` restore the two older behaviors.
+
+  A funded annual also requires a HEARING AID on file
+  (``require_hearing_aid_for_funded_annual``, 2026-08-24): the funded annual is
+  a care-plan benefit and a care plan services a device, so with no device there
+  is no benefit to draw on and the call goes to staff. Note that the plan name
+  itself is read off ClientAids, which also carries accessories and returned /
+  inactive devices — hence a plan label can exist for a patient who owns no aid.
 
   Callers under ``minor_age_threshold`` always go to a human — some minors do
   have payer eligibility, and that determination isn't safe to automate.
@@ -46,10 +58,16 @@ Spec (confirmed with the clinic 2026-07-21, revised 2026-08-10):
     2. payer action = prior_auth                     -> REFER_TO_STAFF_PRIOR_AUTHORIZATION
     3. payer action = human_review                   -> REFER_TO_STAFF_PAYER_REVIEW
     4. not existing                                  -> BOOK_NEW_PATIENT_INTAKE_WITH_CLINICIAN
-    5. allows_annual AND test_due                    -> BOOK_ANNUAL_HEARING_TEST_WITH_CLINICIAN
-    6. NOT allows_annual AND test_due                -> OFFER_SELF_PAY_ANNUAL_HEARING_TEST
-    7. else if years_since_clinician_visit >= 1.0    -> BOOK_CLINICIAN_SERVICE_VISIT
+    5. test_due AND no hearing aid on file           -> REFER_TO_STAFF_PLAN_REVIEW
+    6. test_due AND plan unrecognized AND action=refer-> REFER_TO_STAFF_PLAN_REVIEW
+    7. allows_annual AND test_due                    -> BOOK_ANNUAL_HEARING_TEST_WITH_CLINICIAN
+    8. NOT allows_annual AND test_due                -> OFFER_SELF_PAY_ANNUAL_HEARING_TEST
+    9. else if years_since_clinician_visit >= 1.0    -> BOOK_CLINICIAN_SERVICE_VISIT
        else                                          -> BOOK_TECHNICIAN_CLEAN_AND_CHECK
+
+  Gates 5 and 6 fire only when the caller is DUE — that is when the funded
+  annual is on the table. A caller who isn't due still gets the service /
+  clean-and-check branches, which assert no coverage.
 
 This module is I/O-free. Data loading lives in the Blueprint adapter; the
 HTTP boundary lives in the blueprint router.
@@ -72,6 +90,7 @@ Outcome = Literal[
     "REFER_TO_STAFF_PRIOR_AUTHORIZATION",
     "REFER_TO_STAFF_PAYER_REVIEW",
     "REFER_TO_STAFF_MINOR",
+    "REFER_TO_STAFF_PLAN_REVIEW",
 ]
 
 # Canonical payer buckets. Anything unrecognized resolves to "Other".
@@ -122,6 +141,15 @@ DEFAULT_PAYER_MIN_YEARS: dict[str, float] = {
     PAYER_AADL: 1.0,
 }
 
+# What an UNRECOGNIZED care-plan name means for a caller who is due for a test.
+# Named actions rather than a bool because the clinic's answer is three-valued:
+# fund it, sell it, or hand it to a person.
+UNKNOWN_PLAN_FUND = "fund"            # treat as covered — book the funded annual
+UNKNOWN_PLAN_SELF_PAY = "self_pay"    # not covered — offer the test at list price
+UNKNOWN_PLAN_REFER = "refer"          # coverage undeterminable — staff decide
+
+DEFAULT_UNKNOWN_PLAN_ACTION = UNKNOWN_PLAN_REFER
+
 DEFAULT_QUALIFYING_PLANS = (
     "Complete Care Plan",
     "CCP LACE",
@@ -154,8 +182,16 @@ class DecisionRules:
 
     qualifying_plan_names: tuple[str, ...] = DEFAULT_QUALIFYING_PLANS
     non_qualifying_plan_names: tuple[str, ...] = DEFAULT_NON_QUALIFYING_PLANS
-    # A plan name in neither list ("unknown"): does it allow funded annuals?
-    unknown_plan_allows_annual: bool = True
+    # A plan name in neither list ("unknown", which includes no plan at all):
+    # 'fund' | 'self_pay' | 'refer'. 2026-08-24 clinic revision — this used to
+    # be a bool defaulting to "fund", which is how a patient whose only plan
+    # label was the placeholder 'Other' was told a hearing test was covered.
+    # Coverage we cannot establish is now a referral, not an assumption.
+    unknown_plan_action: str = DEFAULT_UNKNOWN_PLAN_ACTION
+    # A funded annual is a CARE-PLAN benefit, and a care plan services a device.
+    # With no hearing aid on file there is no benefit to draw on, so the call
+    # goes to staff regardless of what plan label the feed carries.
+    require_hearing_aid_for_funded_annual: bool = True
     # 2026-08-10: a qualifying plan covers a funded annual even once EXPIRED.
     # Set False to restore the pre-revision behavior (expiry gates coverage).
     expired_qualifying_allows_annual: bool = True
@@ -195,6 +231,11 @@ class DecisionInputs:
     # Soonest UPCOMING device warranty expiry on file. Already-expired
     # warranties are irrelevant to bundling, so the loader excludes them.
     warranty_expiry_date: date | None = None
+    # Does the patient currently own a hearing aid (not an accessory)? Defaults
+    # True so a caller that cannot supply the fact keeps the pre-gate behavior
+    # rather than silently referring every patient; the Blueprint loader always
+    # supplies it.
+    has_hearing_aid: bool = True
 
 
 @dataclass(frozen=True)
@@ -276,17 +317,53 @@ def _allows_annual(name: str | None, active: bool, rules: DecisionRules) -> bool
     Care Plan No Batts still covers the annual). Setting
     ``expired_qualifying_allows_annual=False`` restores the older behavior where
     expiry gated coverage. "Pre-Plan" never qualifies. No plan on file /
-    unrecognized name falls to ``unknown_plan_allows_annual``. Names compare
+    unrecognized name falls to ``unknown_plan_action``. Names compare
     trimmed + case-insensitive so feed variance can't bypass the deny rules.
     """
     key = _norm(name)
+    if key and key in {_norm(n) for n in rules.non_qualifying_plan_names}:
+        return False
+    if key and key in {_norm(n) for n in rules.qualifying_plan_names}:
+        return True if rules.expired_qualifying_allows_annual else bool(active)
+    # Unrecognized or absent. Only the 'fund' action treats that as coverage;
+    # 'refer' is caught by its own gate in decide() before this matters, and
+    # 'self_pay' falls through to the self-pay offer.
+    return rules.unknown_plan_action == UNKNOWN_PLAN_FUND
+
+
+def _plan_explicitly_qualifies(name: str | None, rules: DecisionRules) -> bool:
+    """True only when the plan NAME matched a configured qualifying entry.
+
+    Deliberately NARROWER than ``_allows_annual``, which also returns True for
+    an absent or unrecognized plan via ``unknown_plan_action='fund'``. That
+    fail-open default is a BOOKING POLICY ("we'll book them anyway"), not a
+    COVERAGE FACT, and the two must not be conflated when we speak to a caller:
+    only an explicit match entitles us to say "your plan covers it". Telling a
+    patient with a 'Other'/unknown plan that they're covered is a promise the
+    clinic then has to walk back at the desk.
+    """
+    key = _norm(name)
     if not key:
-        return rules.unknown_plan_allows_annual
+        return False
     if key in {_norm(n) for n in rules.non_qualifying_plan_names}:
         return False
-    if key in {_norm(n) for n in rules.qualifying_plan_names}:
-        return True if rules.expired_qualifying_allows_annual else bool(active)
-    return rules.unknown_plan_allows_annual
+    return key in {_norm(n) for n in rules.qualifying_plan_names}
+
+
+def plan_name_is_recognized(name: str | None, rules: DecisionRules) -> bool:
+    """True when the plan name matches a CONFIGURED entry, qualifying or not.
+
+    The question this answers is "is this a plan we can name back to a
+    patient?", not "does it cover a test". The feed carries placeholder labels
+    ('Other') and free-text variants that are meaningful internally and
+    meaningless to a caller; those are unrecognized and must not be spoken.
+    """
+    key = _norm(name)
+    if not key:
+        return False
+    known = {_norm(n) for n in rules.qualifying_plan_names}
+    known |= {_norm(n) for n in rules.non_qualifying_plan_names}
+    return key in known
 
 
 def _payer_action(payer: str, rules: DecisionRules) -> str:
@@ -362,6 +439,9 @@ def decide(inputs: DecisionInputs, rules: DecisionRules | None = None) -> Decisi
         "care_plan_name": inputs.care_plan_name,
         "care_plan_active": inputs.care_plan_active,
         "allows_annual_tests": allows,
+        "plan_name_recognized": plan_name_is_recognized(inputs.care_plan_name, r),
+        "unknown_plan_action": r.unknown_plan_action,
+        "has_hearing_aid": inputs.has_hearing_aid,
         "payer_type": inputs.payer_type,
         "payer_action": action,
         "min_years_between_tests": min_years,
@@ -438,15 +518,54 @@ def decide(inputs: DecisionInputs, rules: DecisionRules | None = None) -> Decisi
             annual_covered_by_plan=allows,
         )
 
+    # ── Funded-annual eligibility gates ──────────────────────────────────────
+    # Both bite only when the caller is DUE — that is the moment the funded
+    # annual is on the table. A caller who isn't due falls through to the
+    # service / clean-and-check branches, which make no coverage claim.
+
+    if test_due and r.require_hearing_aid_for_funded_annual and not inputs.has_hearing_aid:
+        return Decision(
+            outcome="REFER_TO_STAFF_PLAN_REVIEW",
+            reason=(
+                "You're due for a hearing test, but I don't have a hearing aid "
+                "on file for you, so a team member needs to look at your record "
+                "and arrange the right appointment."
+            ),
+            trace=trace,
+            annual_covered_by_plan=False,
+        )
+
+    if (
+        test_due
+        and r.unknown_plan_action == UNKNOWN_PLAN_REFER
+        and not plan_name_is_recognized(inputs.care_plan_name, r)
+    ):
+        return Decision(
+            outcome="REFER_TO_STAFF_PLAN_REVIEW",
+            reason=(
+                "You're due for a hearing test, but I can't confirm from your "
+                "file which plan it would go under, so a team member will check "
+                "your coverage and book it with you."
+            ),
+            trace=trace,
+            annual_covered_by_plan=False,
+        )
+
     if inputs.last_hearing_test_date is None:
         why = "we don't have a recent hearing test on file"
     else:
         why = f"your last hearing test was on {_speakable(inputs.last_hearing_test_date)}"
 
     if allows and test_due:
+        # Gated on an EXPLICIT qualifying-name match, not on `allows`. When
+        # `allows` came from the unknown-plan fail-open there is no plan we can
+        # point at, so the reason states only that they're due — it never
+        # asserts coverage. (Before this, care_plan_name='Other' rendered
+        # "your Other covers it", which the agent relayed as "covered by your
+        # plan" to a caller whose coverage we had never established.)
         plan_bit = (
             f" and your {inputs.care_plan_name} covers it"
-            if inputs.care_plan_name else ""
+            if _plan_explicitly_qualifies(inputs.care_plan_name, r) else ""
         )
         gap_bit = (
             f" Because you had a clean-and-check recently, the test needs to be on "
@@ -470,9 +589,13 @@ def decide(inputs: DecisionInputs, rules: DecisionRules | None = None) -> Decisi
     if test_due:
         # Due for a test, but no plan funds it — offer it as self-pay. The agent
         # quotes the price and books only if the caller accepts.
+        # Name the plan only when it is one we actually recognize (either
+        # list). An unrecognized label like 'Other' is meaningless to a caller
+        # — "your Other doesn't include a funded hearing test" — so it falls to
+        # the same no-plan-on-file wording as a blank.
         plan_bit = (
             f"your {inputs.care_plan_name} doesn't include a funded hearing test"
-            if inputs.care_plan_name else
+            if plan_name_is_recognized(inputs.care_plan_name, r) else
             "we don't have a plan on file that covers a hearing test for you"
         )
         gap_bit = (
@@ -500,9 +623,11 @@ def decide(inputs: DecisionInputs, rules: DecisionRules | None = None) -> Decisi
     # "why not / when instead" so the agent can answer "when am I due?"
     # directly instead of stonewalling a verified patient about their own record.
     if not allows:
+        # Third and last place a plan name reaches the caller — same rule as
+        # the other two: name it only if we recognize it.
         not_due_bit = (
             f"your {inputs.care_plan_name} doesn't currently cover a funded annual test"
-            if inputs.care_plan_name else
+            if plan_name_is_recognized(inputs.care_plan_name, r) else
             "we don't have an active care plan covering annual tests on file for you"
         )
     elif next_due is not None:

@@ -11,7 +11,8 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger, Boolean, CHAR, Column, DateTime, Enum, ForeignKey,
-    Index, Integer, SmallInteger, String, Text, UniqueConstraint, func,
+    ForeignKeyConstraint, Index, Integer, SmallInteger, String, Text,
+    UniqueConstraint, func,
 )
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -19,6 +20,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
     pass
+
+
+# "Every row of this feed belongs to one clinic" — a single-location account.
+# See :class:`PmsClinicLocation`; it must never appear beside specific keys.
+CATCH_ALL_LOCATION_KEY = "*"
 
 
 def _audit_columns():
@@ -45,9 +51,13 @@ class Instance(Base):
     primary_contact_uid: Mapped[str | None] = mapped_column(String(128))
     google_ads_customer_id: Mapped[str | None] = mapped_column(String(32))
     invoca_profile_id: Mapped[str | None] = mapped_column(String(32))
-    # Capability flag: unlocks the multi-location "Group Intelligence" analytics
-    # section (the leaderboard across all of an instance's clinics). Off by
-    # default; flipped on per instance (currently Virsono). See migration 0013.
+    # DEPRECATED by alembic 0031 — read by nothing. Group Intelligence is derived
+    # from the clinic count (api/core/grouping.py, >= 2), because a stored flag
+    # restating what the data already says can disagree with it: an instance that
+    # grew to four locations kept 404ing its rollup until someone remembered the
+    # switch. Retained as the record of which instances had it explicitly off,
+    # which is the seed for an override column if that distinction is ever wanted
+    # back. Do not add readers.
     multi_location_group: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="0")
 
@@ -63,6 +73,8 @@ class Instance(Base):
     clinics: Mapped[list["Clinic"]] = relationship(back_populates="instance")
     admins: Mapped[list["ClinicAdmin"]] = relationship(back_populates="instance",
                                                        cascade="all, delete-orphan")
+    pms_configs: Mapped[list["InstancePmsConfig"]] = relationship(
+        back_populates="instance", cascade="all, delete-orphan")
 
 
 # ─────────────────────────── clinics ───────────────────────────
@@ -148,6 +160,17 @@ class Clinic(Base):
     )
     jotform_forms: Mapped[list["JotformForm"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
+    )
+    # Locations of a shared PMS account that resolve to this clinic. Distinct
+    # from InstancePmsConfig.primary_clinic, hence the explicit foreign_keys.
+    pms_locations: Mapped[list["PmsClinicLocation"]] = relationship(
+        back_populates="clinic", cascade="all, delete-orphan",
+        foreign_keys="PmsClinicLocation.clinic_id",
+    )
+    # Jotform location options that route to this clinic. A group's single lead
+    # form fans out to every clinic in the group through these rows.
+    jotform_form_locations: Mapped[list["JotformFormLocation"]] = relationship(
+        back_populates="clinic", cascade="all, delete-orphan",
     )
 
 
@@ -236,6 +259,14 @@ class ClinicVoiceAgentConfiguration(Base):
 # ──────────────────── clinic_blueprint_config (1:1) ────────────────────
 
 class ClinicBlueprintConfig(Base):
+    """DEPRECATED by alembic 0030 — read by nothing.
+
+    Blueprint config is now :class:`InstancePmsConfig` plus a
+    :class:`PmsClinicLocation` row; ``prompt_for_location`` and ``user_id`` moved
+    onto the mapping as ``prompt_for_location`` / ``booking_user_id``. The table
+    and its rows are kept as the rollback path for 0030 and are dropped in a
+    follow-up once the cutover is proven. Do not add readers.
+    """
     __tablename__ = "clinic_blueprint_config"
 
     clinic_id: Mapped[str] = mapped_column(
@@ -270,7 +301,17 @@ class ClinicBlueprintConfig(Base):
 # ──────────────────── clinic_counselear_config (1:1) ────────────────────
 
 class ClinicCounselEarConfig(Base):
-    """Maps a CORTEX clinic to its identifiers in the CounselEar SFTP feed.
+    """DEPRECATED by alembic 0030 — read by nothing.
+
+    ``counselear_location_code`` and ``counselear_sftp_username`` were
+    per-practice facts duplicated onto every clinic of a practice and are now on
+    :class:`InstancePmsConfig`; ``counselear_clinic_id`` is the vendor location
+    key and is now :class:`PmsClinicLocation.vendor_location_key`. Kept as the
+    rollback path for 0030. Do not add readers.
+
+    Original description follows.
+
+    Maps a CORTEX clinic to its identifiers in the CounselEar SFTP feed.
 
     CounselEar delivers one combined feed per *practice* (SFTP location folder),
     with each row tagged by CounselEar's own per-clinic id. Ingest needs both:
@@ -306,6 +347,171 @@ class ClinicCounselEarConfig(Base):
     )
 
     clinic: Mapped["Clinic"] = relationship(back_populates="counselear_config")
+
+
+# ──────────────────── instance_pms_config (1 per instance+pms) ────────────────
+
+class InstancePmsConfig(Base):
+    """A PMS *account* — the only place PMS credentials live (alembic 0030).
+
+    One PMS login can serve several physical locations, each of which is its own
+    CORTEX clinic, so the credentials and feed identifiers belong to the account
+    rather than to any one clinic. :class:`PmsClinicLocation` maps the vendor's
+    locations to clinics and is the only per-clinic PMS config there is.
+
+    This mirrors what the ads pipeline has always done — ``instances`` holds
+    ``google_ads_customer_id`` / ``invoca_profile_id`` and a campaign table maps
+    ids to clinics.
+
+    Fields are per-vendor and the unused ones stay NULL:
+
+        blueprint   clinic_code, api_url, aws_url
+        counselear  counselear_location_code, counselear_sftp_username
+
+    Both CounselEar fields describe the *practice* — the ``upload/<code>/`` SFTP
+    folder its combined feed lands in, and the login it is delivered under. Before
+    0030 they were copied identically onto every clinic row of a practice, which
+    is what made the account level obviously missing.
+
+    Secrets live in Secret Manager under
+    ``instance_{instance_id}_{pms_type}_{key}``. Readers fall back to a mapped
+    clinic's own ``clinic_{clinic_id}_…`` secret with a warning, so 0030 did not
+    need to be sequenced against a secret copy; see
+    ``scripts/copy_pms_secrets_to_instance.py``.
+
+    ``primary_clinic_id`` receives feed rows that carry no location. Blueprint's
+    patient-level tables carry only the account-wide ``branch_id``, and those
+    rows have to land on exactly one clinic: replicating them across the
+    account's clinics would make every patient look dormant at the locations
+    they don't attend, inflating the reactivation worklist by the number of
+    locations.
+    """
+    __tablename__ = "instance_pms_config"
+
+    instance_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("instances.instance_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    pms_type: Mapped[str] = mapped_column(
+        Enum("blueprint", "counselear", "audit_data", "none", name="pms_type_enum"),
+        primary_key=True,
+    )
+    # Blueprint
+    clinic_code: Mapped[str | None] = mapped_column(String(64))
+    api_url: Mapped[str | None] = mapped_column(String(512))
+    aws_url: Mapped[str | None] = mapped_column(String(512))
+    # CounselEar — per-practice, not per-clinic (see the class docstring).
+    counselear_location_code: Mapped[str | None] = mapped_column(String(64))
+    counselear_sftp_username: Mapped[str | None] = mapped_column(String(64))
+
+    primary_clinic_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("clinics.clinic_id", ondelete="SET NULL")
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    instance: Mapped["Instance"] = relationship(back_populates="pms_configs")
+    locations: Mapped[list["PmsClinicLocation"]] = relationship(
+        back_populates="config", cascade="all, delete-orphan"
+    )
+    primary_clinic: Mapped["Clinic | None"] = relationship(
+        foreign_keys=[primary_clinic_id]
+    )
+
+
+# ──────────────────── pms_clinic_locations (N) ────────────────────
+
+class PmsClinicLocation(Base):
+    """Maps one vendor location id within a PMS account to a CORTEX clinic.
+
+    This is the ONLY per-clinic PMS configuration (alembic 0030): everything else
+    is a property of the account. Which is why the two genuinely per-clinic
+    settings — ``prompt_for_location`` and ``booking_user_id`` — live here rather
+    than beside the credentials.
+
+    ``vendor_location_key`` is UNIQUE per (instance, pms_type) — the same
+    constraint ``jotform_forms`` puts on ``jotform_form_id``, and for the same
+    reason: a location mapped to two clinics double-ingests its rows.
+
+    Stored as a string because the id space is the vendor's, not ours —
+    Blueprint uses a numeric ``location_id``, CounselEar a string clinic id —
+    and the ids are neither contiguous nor dense.
+
+    :data:`CATCH_ALL_LOCATION_KEY` (``"*"``) means "every row of this feed belongs
+    to this clinic", which is what a single-location account is. It must be the
+    only row for its account — a catch-all beside specific keys has no defined
+    meaning, and the API rejects the combination rather than picking one.
+
+    ``active=False`` retires a location without deleting the row, so the ETL can
+    tell a site we deliberately stopped ingesting from one nobody ever mapped —
+    the first is a decision, the second a wiring gap that must be reported. A
+    closed site's rows keep arriving in the account's feed indefinitely, so
+    conflating the two would keep every sync permanently ``partial``.
+
+    ``clinic_id`` is therefore nullable (migration 0029), and the two fields pair:
+
+        active=True,  clinic_id set    route this location's rows to that clinic
+        active=False, clinic_id NULL   known site, deliberately not ingested
+
+    MySQL can't portably express "NULL only when inactive" as a CHECK against
+    another column, so that invariant is the application's to keep. Readers
+    should treat a NULL ``clinic_id`` as retired regardless of the flag — it
+    cannot be routed either way.
+    """
+    __tablename__ = "pms_clinic_locations"
+    __table_args__ = (
+        # The parent is the account config, not the instance: a map row with no
+        # account credentials behind it is meaningless.
+        ForeignKeyConstraint(
+            ["instance_id", "pms_type"],
+            ["instance_pms_config.instance_id", "instance_pms_config.pms_type"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("instance_id", "pms_type", "vendor_location_key",
+                         name="uq_pms_location"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    instance_id: Mapped[str] = mapped_column(CHAR(36), nullable=False)
+    pms_type: Mapped[str] = mapped_column(
+        Enum("blueprint", "counselear", "audit_data", "none", name="pms_type_enum"),
+        nullable=False,
+    )
+    vendor_location_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    clinic_id: Mapped[str | None] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=True, index=True,
+    )
+    location_name: Mapped[str | None] = mapped_column(String(255))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+    # Voice agent: ask the caller which site to book into. Only meaningful for a
+    # clinic that fronts more than one vendor location.
+    prompt_for_location: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="0")
+    # Blueprint "user creating the appointment" for create/cancel/reschedule.
+    # NULL falls back to the booking's providerId.
+    booking_user_id: Mapped[int | None] = mapped_column(Integer)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    config: Mapped["InstancePmsConfig"] = relationship(back_populates="locations")
+    clinic: Mapped["Clinic | None"] = relationship(back_populates="pms_locations")
 
 
 # ──────────────────── clinic_voice_agent_script (1:1) ────────────────────
@@ -744,6 +950,82 @@ class JotformForm(Base):
     )
 
     clinic: Mapped["Clinic"] = relationship(back_populates="jotform_forms")
+    locations: Mapped[list["JotformFormLocation"]] = relationship(
+        back_populates="form", cascade="all, delete-orphan",
+    )
+
+
+# ──────────────────── jotform_form_locations (N) ────────────────────
+
+class JotformFormLocation(Base):
+    """Maps one "choose your location" answer on a Jotform to a CORTEX clinic.
+
+    A single form can serve every site in a group — Sense of Hearing's
+    appointment-request form covers all 14 Ontario locations — but a webhook URL
+    carries exactly ONE clinic_id in its path (see :class:`JotformForm`). Without
+    this table every one of those submissions is attributed to whichever clinic
+    the webhook happens to point at; on the Sense of Hearing form that would be
+    right for 14% of leads and wrong for the other 86%.
+
+    ``option_value`` is the dropdown answer **verbatim**, exactly as it arrives in
+    the webhook's ``rawRequest`` (e.g. ``"Burlington: 11 - 1960 Appleby Line"``).
+    Matching is on the literal string rather than on a parsed-out location name
+    because these strings are marketing copy maintained in the Jotform builder and
+    routinely disagree with our clinic names — the same form says "Limestone
+    Hearing Care Centre (Kingston)" where the clinic is *Kingston*, and
+    "Mississauga (Eglinton)" where the clinic is *Mississauga Central*. An
+    explicit row per option is the only mapping that survives that.
+
+    Not scoped to a field: forms reveal different location dropdowns by condition
+    (this one has four — adult, 6-17, APD, 10-months-up — with overlapping option
+    lists), so the resolver scans the submission's values instead of naming a
+    field. See ``api/webforms.py::_resolve_location_clinic``.
+
+    ``clinic_id`` is nullable and pairs with ``active`` exactly as
+    :class:`PmsClinicLocation` does — a known option we cannot route yet is a
+    different thing from an option nobody has ever mapped, and only the first is
+    a decision:
+
+        active=True,  clinic_id set    route this option's submissions there
+        active=True,  clinic_id NULL   known option, clinic not created yet
+        active=False                   retired option, ignore
+
+    A NULL ``clinic_id`` is not an error: the submission falls back to the form's
+    own clinic (the one in the webhook path) and the resolver logs the unmapped
+    value, so it shows up as drift rather than silently vanishing.
+    """
+    __tablename__ = "jotform_form_locations"
+    __table_args__ = (
+        UniqueConstraint("jotform_form_id", "option_value", name="uq_jotform_form_location"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    jotform_form_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("jotform_forms.jotform_form_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # 255 rather than TEXT so it can carry a UNIQUE index; the longest option on
+    # any form today is 78 characters.
+    option_value: Mapped[str] = mapped_column(String(255), nullable=False)
+    clinic_id: Mapped[str | None] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=True, index=True,
+    )
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    form: Mapped["JotformForm"] = relationship(back_populates="locations")
+    clinic: Mapped["Clinic | None"] = relationship(back_populates="jotform_form_locations")
 
 
 # ──────────────────── clinic_admins (N) ────────────────────
