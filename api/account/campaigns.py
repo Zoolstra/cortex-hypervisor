@@ -22,6 +22,7 @@ URL shape:
     GET    /campaigns/{instance_id}/{clinic_id}      → both types, one clinic
     POST   /campaigns/{clinic_id}  body{campaign_type, external_campaign_id, active}
     DELETE /campaigns/{campaign_type}/{id}           → explicit type required
+    GET    /campaigns/{instance_id}/jotform/locations → every form + its routing
     GET    /campaigns/jotform/{form_id}/locations    → the form's location map
     PUT    /campaigns/jotform/{form_id}/locations    → replace the location map
 """
@@ -470,13 +471,114 @@ def _jotform_form_or_404(db: Session, form_id: str) -> JotformForm:
     return form
 
 
+def _location_payload(
+    db: Session, form: JotformForm, names: dict[str, str], live: list[str] | None,
+) -> dict:
+    """One form's routing picture: its scope, its map, and what is unrouted.
+
+    ``scope`` is derived, not stored, because it IS the presence of a map:
+
+      "instance"  the form has location rows, so one form serves several clinics
+                  and the patient's answer decides which
+      "clinic"    no rows, so every submission goes to the one registry clinic
+
+    ``needs_location_map`` is the misconfiguration worth shouting about — a form
+    that ASKS for a location but has no map. Every one of its leads is being
+    attributed to a single clinic while the patient is telling us otherwise.
+    """
+    rows = db.scalars(
+        select(JotformFormLocation)
+        .where(JotformFormLocation.jotform_form_id == form.jotform_form_id)
+        .order_by(JotformFormLocation.option_value)
+    ).all()
+    mapped = {r.option_value for r in rows}
+    unmapped = None if live is None else [o for o in live if o not in mapped]
+    scope = "instance" if rows else "clinic"
+    return {
+        "jotform_form_id": form.jotform_form_id,
+        "form_title": form.form_title,
+        "active": bool(form.active),
+        # The clinic in the webhook URL. For an instance-scoped form this is only
+        # where an answer that resolves to nothing lands, NOT where its leads go.
+        "default_clinic_id": form.clinic_id,
+        "default_clinic_name": names.get(form.clinic_id),
+        "scope": scope,
+        "needs_location_map": scope == "clinic" and bool(live),
+        "locations": [
+            {
+                "option_value": r.option_value,
+                "clinic_id": r.clinic_id,
+                "clinic_name": names.get(r.clinic_id) if r.clinic_id else None,
+                "active": bool(r.active),
+                # Mapped, but the form no longer offers it — renamed in the
+                # builder, so it can never match a submission again.
+                "stale": live is not None and r.option_value not in live,
+            }
+            for r in rows
+        ],
+        # Distinct clinics this form can actually deliver to, default included.
+        "routes_to": sorted({
+            *(r.clinic_id for r in rows if r.active and r.clinic_id),
+            form.clinic_id,
+        }),
+        "unmapped_options": unmapped,
+    }
+
+
+def _instance_clinic_names(db: Session, instance_id: str) -> dict[str, str]:
+    return {
+        c.clinic_id: c.clinic_name
+        for c in db.scalars(
+            select(Clinic).where(
+                Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None),
+            )
+        ).all()
+    }
+
+
+@router.get("/campaigns/{instance_id}/jotform/locations")
+def get_instance_jotform_locations(
+    instance_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Every registered Jotform of one business, with its routing.
+
+    One call rather than one per form: the admin UI needs the whole picture to
+    answer "is this form set up for the business or for a single clinic?", and a
+    per-clinic panel needs to know which OTHER clinic's form delivers to it.
+
+    A form whose options cannot be read from Jotform still appears, with
+    ``unmapped_options: null`` — an outage must not read as "fully mapped".
+    """
+    require_read_access(instance_id, caller)
+
+    names = _instance_clinic_names(db, instance_id)
+    forms = db.scalars(
+        select(JotformForm)
+        .join(Clinic, Clinic.clinic_id == JotformForm.clinic_id)
+        .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
+        .order_by(JotformForm.jotform_form_id)
+    ).all()
+
+    return {
+        "instance_id": instance_id,
+        "clinics": [{"clinic_id": cid, "clinic_name": n} for cid, n in sorted(
+            names.items(), key=lambda kv: kv[1])],
+        "forms": [
+            _location_payload(db, f, names, _jotform_location_options(f.jotform_form_id))
+            for f in forms
+        ],
+    }
+
+
 @router.get("/campaigns/jotform/{form_id}/locations")
 def get_jotform_locations(
     form_id: str,
     caller: dict = Depends(verify_token),
     db: Session = Depends(get_session),
 ):
-    """The form's location map, merged with the options the form actually offers.
+    """One form's location map, merged with the options the form actually offers.
 
     ``unmapped_options`` is the useful half: an option the form presents that no
     row routes is a lead that will be attributed to the form's default clinic.
@@ -487,40 +589,8 @@ def get_jotform_locations(
     default_clinic = db.get(Clinic, form.clinic_id)
     require_read_access(default_clinic.instance_id, caller)
 
-    rows = db.scalars(
-        select(JotformFormLocation)
-        .where(JotformFormLocation.jotform_form_id == form_id)
-        .order_by(JotformFormLocation.option_value)
-    ).all()
-    names = {
-        c.clinic_id: c.clinic_name
-        for c in db.scalars(
-            select(Clinic).where(Clinic.instance_id == default_clinic.instance_id)
-        ).all()
-    }
-
-    live = _jotform_location_options(form_id)
-    mapped = {r.option_value for r in rows}
-    return {
-        "jotform_form_id": form_id,
-        "form_title": form.form_title,
-        # The clinic in the webhook URL — where a submission lands when its
-        # answer resolves to nothing.
-        "default_clinic_id": form.clinic_id,
-        "default_clinic_name": default_clinic.clinic_name,
-        "locations": [
-            {
-                "option_value": r.option_value,
-                "clinic_id": r.clinic_id,
-                "clinic_name": names.get(r.clinic_id) if r.clinic_id else None,
-                "active": bool(r.active),
-                # An option that used to exist and no longer appears on the form.
-                "stale": live is not None and r.option_value not in live,
-            }
-            for r in rows
-        ],
-        "unmapped_options": None if live is None else [o for o in live if o not in mapped],
-    }
+    names = _instance_clinic_names(db, default_clinic.instance_id)
+    return _location_payload(db, form, names, _jotform_location_options(form_id))
 
 
 @router.put("/campaigns/jotform/{form_id}/locations")

@@ -384,6 +384,16 @@ instance) or through `GET`/`PUT /campaigns/jotform/{form_id}/locations`.
 Wire a group's webhook only after its map exists — the leads that arrive in
 between all land on the default clinic.
 
+**In the dashboard.** *Business settings → Lead forms* (`/settings/instance/{id}/lead-forms`,
+`InstanceJotformSection.tsx`) is the editor; the per-clinic *Campaigns* tab keeps
+the registry. Scope is shown, never set: a form is "Business-wide" when it has a
+map and "One clinic" when it does not, computed by the API rather than stored, so
+a flag can never disagree with the rows that actually route. The clinic holding a
+group form's webhook sees it badged business-wide with the fallback explained;
+the other clinics get a read-only "Lead forms shared with this clinic" panel
+naming the exact answers that route to them — without which 13 of a 14-site
+group look like they have no lead form at all.
+
 ## Group Intelligence (multi-location rollup)
 
 `GET /intelligence/group/{instance_id}/overview` returns the **per-clinic
