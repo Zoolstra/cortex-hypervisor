@@ -250,12 +250,52 @@ def test_yoy_basis_is_mixed_when_clinics_disagree():
 # ── nested list merges ───────────────────────────────────────────────────────
 
 def test_ad_click_campaigns_merge_rather_than_concatenate():
+    # Rows carry google_ads_campaign_id (queries.paid_campaign_drivers), and the
+    # rollup must key on that — it keyed on a "campaign_id" no row had, which
+    # collapsed every clinic's campaigns into one row keyed None.
     merged = ga._merge_by_key(
-        [[{"campaign_id": "c1", "campaign_name": "Brand", "calls": 3, "clicks": 10}],
-         [{"campaign_id": "c1", "campaign_name": "Brand", "calls": 2, "clicks": 5}]],
-        "campaign_id", int_fields=("calls", "clicks"), carry=("campaign_name",))
-    assert len(merged) == 1
-    assert merged[0]["calls"] == 5 and merged[0]["clicks"] == 15
+        [[{"google_ads_campaign_id": "c1", "campaign_name": "Brand", "calls": 3}],
+         [{"google_ads_campaign_id": "c1", "campaign_name": "Brand", "calls": 2}],
+         [{"google_ads_campaign_id": "c2", "campaign_name": "Generic", "calls": 1}]],
+        "google_ads_campaign_id", int_fields=("calls",), carry=("campaign_name",))
+    by = {r["google_ads_campaign_id"]: r for r in merged}
+    assert set(by) == {"c1", "c2"}
+    assert by["c1"]["calls"] == 5 and by["c1"]["campaign_name"] == "Brand"
+
+
+def test_paid_click_breakdown_merges_places_and_keywords_additively():
+    a = {"paid_calls": 10, "with_click_data": 4, "no_click_data": 6,
+         "geo": {"places": [{"id": "1", "name": "Calgary", "region": "Alberta",
+                             "country": "Canada", "lat": 51.0, "lon": -114.1, "calls": 3}],
+                 "unknown": 1},
+         "keywords": {"keywords": [{"keyword": "hearing test", "match_type": "PHRASE", "calls": 4}],
+                      "unknown": 0}}
+    b = {"paid_calls": 5, "with_click_data": 2, "no_click_data": 3,
+         "geo": {"places": [{"id": "1", "name": "Calgary", "region": "Alberta",
+                             "country": "Canada", "lat": 51.0, "lon": -114.1, "calls": 1},
+                            {"id": "2", "name": "Airdrie", "region": "Alberta",
+                             "country": "Canada", "lat": None, "lon": None, "calls": 1}],
+                 "unknown": 0},
+         "keywords": {"keywords": [{"keyword": "hearing test", "match_type": "PHRASE", "calls": 1}],
+                      "unknown": 1}}
+    m = ga._merge_paid_click_breakdown([a, b])
+    assert (m["paid_calls"], m["with_click_data"], m["no_click_data"]) == (15, 6, 9)
+    places = {p["id"]: p for p in m["geo"]["places"]}
+    assert places["1"]["calls"] == 4 and places["1"]["lat"] == 51.0
+    assert places["2"]["calls"] == 1
+    assert m["geo"]["unknown"] == 1
+    assert m["keywords"]["keywords"] == [{"keyword": "hearing test", "match_type": "PHRASE", "calls": 5}]
+    assert m["keywords"]["unknown"] == 1
+    # Identities the UI relies on to draw a real partition.
+    assert sum(p["calls"] for p in m["geo"]["places"]) + m["geo"]["unknown"] == m["with_click_data"]
+    assert m["with_click_data"] + m["no_click_data"] == m["paid_calls"]
+
+
+def test_paid_click_breakdown_hides_when_no_paid_calls():
+    assert ga._merge_paid_click_breakdown([]) is None
+    empty = {"paid_calls": 0, "with_click_data": 0, "no_click_data": 0,
+             "geo": {"places": [], "unknown": 0}, "keywords": {"keywords": [], "unknown": 0}}
+    assert ga._merge_paid_click_breakdown([empty, empty]) is None
 
 
 def test_channel_mix_merges_by_channel():

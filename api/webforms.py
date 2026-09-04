@@ -1,43 +1,35 @@
 """
-Web-form ingestion — relays form submissions from our clinic sites into
-``ClinicData.webforms`` for the patient-acquisition funnel.
-
-Two entry points land in the same table:
+Web-form ingestion — relays form submissions from our own clinic-site backends
+into ``ClinicData.webforms`` for the patient-acquisition funnel.
 
 ``POST /webforms`` (JSON)
-    A form on one of our sites is submitted; the site's backend POSTs the
+    A form on one of our Next.js sites is submitted; the site's backend POSTs the
     captured fields here (server-to-server, so the shared secret never reaches
     the browser). Auth is the ``X-Webform-Secret`` header.
 
-``POST /webforms/jotform/{clinic_id}`` (Jotform webhook)
-    Sites whose forms are hosted by Jotform (e.g. Alto Hearing) configure a
-    Jotform webhook here. Jotform POSTs ``multipart/form-data`` and CANNOT send
-    custom headers, so the shared secret travels as a ``token`` query param and
-    ``clinic_id`` sits in the path (each form's webhook URL targets its clinic).
-    The Jotform field payload arrives JSON-encoded in ``rawRequest`` and is
-    mapped onto the same columns.
+**Jotform-hosted forms do NOT come through here any more.** They are polled from
+the Jotform API by the ETL job ``jotform-ingest``
+(``cortex-data-ingestion/app/jotform/``), which owns the table's schema; the
+``WEBFORMS_SCHEMA`` below is a pinned mirror. The former webhook relay
+``POST /webforms/jotform/{clinic_id}`` was retired 2026-09-04 after the webhooks
+were removed from every form (``resources/jotform-api-polling-plan.md``).
 
-    A URL can only name one clinic, which is wrong for a group running every
-    site off one form. When such a form asks the patient to choose a location,
-    ``jotform_form_locations`` maps that answer to a clinic and the path clinic
-    becomes a fallback — see ``_resolve_location_clinic``.
+``GET /webforms/coverage`` (super_admin) joins the ``jotform_forms`` registry
+against what has landed, so a registered-but-silent form is visible.
 
 Auth
 ----
-A single shared secret (Secret Manager: ``webform-webhook-secret``) guards both
-entry points. ``clinic_id`` is verified against Cloud SQL before any write — an
-unknown or soft-deleted clinic is rejected with 404, so junk never lands in
-BigQuery.
+``webform-webhook-secret`` (Secret Manager) guards ``POST /webforms``.
+``clinic_id`` is verified against Cloud SQL before any write — an unknown or
+soft-deleted clinic is rejected with 404, so junk never lands in BigQuery.
 
 Storage
 -------
-Rows go to ``ClinicData.webforms`` (analytics dataset, NOT Blueprint_PHI) via a
-streaming insert — real-time, append-only. The table is created lazily on first
-write (idempotent), matching the ``transcript_analysis/callscoring.py`` pattern.
-Schema is the locked patient-acquisition spec (clinic_id, first/last name,
-phone, email, utm_source, utm_content, customer_type, message) plus
-server-side enrichment: ``clinic_name``, ``landing_page``, and
-``submitted_at``.
+Rows go to ``ClinicData.webforms`` via a streaming insert — real-time,
+append-only, ``ingest_source = json_relay``. The table is created lazily on
+first write and reconciled additively (NULLABLE columns only). Streaming inserts
+take the ``raw_fields`` JSON column as an encoded string; the ETL's load jobs
+take the object — the two writers differ on purpose.
 """
 import json
 import logging
@@ -45,14 +37,14 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.core.db import get_session
-from api.core.orm import Clinic, JotformForm, JotformFormLocation
+from api.core.orm import Clinic, JotformForm
 from api.core.secrets import get_secret
 from api.deps import bq_client, verify_token
 from api.models import WebformSubmission
@@ -80,56 +72,72 @@ def verify_webform_secret(x_webform_secret: str = Header(None)) -> None:
 
 # ── Table ───────────────────────────────────────────────────────────────────--
 
+# Schema MIRROR. The source of record is the ETL's ``jotform/schema.py``
+# (the poller is the main writer now); both are pinned to the same fixture,
+# ``tests/fixtures/webforms_schema.json``, by tests in each repo.
+WEBFORMS_SCHEMA = [
+    bigquery.SchemaField("clinic_id",    "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("clinic_name",  "STRING"),
+    bigquery.SchemaField("first_name",   "STRING"),
+    bigquery.SchemaField("last_name",    "STRING"),
+    bigquery.SchemaField("phone_number", "STRING"),
+    bigquery.SchemaField("email",        "STRING"),
+    bigquery.SchemaField("utm_source",   "STRING"),
+    bigquery.SchemaField("utm_medium",   "STRING"),
+    bigquery.SchemaField("utm_campaign", "STRING"),
+    bigquery.SchemaField("utm_term",     "STRING"),
+    bigquery.SchemaField("utm_content",  "STRING"),
+    bigquery.SchemaField("gclid",        "STRING"),
+    bigquery.SchemaField("fbclid",       "STRING"),
+    # Paid-click identifiers beyond gclid. Google sends `gbraid` (app/web
+    # cross-device) or `wbraid` (iOS, post-ATT) INSTEAD of a gclid on a large
+    # and growing share of clicks, so a gclid-only capture silently loses
+    # them: 7 of the first 8 attributable submissions carried a gbraid.
+    # `gad_campaignid` is the strongest key of the three — it IS the campaign
+    # id, so it needs no ad_clicks_v2 join and is therefore immune to that
+    # table's 7-day click settle window.
+    bigquery.SchemaField("gbraid",         "STRING"),
+    bigquery.SchemaField("wbraid",         "STRING"),
+    bigquery.SchemaField("gad_campaignid", "STRING"),
+    # The referring site's host, when the visit carried no UTM parameters.
+    # Split out of utm_source by _utm() — see that docstring for why the two
+    # were conflated and how they are told apart.
+    bigquery.SchemaField("referrer_host",  "STRING"),
+    bigquery.SchemaField("landing_page", "STRING"),
+    bigquery.SchemaField("customer_type", "STRING"),
+    bigquery.SchemaField("message",       "STRING"),
+    bigquery.SchemaField("submitted_at", "TIMESTAMP", mode="REQUIRED"),
+    # Form provenance + lossless capture. Forms differ in layout (a "New/
+    # Returning" radio on one, a service-type radio on another, extra fields
+    # like "preferred contact method" on a third), so the typed columns above
+    # are a best-effort *core*; ``raw_fields`` keeps EVERY field verbatim so
+    # nothing is ever dropped and novel forms need no code change. ``pretty``
+    # is Jotform's human-readable "Label: Value" rendering (labels aren't in
+    # rawRequest). Promote a raw field to its own column later by backfilling
+    # from the JSON.
+    bigquery.SchemaField("form_id",     "STRING"),
+    bigquery.SchemaField("form_title",  "STRING"),
+    bigquery.SchemaField("raw_fields",  "JSON"),
+    bigquery.SchemaField("pretty",      "STRING"),
+    # Added 2026-09 with the webhook → API-polling move. ``submission_id`` is
+    # Jotform's id — the poller's idempotency key, so the webhook and the
+    # poller can overlap without double-counting; ``ingest_source`` says which
+    # writer landed the row; ``ingested_at`` is when WE wrote it (what
+    # submitted_at used to mean before the poller made it Jotform's created_at).
+    bigquery.SchemaField("submission_id", "STRING"),
+    bigquery.SchemaField("ingest_source", "STRING"),
+    bigquery.SchemaField("ingested_at",   "TIMESTAMP"),
+]
+
+SOURCE_JSON_RELAY = "json_relay"   # the ETL writes jotform_api / backfill
+
+
 def _ensure_table() -> None:
     """Create ClinicData.webforms if it doesn't exist. Idempotent; runs once."""
     global _table_ready
     if _table_ready:
         return
-    schema = [
-        bigquery.SchemaField("clinic_id",    "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("clinic_name",  "STRING"),
-        bigquery.SchemaField("first_name",   "STRING"),
-        bigquery.SchemaField("last_name",    "STRING"),
-        bigquery.SchemaField("phone_number", "STRING"),
-        bigquery.SchemaField("email",        "STRING"),
-        bigquery.SchemaField("utm_source",   "STRING"),
-        bigquery.SchemaField("utm_medium",   "STRING"),
-        bigquery.SchemaField("utm_campaign", "STRING"),
-        bigquery.SchemaField("utm_term",     "STRING"),
-        bigquery.SchemaField("utm_content",  "STRING"),
-        bigquery.SchemaField("gclid",        "STRING"),
-        bigquery.SchemaField("fbclid",       "STRING"),
-        # Paid-click identifiers beyond gclid. Google sends `gbraid` (app/web
-        # cross-device) or `wbraid` (iOS, post-ATT) INSTEAD of a gclid on a large
-        # and growing share of clicks, so a gclid-only capture silently loses
-        # them: 7 of the first 8 attributable submissions carried a gbraid.
-        # `gad_campaignid` is the strongest key of the three — it IS the campaign
-        # id, so it needs no ad_clicks_v2 join and is therefore immune to that
-        # table's 7-day click settle window.
-        bigquery.SchemaField("gbraid",         "STRING"),
-        bigquery.SchemaField("wbraid",         "STRING"),
-        bigquery.SchemaField("gad_campaignid", "STRING"),
-        # The referring site's host, when the visit carried no UTM parameters.
-        # Split out of utm_source by _utm() — see that docstring for why the two
-        # were conflated and how they are told apart.
-        bigquery.SchemaField("referrer_host",  "STRING"),
-        bigquery.SchemaField("landing_page", "STRING"),
-        bigquery.SchemaField("customer_type", "STRING"),
-        bigquery.SchemaField("message",       "STRING"),
-        bigquery.SchemaField("submitted_at", "TIMESTAMP", mode="REQUIRED"),
-        # Form provenance + lossless capture. Forms differ in layout (a "New/
-        # Returning" radio on one, a service-type radio on another, extra fields
-        # like "preferred contact method" on a third), so the typed columns above
-        # are a best-effort *core*; ``raw_fields`` keeps EVERY field verbatim so
-        # nothing is ever dropped and novel forms need no code change. ``pretty``
-        # is Jotform's human-readable "Label: Value" rendering (labels aren't in
-        # rawRequest). Promote a raw field to its own column later by backfilling
-        # from the JSON.
-        bigquery.SchemaField("form_id",     "STRING"),
-        bigquery.SchemaField("form_title",  "STRING"),
-        bigquery.SchemaField("raw_fields",  "JSON"),
-        bigquery.SchemaField("pretty",      "STRING"),
-    ]
+    schema = WEBFORMS_SCHEMA
     # Check existence first so we don't issue a create — and log a benign
     # "Already Exists" audit error — on every cold start.
     try:
@@ -267,16 +275,19 @@ def _attribution(fields: dict) -> dict[str, str | None]:
 
 # ── Shared insert ─────────────────────────────────────────────────────────────
 
-def _store_submission(clinic: Clinic, fields: dict) -> None:
+def _store_submission(clinic: Clinic, fields: dict, *, source: str) -> None:
     """Ensure the table exists and stream one server-enriched row.
 
     ``fields`` carries the optional submission columns (``first_name`` … ``message``);
-    missing keys become NULL. ``clinic_name`` and ``submitted_at`` are stamped
-    server-side. Raises 500 if BigQuery rejects the row.
+    missing keys become NULL. ``clinic_name``, ``submitted_at`` and ``ingested_at``
+    are stamped server-side (both = now; the relay is synchronous). ``source``
+    names the writer (``ingest_source``).
+    Raises 500 if BigQuery rejects the row.
     """
     _ensure_table()
     attr = _attribution(fields)
     utm = _utm(fields)
+    now = datetime.now(timezone.utc).isoformat()
     row = {
         "clinic_id":     clinic.clinic_id,
         "clinic_name":   clinic.clinic_name,
@@ -303,12 +314,15 @@ def _store_submission(clinic: Clinic, fields: dict) -> None:
         "landing_page":  fields.get("landing_page"),
         "customer_type": fields.get("customer_type"),
         "message":       fields.get("message"),
-        "submitted_at":  datetime.now(timezone.utc).isoformat(),
+        "submitted_at":  now,
         "form_id":       fields.get("form_id"),
         "form_title":    fields.get("form_title"),
         # JSON-typed column: streaming insert expects the value as a JSON string.
         "raw_fields":    json.dumps(fields["raw_fields"]) if fields.get("raw_fields") else None,
         "pretty":        fields.get("pretty"),
+        "submission_id": fields.get("submission_id"),
+        "ingest_source": source,
+        "ingested_at":   now,
     }
     errors = bq_client.insert_rows_json(WEBFORMS_TABLE, [row])
     if errors:
@@ -334,258 +348,7 @@ def ingest_webform(
     if clinic is None or clinic.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Unknown clinic_id")
 
-    _store_submission(clinic, submission.model_dump())
-    return {"status": "accepted"}
-
-
-# ── Endpoint: Jotform webhook ──────────────────────────────────────────────────
-
-# Jotform prepends ``q<id>_`` to every field's unique name in ``rawRequest``
-# (e.g. ``q7_utm_source``). Strip it to recover the unique name we configured.
-# Strip *repeated* prefixes: if a field's Unique Name itself starts with a
-# ``q<n>_`` token (e.g. someone set it to ``q2_fullname0``), Jotform emits
-# ``q<id>_q2_fullname0`` and a single strip would leave ``q2_fullname0`` — which
-# matches no column. Stripping greedily recovers ``fullname0`` either way.
-_JOTFORM_PREFIX = re.compile(r"^(?:q\d+_)+")
-
-
-def _clean(v) -> str | None:
-    """Trim a string value; non-strings and blanks collapse to None."""
-    if not isinstance(v, str):
-        return None
-    v = v.strip()
-    return v or None
-
-
-def _camel(snake: str) -> str:
-    """utm_source -> utmSource (Jotform's default unique-name casing)."""
-    head, *rest = snake.split("_")
-    return head + "".join(p.title() for p in rest)
-
-
-def _parse_jotform(raw_request: str) -> dict:
-    """Map a Jotform ``rawRequest`` JSON blob onto our submission columns.
-
-    Jotform names fields in ``rawRequest`` by their auto-generated unique name —
-    ``fullname0``, ``email1``, ``phone2``, ``textarea4`` — unless you set a custom
-    unique name. So contact fields are matched by **field-type prefix** (robust to
-    the numeric suffixes), and tracking fields by exact name (with a camelCase
-    fallback). Name/phone fields submit as objects (``{first,last}`` /
-    ``{full,...}``); everything else is a plain string. Anything absent maps to
-    NULL — extraction never raises.
-    """
-    try:
-        raw = json.loads(raw_request or "{}")
-    except (ValueError, TypeError):
-        raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-
-    fields = {
-        _JOTFORM_PREFIX.sub("", k): v
-        for k, v in raw.items()
-        if isinstance(k, str)
-    }
-
-    # Diagnostic: log the field names Jotform sent (KEYS ONLY — no values, so no
-    # PII lands in logs).
-    log.info("Jotform rawRequest: %d chars, field keys=%s",
-             len(raw_request or ""), sorted(fields.keys()))
-
-    def pick(*prefixes):
-        """Value of the first field whose lowercased name starts with a prefix."""
-        for k, v in fields.items():
-            kl = k.lower()
-            if any(kl.startswith(p) for p in prefixes):
-                return v
-        return None
-
-    def tracking(name):
-        """Tracking params keyed by exact snake_case or camelCase unique name."""
-        return fields.get(name) or fields.get(_camel(name))
-
-    # Name: full-name field is {first, last}; a plain string splits on first space.
-    first = last = None
-    name = pick("fullname", "name", "yourname")
-    if isinstance(name, dict):
-        first = _clean(name.get("first"))
-        last = _clean(name.get("last"))
-    elif isinstance(name, str):
-        parts = name.strip().split(None, 1)
-        first = _clean(parts[0]) if parts else None
-        last = _clean(parts[1]) if len(parts) > 1 else None
-
-    # Phone: object {full, area, phone, ...} or a plain string.
-    phone = pick("phone", "mobile")
-    if isinstance(phone, dict):
-        phone = phone.get("full") or phone.get("phone")
-
-    # Message: prefer a configured "message", else a textarea / "how can we help".
-    message = (pick("message", "comment")
-               or pick("textarea", "howcan", "whatcan", "reason", "inquiry", "help"))
-
-    # customer_type: try the field NAME first, then fall back to the VALUE. Field
-    # names are unreliable across forms — one form's ``radio3`` is New/Returning,
-    # another's ``radio3`` is a service-type question — but the *value*
-    # "New Customer" / "Returning Customer" is self-identifying, so a value scan
-    # catches default-named radios without mis-labelling unrelated ones.
-    customer_type = _clean(pick("newor", "returning", "customertype", "newcustomer"))
-    if not customer_type:
-        for v in fields.values():
-            if isinstance(v, str) and re.match(r"(?i)^\s*(new|returning)\b", v):
-                customer_type = v.strip()
-                break
-
-    return {
-        "first_name":    first,
-        "last_name":     last,
-        "email":         _clean(pick("email", "e-mail")),
-        "phone_number":  _clean(phone),
-        "utm_source":    _clean(tracking("utm_source")),
-        "utm_medium":    _clean(tracking("utm_medium")),
-        "utm_campaign":  _clean(tracking("utm_campaign")),
-        "utm_term":      _clean(tracking("utm_term")),
-        "utm_content":   _clean(tracking("utm_content")),
-        "gclid":         _clean(tracking("gclid")),
-        "fbclid":        _clean(tracking("fbclid")),
-        # Not configured as hidden fields on any form today — read anyway so the
-        # form wins over the URL the moment they are added, per _attribution().
-        "gbraid":         _clean(tracking("gbraid")),
-        "wbraid":         _clean(tracking("wbraid")),
-        "gad_campaignid": _clean(tracking("gad_campaignid")),
-        "landing_page":  _clean(tracking("landing_page")),
-        "customer_type": customer_type,
-        "message":       _clean(message),
-        # Lossless capture: the full prefix-stripped field map, so any field the
-        # typed columns don't model (service type, preferred contact, best times…)
-        # is preserved and new form layouts need no parser change.
-        "raw_fields":    fields,
-    }
-
-
-def _resolve_location_clinic(
-    db: Session, form_id: str | None, fields: dict, default: Clinic,
-) -> Clinic:
-    """Pick the clinic a submission belongs to from its "choose your location" answer.
-
-    One form can serve a whole group — Sense of Hearing's appointment-request
-    form covers all 14 Ontario sites — but the webhook URL names a single clinic
-    (``JotformForm``), so without this every submission lands on whichever clinic
-    that URL points at. ``jotform_form_locations`` maps each dropdown answer to a
-    clinic; this resolves one submission against that map.
-
-    Matching is by VALUE, not by field name, and deliberately so. Forms reveal
-    different location dropdowns by condition — the Sense of Hearing form has
-    four (adult, 6-17, APD, 10-months-up) with overlapping option lists, and only
-    the one its conditions revealed is answered. Naming the fields would mean
-    re-configuring every time the builder adds a fifth; scanning the values costs
-    nothing and cannot go stale. Option strings are long and address-bearing
-    ("Burlington: 11 - 1960 Appleby Line"), so a collision with an unrelated
-    field's value is not a practical concern.
-
-    Falls back to ``default`` (the clinic in the webhook path) whenever the answer
-    is missing, unmapped, mapped to nothing yet, or points at a soft-deleted
-    clinic. A lead attributed to the group's default site is recoverable — the
-    verbatim answer is kept in ``raw_fields`` — where a dropped lead is not. Each
-    fallback logs the value that caused it so the gap is visible rather than
-    silent.
-    """
-    if not form_id:
-        return default
-
-    rows = db.execute(
-        select(JotformFormLocation).where(
-            JotformFormLocation.jotform_form_id == form_id,
-            JotformFormLocation.active.is_(True),
-        )
-    ).scalars().all()
-    if not rows:
-        return default
-
-    by_option = {r.option_value: r.clinic_id for r in rows}
-    for value in (fields.get("raw_fields") or {}).values():
-        if not isinstance(value, str):
-            continue
-        answer = value.strip()
-        if answer not in by_option:
-            continue
-
-        mapped_id = by_option[answer]
-        if mapped_id is None:
-            # Known option, clinic not created yet — an expected state during a
-            # group's rollout, not a misconfiguration.
-            log.warning(
-                "Jotform location %r on form %s has no clinic yet; "
-                "attributing to %s", answer, form_id, default.clinic_id,
-            )
-            return default
-
-        clinic = db.get(Clinic, mapped_id)
-        if clinic is None or clinic.deleted_at is not None:
-            log.warning(
-                "Jotform location %r on form %s maps to missing/deleted clinic %s; "
-                "attributing to %s", answer, form_id, mapped_id, default.clinic_id,
-            )
-            return default
-        return clinic
-
-    # The form has a location map but this submission matched none of it: either
-    # an option was renamed in the builder, or a new site was added and never
-    # mapped. Both are drift the provisioning script should reconcile.
-    log.warning(
-        "Jotform form %s has %d mapped location(s) but the submission matched "
-        "none; attributing to %s", form_id, len(by_option), default.clinic_id,
-    )
-    return default
-
-
-@router.post("/webforms/jotform/{clinic_id}")
-async def ingest_jotform_webform(
-    request: Request,
-    clinic_id: str,
-    token: str = Query("", description="shared secret; Jotform webhooks can't send headers"),
-    db: Session = Depends(get_session),
-):
-    """Relay a Jotform webhook submission into ``ClinicData.webforms``.
-
-    Auth is the ``token`` query param (Jotform cannot send custom headers), checked
-    against the same ``webform-webhook-secret``. ``clinic_id`` is path-scoped and
-    validated against Cloud SQL. Jotform POSTs multipart form-data; the field
-    values arrive JSON-encoded in the ``rawRequest`` part.
-
-    The path clinic is the form's DEFAULT, not necessarily the row's: a form that
-    serves a whole group asks which site the patient wants, and
-    ``_resolve_location_clinic`` re-points the row at that one.
-    """
-    expected = (get_secret("webform-webhook-secret") or "").strip()
-    if not expected or token.strip() != expected:
-        raise HTTPException(status_code=403, detail="Invalid or missing webform token")
-
-    clinic = db.get(Clinic, clinic_id)
-    if clinic is None or clinic.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="Unknown clinic_id")
-
-    form = await request.form()
-    # Diagnostic: which parts did Jotform actually send? (KEYS ONLY — no values.)
-    log.info("Jotform webhook clinic_id=%s top-level keys=%s", clinic_id, sorted(form.keys()))
-    raw_request = form.get("rawRequest") or ""
-
-    fields = _parse_jotform(raw_request)
-    # Form provenance travels in the multipart body (not rawRequest): ``formID``
-    # / ``formTitle`` identify which clinic page it came from; ``pretty`` is the
-    # human-readable "Label: Value" rendering that gives raw_fields' cryptic
-    # unique names (radio3, textbox5…) meaning.
-    fields["form_id"] = _clean(form.get("formID"))
-    fields["form_title"] = _clean(form.get("formTitle"))
-    fields["pretty"] = _clean(form.get("pretty"))
-
-    # A group's shared form names one clinic in its webhook URL but asks the
-    # patient which site they want; that answer wins over the path.
-    clinic = _resolve_location_clinic(db, fields["form_id"], fields, clinic)
-
-    _store_submission(clinic, fields)
-    log.info("Stored Jotform submission clinic_id=%s (path %s) form=%s submission=%s",
-             clinic.clinic_id, clinic_id, form.get("formID"), form.get("submissionID"))
+    _store_submission(clinic, submission.model_dump(), source=SOURCE_JSON_RELAY)
     return {"status": "accepted"}
 
 

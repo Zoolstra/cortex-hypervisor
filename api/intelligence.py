@@ -116,7 +116,11 @@ def _group_clinic_specs(db: Session, instance_id: str) -> list[dict]:
 #             bump is mandatory — a cached payload would still report the old
 #             qualified_not_booked and the Recoverable tile would price a cohort
 #             the funnel no longer reports.
-_METHODOLOGY_VERSION = "2026-08-20.6"
+# 2026-09-04: added `paid_click_breakdown` (geography + keyword behind each Paid
+#             call's click row). MUST bump for the same reason as by_medium: a
+#             cached payload has no such key, and the Ads tab would show
+#             nothing where the two new sections belong.
+_METHODOLOGY_VERSION = "2026-09-04.1"
 
 
 def _group_data_version(clinic_ids: list[str]) -> str:
@@ -1244,6 +1248,124 @@ def get_line_item_calls(
     from intelligence_report.payloads import pms_integrated
     return {"calls": calls,
             "pms_integrated": pms_integrated(getattr(clinic, "pms_type", None))}
+
+
+# ── Web-form submissions (PHI — admin/super_admin only, audited) ─────────────
+
+@router.get("/intelligence/{clinic_id}/webform-submissions")
+def get_webform_submissions(
+    clinic_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 90,
+    limit: int = 2000,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Per-submission line items behind the Web forms tab's tiles: every web-form
+    submission in the window with the submitter's name (PMS record when matched,
+    else the form), email, clinic-local submit time, derived medium/source plus
+    the raw UTM fields, and the first PMS appointment created on/after it.
+    PHI (names, emails, patient ids) — admin/super_admin only, audited.
+
+    Not cached, like ``/calls``: a PHI list people act on must be current, and
+    the query is one BigQuery round-trip."""
+    clinic = _phi_clinic(db, clinic_id, caller)
+    window = _resolve_window(start, end, days)
+    limit = max(1, min(int(limit), 20000))
+
+    from intelligence_report.payloads import pms_integrated
+    from intelligence_report.queries import CALL_BOOKING_MATCH_DAYS, webform_submission_detail
+
+    _loc = getattr(clinic, "location", None)
+    rows = webform_submission_detail(
+        clinic_id, window=window, limit=limit,
+        clinic_tz=getattr(_loc, "time_zone", None))
+    log_phi_access(
+        clinic_id=clinic_id,
+        action="webform_submissions",
+        actor=caller.get("email") or caller.get("uid") or "unknown",
+        outcome="ok",
+        detail=f"n={len(rows)}",
+    )
+    return {
+        "submissions": rows,
+        "pms_integrated": pms_integrated(getattr(clinic, "pms_type", None)),
+        "match_days": CALL_BOOKING_MATCH_DAYS,
+        "window": {"start": window.start_date, "end": window.end_date_excl},
+    }
+
+
+@router.get("/intelligence/group/{instance_id}/webform-submissions")
+def get_group_webform_submissions(
+    instance_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 90,
+    limit: int = 2000,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Instance-wide web-form submissions — every location's rows in one list,
+    each reconciled against ITS OWN clinic's PMS patients (a submitter is never
+    matched across locations) and tagged with the clinic. Same gates as
+    ``/group/{instance_id}/calls``: multi-location only, admin/super_admin,
+    audited."""
+    instance = db.get(Instance, instance_id)
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    require_write_access(instance_id, caller)
+    if not is_multi_location(db, instance_id):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    window = _resolve_window(start, end, days)
+    limit = max(1, min(int(limit), 20000))
+    clinics = db.execute(
+        select(Clinic.clinic_id, Clinic.clinic_name, Clinic.pms_type,
+               ClinicLocationDetails.time_zone)
+        .outerjoin(ClinicLocationDetails, ClinicLocationDetails.clinic_id == Clinic.clinic_id)
+        .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
+    ).all()
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from intelligence_report.payloads import pms_integrated
+    from intelligence_report.queries import CALL_BOOKING_MATCH_DAYS, webform_submission_detail
+
+    def _one(spec) -> list[dict]:
+        clinic_id, clinic_name, _pms, tz = spec
+        rows = webform_submission_detail(clinic_id, window=window, limit=limit, clinic_tz=tz)
+        for r in rows:
+            r["clinic_id"] = clinic_id
+            r["clinic_name"] = clinic_name
+        return rows
+
+    # Independent BigQuery reads, so fan out; the reader itself fails safe to []
+    # per clinic. Like the calls table this is a list people work from, so a
+    # clinic that errors is visible in the server log rather than silently short —
+    # but unlike calls the reader never raises, so the request cannot 500 on one
+    # location.
+    rows: list[dict] = []
+    if clinics:
+        with ThreadPoolExecutor(max_workers=min(8, len(clinics)),
+                                thread_name_prefix="group-webforms") as pool:
+            for part in pool.map(_one, clinics):
+                rows.extend(part)
+    rows.sort(key=lambda r: r.get("submitted_at_utc") or "", reverse=True)
+    rows = rows[:limit]
+    log_phi_access(
+        clinic_id=instance_id,
+        action="group_webform_submissions",
+        actor=caller.get("email") or caller.get("uid") or "unknown",
+        outcome="ok",
+        detail=f"clinics={len(clinics)} n={len(rows)}",
+    )
+    return {
+        "submissions": rows,
+        "pms_integrated": any(pms_integrated(c.pms_type) for c in clinics),
+        "match_days": CALL_BOOKING_MATCH_DAYS,
+        "window": {"start": window.start_date, "end": window.end_date_excl},
+    }
 
 
 class _OutcomeOverrideBody(BaseModel):

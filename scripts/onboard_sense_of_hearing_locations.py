@@ -26,12 +26,13 @@ Why the map is spelled out here rather than derived: 3 of the 14 option strings
 do not match the clinic name ("Limestone Hearing Care Centre (Kingston)" is
 clinic *Kingston*, "Mississauga (Eglinton)" is *Mississauga Central*, "St
 Catharines West" is *St. Catharines West*), so
-``configure_jotform_webhooks.py --locations --link-by-name`` would leave exactly
+``configure_jotform.py --locations --link-by-name`` would leave exactly
 those three unmapped. Writing all 14 keeps the group's map in one reviewable
 place.
 
-Run this BEFORE adding the form's webhook — leads arriving in between all land
-on the default clinic.
+Run this BEFORE registering the form (or activating its registry row) — the ETL
+poller (``jotform-ingest``) starts ingesting the moment the row is active, and
+leads arriving before the map exists all land on the default clinic.
 
 Usage
 -----
@@ -39,8 +40,10 @@ Usage
     PYTHONPATH=. python scripts/onboard_sense_of_hearing_locations.py
     PYTHONPATH=. python scripts/onboard_sense_of_hearing_locations.py --apply
 
-    # then, once this reports clean:
-    python configure_jotform_webhooks.py --form 262174010008038 --apply
+    # then, once this reports clean, register/activate the form in the admin UI
+    # (clinic → Campaigns → Jotform); the poller picks it up on its next tick.
+    # Hidden UTM fields, if the form lacks them:
+    python configure_jotform.py --with-utm --form 262174010008038 --apply
 """
 from __future__ import annotations
 
@@ -245,8 +248,9 @@ def main() -> None:
         for option in stale:
             print(f"  ! existing row not in this map, left alone: {option}")
 
-    print("\nNext: python configure_jotform_webhooks.py --form "
-          f"{FORM_ID} --apply    # adds the webhook")
+    print("\nNext: register/activate the form in the admin UI (clinic → Campaigns → "
+          "Jotform); jotform-ingest polls it on its next 15-min tick. Hidden UTM "
+          f"fields if missing: python configure_jotform.py --with-utm --form {FORM_ID} --apply")
 
 
 if __name__ == "__main__":

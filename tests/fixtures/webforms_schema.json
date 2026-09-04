@@ -1,0 +1,142 @@
+[
+  {
+    "name": "clinic_id",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "clinic_name",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "first_name",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "last_name",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "phone_number",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "email",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "utm_source",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "utm_medium",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "utm_campaign",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "utm_term",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "utm_content",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "gclid",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "fbclid",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "gbraid",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "wbraid",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "gad_campaignid",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "referrer_host",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "landing_page",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "customer_type",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "message",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "submitted_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "form_id",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "form_title",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "raw_fields",
+    "type": "JSON",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "pretty",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "submission_id",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "ingest_source",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "ingested_at",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  }
+]

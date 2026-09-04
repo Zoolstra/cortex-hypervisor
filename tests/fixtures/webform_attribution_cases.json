@@ -1,0 +1,72 @@
+{
+  "_comment": "PARITY FIXTURE — byte-identical copies live in cortex-data-ingestion/app/test_fixtures/ and cortex-hypervisor/tests/fixtures/. Pins jotform/parse.py::{utm,attribution} to api/webforms.py::{_utm,_attribution}. `expect_*` values are subsets: every listed key must equal; unlisted keys are unchecked. Change a rule in BOTH repos and update BOTH copies.",
+  "cases": [
+    {
+      "name": "click ids read from the landing URL when no field sent them",
+      "fields": {"landing_page": "/brand-official-cec?matchtype=p&keyword=hearing%20places&gad_source=1&gad_campaignid=22788881937&gbraid=0AAAAADmeCYZRgOvoUrY7oEIU5gZjT70N5&gclid=Cj0KCQjw7eXT"},
+      "expect_attribution": {"gad_campaignid": "22788881937", "gbraid": "0AAAAADmeCYZRgOvoUrY7oEIU5gZjT70N5", "gclid": "Cj0KCQjw7eXT", "wbraid": null, "fbclid": null}
+    },
+    {
+      "name": "explicit field beats the URL; URL still fills the gaps",
+      "fields": {"gclid": "from-field", "landing_page": "/x?gclid=from-url&gbraid=g1"},
+      "expect_attribution": {"gclid": "from-field", "gbraid": "g1"}
+    },
+    {
+      "name": "nan and blank sentinels are absent",
+      "fields": {"gclid": "nan", "landing_page": "/x?fbclid=nan&gbraid="},
+      "expect_attribution": {"gclid": null, "fbclid": null, "gbraid": null}
+    },
+    {
+      "name": "no landing page at all",
+      "fields": {"landing_page": null},
+      "expect_attribution": {"gclid": null, "gbraid": null, "wbraid": null, "fbclid": null, "gad_campaignid": null},
+      "expect_utm": {"utm_source": null, "referrer_host": null}
+    },
+    {
+      "name": "referrer host smuggled in utm_source is moved out",
+      "fields": {"utm_source": "google.com", "landing_page": "/contact"},
+      "expect_utm": {"utm_source": null, "referrer_host": "google.com"}
+    },
+    {
+      "name": "genuine utm whose value looks like a host is kept (provenance wins)",
+      "fields": {"utm_source": "chatgpt.com", "landing_page": "/contact?utm_source=chatgpt.com"},
+      "expect_utm": {"utm_source": "chatgpt.com", "referrer_host": null}
+    },
+    {
+      "name": "URL params beat the form field",
+      "fields": {"utm_source": "google.com", "landing_page": "/lp?utm_source=newsletter&utm_medium=email"},
+      "expect_utm": {"utm_source": "newsletter", "utm_medium": "email", "referrer_host": null}
+    },
+    {
+      "name": "direct is a referrer",
+      "fields": {"utm_source": "direct", "landing_page": "/"},
+      "expect_utm": {"utm_source": null, "referrer_host": "direct"}
+    },
+    {
+      "name": "android package name is a referrer",
+      "fields": {"utm_source": "com.google.android.googlequicksearchbox", "landing_page": "/"},
+      "expect_utm": {"utm_source": null, "referrer_host": "com.google.android.googlequicksearchbox"}
+    },
+    {
+      "name": "plain campaign source passes through",
+      "fields": {"utm_source": "spring-promo", "landing_page": "/"},
+      "expect_utm": {"utm_source": "spring-promo", "referrer_host": null}
+    },
+    {
+      "name": "explicit referrer_host from a fixed site is honoured",
+      "fields": {"utm_source": null, "referrer_host": "google.com", "landing_page": "/contact"},
+      "expect_utm": {"utm_source": null, "referrer_host": "google.com"}
+    },
+    {
+      "name": "explicit referrer_host wins over the salvaged one",
+      "fields": {"utm_source": "bing.com", "referrer_host": "google.com", "landing_page": "/"},
+      "expect_utm": {"utm_source": null, "referrer_host": "google.com"}
+    },
+    {
+      "name": "whitespace-padded values are trimmed",
+      "fields": {"utm_source": "  promo  ", "utm_campaign": " ", "gclid": "  abc "},
+      "expect_utm": {"utm_source": "promo", "utm_campaign": null},
+      "expect_attribution": {"gclid": "abc"}
+    }
+  ]
+}

@@ -1,63 +1,45 @@
 #!/usr/bin/env python3
 """
-Provision Jotform lead-capture: webhooks + hidden UTM fields, per clinic.
+Jotform lead-form maintenance: hidden UTM fields, the location map, drift audit.
 
-Wires Jotform-hosted lead forms into ``ClinicData.webforms`` by (a) adding a
-webhook that POSTs each submission to ``/webforms/jotform/{clinic_id}`` and
-(b) optionally adding the hidden UTM fields that carry campaign attribution.
-Idempotent: existing webhooks/fields are detected and left alone, so re-runs
-are safe.
+Submissions are INGESTED by the ETL job ``jotform-ingest``
+(``cortex-data-ingestion/app/jotform/``), which polls the Jotform API for every
+form in the Cloud SQL ``jotform_forms`` registry. Registering a form (admin UI →
+clinic → Campaigns → type ``jotform``, or ``POST /campaigns/{clinic_id}``) IS the
+wiring — there is no webhook to provision any more (removed 2026-09-04; see
+``resources/jotform-api-polling-plan.md``). What still has to be done on the
+Jotform side, and what this script does:
 
-The form → clinic mapping lives in Cloud SQL ``jotform_forms`` (alembic 0019)
-— the registry shared with the admin UI (campaign type ``jotform``) and the
-``GET /webforms/coverage`` health endpoint. This script only READS it (except
-``--discover --apply``, which backfills it); add or remove mappings via the
-admin UI or ``POST /campaigns/{clinic_id}``.
+  --with-utm       add the hidden UTM/click-id fields the site prefills through
+                   the iframe URL (idempotent; prints paste-ready <input> tags for
+                   INLINED forms)
+  --locations      a group's shared form asks the patient which site they want:
+                   reconcile its live dropdown options against
+                   ``jotform_form_locations`` and report/record what is unmapped
+  --discover       drift audit: forms in the account with submissions in the last
+                   90 days that are NOT registered (their leads land nowhere), and
+                   registered forms Jotform no longer knows
+  --remove-webhooks residue check: report/delete any hypervisor-pointing webhook
+                   still on a registered form (none should exist)
 
 Why a script and not the claude.ai Jotform connector: that connector is
-READ-ONLY (its OAuth token 401s on webhook/field creation). Management calls
-need a real Jotform API key with full access.
+READ-ONLY (its OAuth token 401s on field creation). Management calls need a real
+Jotform API key with full access.
 
 Credentials
 -----------
 - Jotform API key: env ``JOTFORM_API_KEY`` or Secret Manager ``jotform-api-key``.
-  Create one at Jotform → Settings → API → Create New Key (Full Access), for the
-  account that owns the forms (the shared "Dean_Matt" agency account).
-- Webhook shared secret: Secret Manager ``webform-webhook-secret`` (same secret
-  the hypervisor validates on the ``token`` query param).
 - Cloud SQL: standard ADC (same as running the hypervisor locally).
 
 Usage
 -----
     cd cortex-hypervisor && source venv/bin/activate
 
-    # Preview every change without writing (default is dry-run):
-    python configure_jotform_webhooks.py
-
-    # Apply webhooks only:
-    python configure_jotform_webhooks.py --apply
-
-    # Apply webhooks AND add hidden UTM fields:
-    python configure_jotform_webhooks.py --apply --with-utm
-
-    # Restrict to one form:
-    python configure_jotform_webhooks.py --apply --form 261767450350053
-
-    # Location map: a form serving a whole group asks which site the patient
-    # wants. Compare the form's live location options against
-    # jotform_form_locations and report what is unmapped:
-    python configure_jotform_webhooks.py --locations
-    python configure_jotform_webhooks.py --locations --apply
-    # …and additionally link options whose leading label is EXACTLY a clinic
-    # name of the same instance (the rest still need mapping by hand):
-    python configure_jotform_webhooks.py --locations --apply --link-by-name
-
-    # Audit: scan EVERY form in the Jotform account for webhooks pointing at
-    # the hypervisor and report drift against the registry, both directions.
-    # With --apply, forms wired in Jotform but missing from the registry are
-    # inserted (clinic_id is recovered from the webhook URL path):
-    python configure_jotform_webhooks.py --discover
-    python configure_jotform_webhooks.py --discover --apply
+    python configure_jotform.py --with-utm                  # dry-run
+    python configure_jotform.py --with-utm --apply [--form 261767450350053]
+    python configure_jotform.py --locations [--apply] [--link-by-name] [--form ID]
+    python configure_jotform.py --discover
+    python configure_jotform.py --remove-webhooks [--apply]
 
 Notes
 -----
@@ -68,12 +50,12 @@ Notes
   exact ``q{qid}_{name}`` input tags to paste into the inlined form component.
 - IFRAME forms (Alto/Prairie) only need the server-side hidden fields; the site
   appends the params to the iframe URL and Jotform prefills by unique name.
-- A webhook URL names ONE clinic. For a group running every site off one form
+- A registry row names ONE clinic. For a group running every site off one form
   that clinic is only a default: ``jotform_form_locations`` maps the patient's
-  "choose your location" answer to a clinic and ``api/webforms.py`` re-points the
-  row. ``--locations`` maintains that map. Wiring the webhook without it sends
-  the whole group's leads to the default clinic — on the Sense of Hearing form
-  that is 86% of them.
+  "choose your location" answer to a clinic and the ETL re-points the row.
+  ``--locations`` maintains that map. Registering a group's form without it
+  sends the whole group's leads to the default clinic — on the Sense of Hearing
+  form that is 86% of them.
 """
 import argparse
 import json
@@ -98,8 +80,8 @@ HYPERVISOR = "https://cortex-hypervisor-45007506504.us-central1.run.app"
 # than in the registry.
 INLINED_FORMS = {"261767450350053", "261766594045062"}
 
-# Jotform unique names the hypervisor parser reads (api/webforms.py::_parse_jotform
-# tracking()). Order preserved for stable field ordering on the form.
+# Jotform unique names the ETL parser reads (cortex-data-ingestion/app/jotform/
+# parse.py::parse_fields → tracking()). Order preserved for stable field ordering.
 UTM_FIELDS = [
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     # Google sends gbraid (cross-device) or wbraid (iOS post-ATT) INSTEAD of a
@@ -113,7 +95,8 @@ UTM_FIELDS = [
     "landing_page",
 ]
 
-# clinic_id sits in the webhook URL path: .../webforms/jotform/{clinic_id}?token=…
+# The retired webhook URL shape, still matched by --remove-webhooks so any
+# straggler can be found: .../webforms/jotform/{clinic_id}?token=…
 _WEBHOOK_CLINIC = re.compile(r"/webforms/jotform/([0-9a-fA-F-]{36})")
 
 
@@ -137,14 +120,66 @@ def _request(method: str, path: str, api_key: str, fields: dict | None = None) -
         return json.loads(resp.read().decode())
 
 
-def _webhook_url(clinic_id: str, secret: str) -> str:
-    return f"{HYPERVISOR}/webforms/jotform/{clinic_id}?token={secret}"
+
+
+def _form_webhooks_indexed(form_id: str, api_key: str) -> dict[str, str]:
+    """``{webhook_index: url}`` — the index is what ``DELETE …/webhooks/{id}`` takes."""
+    existing = _request("GET", f"/form/{form_id}/webhooks", api_key).get("content") or []
+    # content is a dict {index: url} or a list depending on Jotform version.
+    if isinstance(existing, dict):
+        return {str(k): v for k, v in existing.items()}
+    return {str(i): u for i, u in enumerate(existing)}
 
 
 def _form_webhooks(form_id: str, api_key: str) -> list[str]:
-    existing = _request("GET", f"/form/{form_id}/webhooks", api_key).get("content") or []
-    # content is a dict {index: url} or a list depending on Jotform version.
-    return list(existing.values()) if isinstance(existing, dict) else list(existing)
+    return list(_form_webhooks_indexed(form_id, api_key).values())
+
+
+def remove_webhooks(form_filter: str | None, api_key: str, apply: bool) -> None:
+    """Delete every hypervisor-pointing webhook from the registered forms.
+
+    Was the cutover step of the webhook → API-polling move (run 2026-09-04: seven
+    hooks removed). Kept as a residue check — the endpoint they pointed at no
+    longer exists, so a straggler would only produce 404s in the hypervisor log.
+    Only URLs matching ``_WEBHOOK_CLINIC`` on the hypervisor host are touched —
+    a form may carry unrelated webhooks (Zapier, email tools) that must survive.
+    Inactive registry rows are included: a stale webhook on a form we stopped
+    polling would otherwise keep pushing into a table nothing reconciles.
+    """
+    registry = [r for r in _load_registry()
+                if not form_filter or r["form_id"] == form_filter]
+    if not registry:
+        sys.exit("No registered form matches "
+                 f"{form_filter!r}." if form_filter else "No registered forms.")
+
+    mode = "APPLY" if apply else "DRY-RUN (use --apply to write)"
+    print(f"=== Jotform webhook removal — {mode} ===\n")
+    removed = kept = 0
+    for r in registry:
+        form_id = r["form_id"]
+        print(f"form {form_id}  ({r['clinic_name']} — {r['title']!r})")
+        try:
+            hooks = _form_webhooks_indexed(form_id, api_key)
+        except Exception as exc:
+            print(f"  ! webhook fetch failed: {exc}\n")
+            continue
+        if not hooks:
+            print("  no webhooks\n")
+            continue
+        for idx, url in hooks.items():
+            if HYPERVISOR in url and _WEBHOOK_CLINIC.search(url):
+                if apply:
+                    _request("DELETE", f"/form/{form_id}/webhooks/{idx}", api_key)
+                    print(f"  - REMOVED  [{idx}] …/webforms/jotform/{_WEBHOOK_CLINIC.search(url).group(1)}")
+                else:
+                    print(f"  - WOULD REMOVE [{idx}] …/webforms/jotform/{_WEBHOOK_CLINIC.search(url).group(1)}")
+                removed += 1
+            else:
+                kept += 1
+                print(f"  ✓ kept     [{idx}] {url[:80]}  (not ours)")
+        print()
+    verb = "removed" if apply else "would remove"
+    print(f"{verb} {removed} hypervisor webhook(s); {kept} unrelated webhook(s) left alone.")
 
 
 def _load_registry() -> list[dict]:
@@ -167,18 +202,6 @@ def _load_registry() -> list[dict]:
             for f, clinic_name in rows
         ]
 
-
-def ensure_webhook(form_id: str, clinic_id: str, secret: str, api_key: str, apply: bool) -> None:
-    urls = _form_webhooks(form_id, api_key)
-    target = _webhook_url(clinic_id, secret)
-    if any(clinic_id in u and "/webforms/jotform/" in u for u in urls):
-        print(f"  webhook  ✓ already set ({len(urls)} hook(s))")
-        return
-    if not apply:
-        print(f"  webhook  + WOULD ADD -> …/webforms/jotform/{clinic_id}")
-        return
-    _request("POST", f"/form/{form_id}/webhooks", api_key, {"webhookURL": target})
-    print(f"  webhook  + ADDED -> …/webforms/jotform/{clinic_id}")
 
 
 def ensure_utm_fields(form_id: str, api_key: str, apply: bool) -> dict:
@@ -347,78 +370,79 @@ def locations(form_filter: str | None, api_key: str, apply: bool,
             print()
 
 
-def discover(api_key: str, apply: bool) -> None:
-    """Audit Jotform ↔ registry drift, both directions.
+def discover(api_key: str, apply: bool, recent_days: int = 90) -> None:
+    """Audit registry ↔ Jotform account drift, both directions.
 
-    Walks every non-deleted form in the account (one webhook call per form —
-    slow on the 150+-form agency account, expect a minute or two) and extracts
-    hypervisor-pointing webhooks. Reports:
-      - wired in Jotform but missing from the registry (--apply inserts them)
-      - registered active but with NO webhook on the Jotform side (fix by
-        running the default provisioning mode)
+    Since ingestion is polled from the registry, the drift that matters is:
+      - a form in the account that is COLLECTING submissions (``last_submission``
+        within ``recent_days``) but is not registered — its leads reach nobody.
+        Reported with its title so it can be registered in the admin UI; this
+        script cannot guess the clinic, so ``--apply`` does nothing here.
+      - a registered form the account no longer has (deleted/moved) — the poller
+        will fail on it every run until the row is deactivated. ``--apply``
+        deactivates those rows.
+    One ``/user/forms`` call; no per-form requests.
     """
     registry = {r["form_id"]: r for r in _load_registry()}
+    forms = {str(f["id"]): f for f in
+             (_request("GET", "/user/forms?limit=1000", api_key).get("content") or [])
+             if f.get("status") != "DELETED"}
+    print(f"account: {len(forms)} form(s); registry: {len(registry)} row(s)\n")
 
-    forms = _request("GET", "/user/forms?limit=1000", api_key).get("content") or []
-    forms = [f for f in forms if f.get("status") != "DELETED"]
-    print(f"Scanning {len(forms)} form(s) for hypervisor webhooks…\n")
-
-    wired: dict[str, dict] = {}  # form_id -> {clinic_id, title}
-    for f in forms:
-        form_id = str(f.get("id"))
-        try:
-            urls = _form_webhooks(form_id, api_key)
-        except Exception as exc:
-            print(f"  ! {form_id} webhook fetch failed: {exc}")
+    import datetime as _dt
+    cutoff = _dt.datetime.now() - _dt.timedelta(days=recent_days)
+    unregistered_active = []
+    for fid, f in forms.items():
+        if fid in registry:
             continue
-        for u in urls:
-            m = _WEBHOOK_CLINIC.search(u)
-            if m and HYPERVISOR in u:
-                wired[form_id] = {"clinic_id": m.group(1), "title": f.get("title")}
+        last = f.get("last_submission")
+        try:
+            last_dt = _dt.datetime.strptime(last, "%Y-%m-%d %H:%M:%S") if last else None
+        except ValueError:
+            last_dt = None
+        if last_dt and last_dt >= cutoff:
+            unregistered_active.append((last_dt, fid, f.get("title"), f.get("count")))
 
-    missing_from_registry = {fid: w for fid, w in wired.items() if fid not in registry}
-    not_wired = [r for r in registry.values() if r["active"] and r["form_id"] not in wired]
+    if unregistered_active:
+        print(f"Collecting submissions in the last {recent_days}d but NOT registered "
+              "(register in the admin UI if it is a CORTEX clinic's form):")
+        for last_dt, fid, title, count in sorted(unregistered_active, reverse=True):
+            print(f"  {fid}  last {last_dt:%Y-%m-%d}  total {count:>5}  {title!r}")
+    else:
+        print(f"No unregistered form has collected submissions in the last {recent_days}d.")
 
-    print(f"Jotform-side wirings found: {len(wired)}")
-    for fid, w in sorted(wired.items()):
-        mark = "✓ registered" if fid in registry else "✗ NOT IN REGISTRY"
-        print(f"  {fid}  clinic {w['clinic_id']}  {w['title']!r}  {mark}")
-
-    if not_wired:
-        print("\nRegistered active but NO webhook on Jotform (run default mode to fix):")
-        for r in not_wired:
-            print(f"  {r['form_id']}  {r['clinic_name']}  {r['title']!r}")
-
-    if missing_from_registry:
-        verb = "Inserting" if apply else "WOULD insert (use --apply)"
-        print(f"\n{verb} {len(missing_from_registry)} registry row(s):")
+    gone = [r for r in registry.values() if r["form_id"] not in forms]
+    if gone:
+        verb = "Deactivating" if apply else "WOULD deactivate (use --apply)"
+        print(f"\nRegistered but no longer in the account — {verb}:")
         with session_scope() as db:
-            for fid, w in sorted(missing_from_registry.items()):
-                clinic = db.get(Clinic, w["clinic_id"])
-                if clinic is None or clinic.deleted_at is not None:
-                    print(f"  ! {fid} webhook targets unknown clinic {w['clinic_id']} — skipped")
-                    continue
-                print(f"  {fid} -> {clinic.clinic_name} ({w['title']!r})")
-                if apply:
-                    db.add(JotformForm(
-                        clinic_id=w["clinic_id"],
-                        jotform_form_id=fid,
-                        form_title=w["title"],
-                    ))
-
-    if not missing_from_registry and not not_wired:
-        print("\nRegistry and Jotform agree — no drift.")
+            for r in gone:
+                print(f"  {r['form_id']}  {r['clinic_name']}  {r['title']!r}"
+                      f"{'' if r['active'] else '  (already inactive)'}")
+                if apply and r["active"]:
+                    row = db.execute(select(JotformForm).where(
+                        JotformForm.jotform_form_id == r["form_id"])).scalar_one()
+                    row.active = False
+    else:
+        print("\nEvery registered form still exists in the account.")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Provision Jotform webhooks + UTM fields.")
+    ap = argparse.ArgumentParser(
+        description="Jotform lead-form maintenance (UTM fields, location map, drift audit).")
     ap.add_argument("--apply", action="store_true", help="write changes (default: dry-run)")
-    ap.add_argument("--with-utm", action="store_true", help="also add hidden UTM fields")
     ap.add_argument("--form", help="only this form_id")
-    ap.add_argument("--discover", action="store_true",
-                    help="audit Jotform↔registry drift; with --apply, backfill registry rows")
-    ap.add_argument("--locations", action="store_true",
-                    help="reconcile each form's location options against jotform_form_locations")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--with-utm", action="store_true",
+                      help="add the hidden UTM/click-id fields to each registered form")
+    mode.add_argument("--locations", action="store_true",
+                      help="reconcile each form's location options against jotform_form_locations")
+    mode.add_argument("--discover", action="store_true",
+                      help="audit registry ↔ account drift (unregistered collecting forms; "
+                           "registered forms that are gone — --apply deactivates those)")
+    mode.add_argument("--remove-webhooks", action="store_true",
+                      help="residue check: delete any hypervisor-pointing webhook still on a "
+                           "registered form")
     ap.add_argument("--link-by-name", action="store_true",
                     help="with --locations --apply: also link an option whose leading "
                          "label is exactly a clinic name of the same instance")
@@ -432,15 +456,14 @@ def main() -> None:
     if args.discover:
         discover(api_key, args.apply)
         return
-
+    if args.remove_webhooks:
+        remove_webhooks(args.form, api_key, args.apply)
+        return
     if args.locations:
         locations(args.form, api_key, args.apply, args.link_by_name)
         return
 
-    secret = (get_secret("webform-webhook-secret") or "").strip()
-    if not secret:
-        sys.exit("No webform-webhook-secret in Secret Manager.")
-
+    # --with-utm
     registry = _load_registry()
     if args.form:
         registry = [r for r in registry if r["form_id"] == args.form]
@@ -448,21 +471,19 @@ def main() -> None:
             sys.exit(f"{args.form} not in the jotform_forms registry "
                      "(add it via the admin UI or POST /campaigns).")
 
-    mode = "APPLY" if args.apply else "DRY-RUN (use --apply to write)"
-    print(f"=== Jotform provisioning — {mode} ===\n")
+    mode_s = "APPLY" if args.apply else "DRY-RUN (use --apply to write)"
+    print(f"=== Jotform hidden UTM fields — {mode_s} ===\n")
     for r in registry:
         if not r["active"]:
             print(f"form {r['form_id']}  ({r['clinic_name']} — {r['title']!r})  SKIPPED: inactive\n")
             continue
         print(f"form {r['form_id']}  ->  clinic {r['clinic_id']}  ({r['clinic_name']} — {r['title']!r})")
-        ensure_webhook(r["form_id"], r["clinic_id"], secret, api_key, args.apply)
-        if args.with_utm:
-            qids = ensure_utm_fields(r["form_id"], api_key, args.apply)
-            if r["form_id"] in INLINED_FORMS and args.apply:
-                print("  ↳ INLINED form — paste these hidden inputs into the site's <form>:")
-                for name, qid in qids.items():
-                    print(f'       <input type="hidden" id="input_{qid}" '
-                          f'name="q{qid}_{name}" data-utm="{name}" />')
+        qids = ensure_utm_fields(r["form_id"], api_key, args.apply)
+        if r["form_id"] in INLINED_FORMS and args.apply:
+            print("  ↳ INLINED form — paste these hidden inputs into the site's <form>:")
+            for name, qid in qids.items():
+                print(f'       <input type="hidden" id="input_{qid}" '
+                      f'name="q{qid}_{name}" data-utm="{name}" />')
         print()
 
 

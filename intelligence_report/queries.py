@@ -1126,6 +1126,250 @@ def webform_appointments(clinic_id: str, days: int = 90, window: "Window | None"
     return out
 
 
+def _landing_path(url: str | None) -> str | None:
+    """Reduce a landing URL to its path for display: drop scheme + host and the
+    query string (which is where the raw UTM/click-id soup lives — that is
+    already broken out into its own columns). ``'/'`` stays ``'/'``."""
+    s = (url or "").strip()
+    if not s or s.lower() in _UTM_NOISE:
+        return None
+    if "://" in s:
+        s = s.split("://", 1)[1]
+        s = s[s.find("/"):] if "/" in s else "/"
+    s = s.split("?", 1)[0].split("#", 1)[0]
+    return s or "/"
+
+
+def webform_submission_detail(
+    clinic_id: str,
+    days: int = 90,
+    window: "Window | None" = None,
+    match_days: int = CALL_BOOKING_MATCH_DAYS,
+    clinic_tz: str | None = None,
+    limit: int = 2000,
+) -> list[dict[str, Any]]:
+    """Per-submission line items behind :func:`webform_appointments` — one row per
+    web-form submission in the window, reconciled to the PMS the same way the
+    tiles are, so the list and the counts above it cannot disagree.
+
+    **PHI.** Rows carry the submitter's name and email and, when matched, the PMS
+    patient's name and opaque ``client_id``. The endpoint is admin-gated and
+    audited; this function never logs a row.
+
+    Reconciliation (identical to the tile query): submitter → patient on phone
+    last-10 OR email against ``patient_contacts``; "first appointment after" is
+    the earliest appointment CREATED on/after the submission date across every
+    patient record the submitter matched — no upper bound, exactly as the
+    "Led to an appointment" tile counts, with ``within_match_window`` flagging the
+    ``match_days`` (call-leg) reading so the two figures beside each other agree.
+
+    Name: the PMS record's ``given_name``/``surname`` when matched (the record
+    with the appointment wins if the submitter matched several), else what they
+    typed into the form. ``name_source`` says which.
+
+    UTM: rather than five mostly-empty columns (measured 2026-09-04 over 283
+    submissions: utm_source 8%, utm_campaign 3%, referrer_host 35%, click ids
+    9%), each row gets the same derived ``medium`` (:func:`_form_medium_case_sql`,
+    the TRAFFIC_CHANNELS vocabulary) and ``source`` (Google Ads campaign name via
+    ``gad_campaignid`` → genuine ``utm_source`` → "via <referrer>" → unattributed)
+    that :func:`webform_drivers` charts, plus the raw ``utm`` fields for the
+    detail view. Free-text ``message`` and the Appointments ``title``/``notes``
+    columns are deliberately not selected (staff-entered clinical text).
+
+    Fails safe to ``[]`` (never raises).
+    """
+    w = _win(window, days)
+    noise = ", ".join(f"'{n}'" for n in _UTM_NOISE)
+    sql = f"""
+        WITH f AS (
+          SELECT
+            ROW_NUMBER() OVER (ORDER BY submitted_at, email, phone_number)  AS form_idx,
+            submitted_at, first_name, last_name, email, phone_number,
+            customer_type, form_title,
+            utm_source, utm_medium, utm_campaign, utm_term, utm_content,
+            referrer_host, landing_page,
+            gclid, gbraid, wbraid, fbclid, gad_campaignid,
+            LOWER(TRIM(IFNULL(utm_medium, '')))                             AS fum,
+            LOWER(TRIM(IFNULL(referrer_host, '')))                          AS fref,
+            IF(utm_source IS NULL OR LOWER(TRIM(utm_source)) IN ({noise}),
+               NULL, TRIM(utm_source))                                      AS futm,
+            NULLIF(NULLIF(gad_campaignid, ''), 'nan')                       AS gad,
+            RIGHT(REGEXP_REPLACE(IFNULL(phone_number, ''), r'\\D', ''), 10) AS phone_norm,
+            LOWER(TRIM(IFNULL(email, '')))                                  AS email_norm,
+            DATE(submitted_at)                                              AS submitted_date
+          FROM `{_CLINIC_DATA}.webforms`
+          WHERE clinic_id = @clinic_id
+            AND {_ts_between("submitted_at", w)}
+        ),
+        camps AS (
+          SELECT CAST(google_ads_campaign_id AS STRING) AS cid,
+                 ANY_VALUE(campaign_name) AS nm
+          FROM `{_CLINIC_DATA}.ad_clicks_v2`
+          WHERE google_ads_campaign_id IS NOT NULL
+          GROUP BY cid
+        ),
+        patients AS (
+          SELECT DISTINCT client_id, phone_norm, email_norm
+          FROM `{_PATIENT_CONTACTS}`
+          WHERE _clinic_id = @clinic_id
+        ),
+        -- One row per (submission, matched patient record), remembering which
+        -- key matched so the UI can say "by phone" / "by email".
+        matched AS (
+          SELECT f.form_idx, f.submitted_date, p.client_id,
+                 LOGICAL_OR(LENGTH(f.phone_norm) = 10 AND f.phone_norm = p.phone_norm) AS by_phone,
+                 LOGICAL_OR(f.email_norm != ''        AND f.email_norm = p.email_norm) AS by_email
+          FROM f
+          JOIN patients p
+            ON (LENGTH(f.phone_norm) = 10 AND f.phone_norm = p.phone_norm)
+            OR (f.email_norm != ''        AND f.email_norm = p.email_norm)
+          GROUP BY f.form_idx, f.submitted_date, p.client_id
+        ),
+        -- Appointments CREATED on/after the submission (the tile's rule).
+        -- `title`/`notes` are free-text and may carry clinical notes: not selected.
+        appt AS (
+          SELECT m.form_idx, m.client_id,
+                 a.event_type, a.start_time, a.status_2, a.location_name, a.practitioner,
+                 SAFE_CAST(a.created_time AS TIMESTAMP) AS created_ts
+          FROM matched m
+          JOIN `{_BP}.Appointments` a
+            ON a._clinic_id = @clinic_id
+           AND a.client_id = m.client_id
+           AND DATE(SAFE_CAST(a.created_time AS TIMESTAMP)) >= m.submitted_date
+        ),
+        first_appt AS (
+          SELECT * EXCEPT (rn) FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY form_idx ORDER BY created_ts, start_time) AS rn
+            FROM appt
+          ) WHERE rn = 1
+        ),
+        -- The patient record to NAME the row after: the one that booked, else
+        -- any matched record (deterministic on client_id).
+        named AS (
+          SELECT form_idx, client_id FROM (
+            SELECT m.form_idx, m.client_id,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY m.form_idx
+                     ORDER BY IF(fa.client_id IS NOT NULL, 0, 1), m.client_id) AS rn
+            FROM matched m
+            LEFT JOIN first_appt fa
+              ON fa.form_idx = m.form_idx AND fa.client_id = m.client_id
+          ) WHERE rn = 1
+        ),
+        match_stats AS (
+          SELECT form_idx,
+                 COUNT(DISTINCT client_id) AS n_clients,
+                 LOGICAL_OR(by_phone)      AS by_phone,
+                 LOGICAL_OR(by_email)      AS by_email
+          FROM matched GROUP BY form_idx
+        ),
+        demo AS (
+          SELECT client_id,
+                 ANY_VALUE(given_name) AS given_name,
+                 ANY_VALUE(surname)    AS surname
+          FROM `{_BP}.ClientDemographics`
+          WHERE _clinic_id = @clinic_id
+            AND client_id IN (SELECT client_id FROM named)
+          GROUP BY client_id
+        )
+        SELECT
+          f.submitted_at,
+          FORMAT_DATETIME('%Y-%m-%d %H:%M', DATETIME(f.submitted_at, @clinic_tz)) AS submitted_local,
+          f.first_name, f.last_name, f.email, f.phone_number,
+          f.customer_type, f.form_title,
+          f.utm_source, f.utm_medium, f.utm_campaign, f.utm_term, f.utm_content,
+          f.referrer_host, f.landing_page,
+          ({_form_medium_case_sql()})                                         AS medium,
+          COALESCE(cm.nm, f.futm,
+                   IF(f.fref = '', NULL, CONCAT('via ', f.fref)),
+                   'unattributed')                                           AS source,
+          cm.nm                                                              AS ad_campaign_name,
+          ({" OR ".join(_real_id_sql(f"f.{c}") for c in ("gclid", "gbraid", "wbraid"))}) AS has_click_id,
+          ms.n_clients, ms.by_phone, ms.by_email,
+          nm.client_id, d.given_name, d.surname,
+          fa.event_type, fa.start_time, fa.status_2, fa.location_name, fa.practitioner,
+          fa.created_ts,
+          DATE_DIFF(DATE(fa.created_ts), f.submitted_date, DAY)              AS lag_days
+        FROM f
+        LEFT JOIN camps cm        ON cm.cid = f.gad
+        LEFT JOIN match_stats ms  USING (form_idx)
+        LEFT JOIN named nm        USING (form_idx)
+        LEFT JOIN demo d          ON d.client_id = nm.client_id
+        LEFT JOIN first_appt fa   USING (form_idx)
+        ORDER BY f.submitted_at DESC
+        LIMIT {int(max(1, min(limit, 20000)))}
+    """
+    try:
+        rows = list(_client().query(
+            sql,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=_params(clinic_id, clinic_tz=clinic_tz or "UTC")),
+        ).result())
+    except Exception as exc:
+        log.warning("webform_submission_detail failed clinic=%s: %s", clinic_id, exc)
+        return []
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        matched = bool(r.client_id)
+        pms_name = " ".join(s for s in ((r.given_name or "").strip(), (r.surname or "").strip()) if s)
+        form_name = " ".join(s for s in ((r.first_name or "").strip(), (r.last_name or "").strip()) if s)
+        if matched and pms_name:
+            display, name_source = pms_name, "pms"
+        else:
+            display, name_source = (form_name or None), "form"
+        if r.by_phone and r.by_email:
+            matched_on = "phone+email"
+        elif r.by_phone:
+            matched_on = "phone"
+        elif r.by_email:
+            matched_on = "email"
+        else:
+            matched_on = None
+        first_appt = None
+        if r.created_ts is not None:
+            lag = int(r.lag_days) if r.lag_days is not None else None
+            first_appt = {
+                "start_time": r.start_time,
+                "event_type": r.event_type,
+                "status": r.status_2,
+                "location_name": r.location_name,
+                "practitioner": r.practitioner,
+                "created_at": str(r.created_ts),
+                "lag_days": lag,
+                "within_match_window": lag is not None and lag <= int(match_days),
+            }
+        out.append({
+            "submitted_at": r.submitted_local,
+            "submitted_at_utc": str(r.submitted_at) if r.submitted_at else None,
+            "display_name": display,
+            "name_source": name_source,
+            "form_name": form_name or None,
+            "pms_name": pms_name or None,
+            "email": (r.email or "").strip() or None,
+            "phone_masked": _mask_phone(r.phone_number),
+            "customer_type": r.customer_type,
+            "form_title": r.form_title,
+            "matched": matched,
+            "client_id": r.client_id,
+            "matched_on": matched_on,
+            "matched_patients": int(r.n_clients or 0),
+            "medium": r.medium,
+            "source": r.source,
+            "ad_campaign_name": r.ad_campaign_name,
+            "has_click_id": bool(r.has_click_id),
+            "utm": {
+                "source": r.utm_source, "medium": r.utm_medium,
+                "campaign": r.utm_campaign, "term": r.utm_term, "content": r.utm_content,
+            },
+            "referrer_host": r.referrer_host,
+            "landing_page": _landing_path(r.landing_page),
+            "first_appointment": first_appt,
+        })
+    return out
+
+
 def webform_appointments_group(
     clinic_ids: list[str], days: int = 90, window: "Window | None" = None,
 ) -> dict[str, Any]:
@@ -2193,6 +2437,168 @@ def ad_click_attribution(
         "no_gclid": no_gclid_ce + no_gclid_web,
         "campaigns": campaigns,
     }
+
+
+def paid_click_breakdown(
+    clinic_id: str,
+    invoca_campaign_ids: list[str],
+    google_ads_campaign_ids: list[str],
+    days: int = 90,
+    window: "Window | None" = None,
+) -> dict[str, Any]:
+    """Where the clinic's Paid calls came from and which keywords drove them,
+    read off the ``ad_clicks_v2`` row behind each call — with the share of Paid
+    calls that HAVE such a row stated explicitly. Powers the Ads tab's
+    geography and keyword sections.
+
+    Population and match rule are :func:`ad_click_attribution`'s, so
+    ``paid_calls`` equals its ``paid_calls`` and ``with_click_data`` equals its
+    ``matched``: non-spam calls deduped per ``complete_call_id``, classified
+    ``Paid`` by :func:`_channel_case_sql`, joined on gclid to a click for one of
+    the clinic's linked Google Ads campaigns. The click set is not
+    window-bounded (same reason as there), and a gclid that appears on more
+    than one click row is de-fanned to one row per call.
+
+    Geography is the click's ``area_of_interest`` city — Google's inferred
+    location of interest, not the caller's phone location — resolved through
+    ``ClinicData.geo_targets`` to a name and, where the loader could place it,
+    a coordinate. A click with no city but a region falls back to the region
+    (a province or state), which carries no coordinate. A click with neither
+    counts under ``geo.unknown``. Keywords are ``keyword_info.text``; clicks
+    without one (Performance Max, display) count under ``keywords.unknown``.
+
+    Every list is complete, not top-N: the group rollup sums per-clinic rows
+    and a per-clinic truncation would not be additive. Shape::
+
+        {"paid_calls", "with_click_data", "no_click_data",
+         "geo": {"places": [{"id", "name", "region", "country",
+                             "lat", "lon", "calls"}], "unknown"},
+         "keywords": {"keywords": [{"keyword", "match_type", "calls"}],
+                      "unknown"}}
+
+    ``no_click_data + with_click_data == paid_calls``; ``sum(places.calls) +
+    geo.unknown == with_click_data``; likewise for keywords. Empty Invoca list
+    → all-zero shell.
+    """
+    empty: dict[str, Any] = {
+        "paid_calls": 0, "with_click_data": 0, "no_click_data": 0,
+        "geo": {"places": [], "unknown": 0},
+        "keywords": {"keywords": [], "unknown": 0},
+    }
+    if not invoca_campaign_ids:
+        return empty
+
+    w = _win(window, days)
+    scope = _spam_scope_clause(invoca_campaign_ids, days, window=w)
+    join_cs = _callscoring_join_sql()
+    not_spam = _non_spam_predicate_sql()
+    channel_case = _channel_case_sql()
+    ga_filter = (
+        "ac.google_ads_campaign_id IN (" + ", ".join(f"'{c}'" for c in google_ads_campaign_ids) + ")"
+        if google_ads_campaign_ids else "FALSE"
+    )
+
+    def geo_id(col: str) -> str:
+        return f"SAFE_CAST(REGEXP_EXTRACT(ac.{col}, r'geoTargetConstants/(\\d+)') AS INT64)"
+
+    sql = f"""
+        WITH calls AS (
+          SELECT
+            complete_call_id, gclid, has_gclid,
+            {channel_case} AS channel
+          FROM (
+            SELECT
+              t.complete_call_id,
+              t.gclid, t.wbraid, t.gbraid, t.msclkid, t.fbclid,
+              LOWER(t.utm_medium) AS um, LOWER(t.utm_source) AS us, t.marketing_channel,
+              {_real_id_sql("t.gclid")} AS has_gclid
+            FROM `{_CLINIC_DATA}.transactions` t
+            {join_cs}
+            WHERE {scope}
+              AND {not_spam}
+            QUALIFY ROW_NUMBER() OVER (
+              PARTITION BY t.complete_call_id ORDER BY t.timestamp DESC) = 1
+          )
+        ),
+        paid AS (SELECT * FROM calls WHERE channel = 'Paid'),
+        matched AS (
+          -- One click row per call: a gclid can appear on more than one row.
+          SELECT
+            p.complete_call_id,
+            {geo_id("click_view_area_of_interest_city")}   AS city_id,
+            {geo_id("click_view_area_of_interest_region")} AS region_id,
+            NULLIF(NULLIF(TRIM(ac.click_view_keyword_info_text), ''), 'nan') AS keyword,
+            ac.click_view_keyword_info_match_type AS match_type
+          FROM paid p
+          INNER JOIN `{_CLINIC_DATA}.ad_clicks_v2` ac
+            ON ac.click_view_gclid = p.gclid
+           AND {ga_filter}
+          WHERE p.has_gclid
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY p.complete_call_id ORDER BY ac.timestamp DESC, ac.campaign_name) = 1
+        ),
+        placed AS (
+          -- City first; a click that carries only a region resolves to that.
+          SELECT
+            m.complete_call_id, m.keyword, m.match_type,
+            COALESCE(gc.criterion_id, gr.criterion_id)     AS geo_id,
+            COALESCE(gc.canonical_name, gr.canonical_name) AS canonical_name,
+            gc.latitude, gc.longitude
+          FROM matched m
+          LEFT JOIN `{_CLINIC_DATA}.geo_targets` gc ON gc.criterion_id = m.city_id
+          LEFT JOIN `{_CLINIC_DATA}.geo_targets` gr ON gr.criterion_id = m.region_id
+        )
+        SELECT 'total' AS dim, NULL AS key, NULL AS label, NULL AS sub,
+               NULL AS lat, NULL AS lon, COUNT(*) AS calls
+        FROM paid
+        UNION ALL
+        SELECT 'matched', NULL, NULL, NULL, NULL, NULL, COUNT(*) FROM matched
+        UNION ALL
+        SELECT 'geo', CAST(g.geo_id AS STRING), g.canonical_name, NULL,
+               ANY_VALUE(g.latitude), ANY_VALUE(g.longitude), COUNT(*)
+        FROM placed g GROUP BY g.geo_id, g.canonical_name
+        UNION ALL
+        SELECT 'kw', k.keyword, k.keyword, ANY_VALUE(k.match_type), NULL, NULL, COUNT(*)
+        FROM placed k GROUP BY k.keyword
+    """
+    rows = list(_client().query(sql).result())
+    out: dict[str, Any] = {
+        "paid_calls": 0, "with_click_data": 0, "no_click_data": 0,
+        "geo": {"places": [], "unknown": 0},
+        "keywords": {"keywords": [], "unknown": 0},
+    }
+    for r in rows:
+        n = int(r.calls or 0)
+        if r.dim == "total":
+            out["paid_calls"] = n
+        elif r.dim == "matched":
+            out["with_click_data"] = n
+        elif r.dim == "geo":
+            if r.key is None:
+                out["geo"]["unknown"] += n
+                continue
+            # canonical_name is "City,[County,]Region,Country"; the region is the
+            # second-to-last part and the display name the first.
+            parts = [p.strip() for p in (r.label or "").split(",") if p.strip()]
+            out["geo"]["places"].append({
+                "id": r.key,
+                "name": parts[0] if parts else r.key,
+                "region": parts[-2] if len(parts) >= 3 else None,
+                "country": parts[-1] if len(parts) >= 2 else None,
+                "lat": float(r.lat) if r.lat is not None else None,
+                "lon": float(r.lon) if r.lon is not None else None,
+                "calls": n,
+            })
+        elif r.dim == "kw":
+            if r.key is None:
+                out["keywords"]["unknown"] += n
+                continue
+            out["keywords"]["keywords"].append(
+                {"keyword": r.key, "match_type": r.sub, "calls": n})
+    out["no_click_data"] = max(out["paid_calls"] - out["with_click_data"], 0)
+    out["geo"]["places"].sort(key=lambda p: (-p["calls"], p["name"]))
+    out["keywords"]["keywords"].sort(key=lambda k: (-k["calls"], k["keyword"]))
+    return out
 
 
 def ad_clicks_keywords(

@@ -2,77 +2,134 @@
 
 ## Overview
 
-REST API for clinic and user management. Account/config data lives in **Cloud SQL (MySQL 8, SQLAlchemy + Alembic)** — the `clinics` table and its per-clinic config children (`clinic_blueprint_config`, `clinic_counselear_config`, `clinic_worklist_taxonomy`, voice-agent tables, …). BigQuery is used for analytics/PHI reads (ETL-written `ClinicData.*`, `Blueprint_PHI.*`) and the `Users.phi_access_log` audit trail. Firebase handles authentication. (Historical note: the config store was migrated off BigQuery to Cloud SQL — ignore older "BigQuery is the only data store" phrasing.)
+REST API for clinic and user management, the intelligence-report engine, the voice-agent lifecycle, and the external data feed.
+
+Account/config data lives in **Cloud SQL (MySQL 8.4, SQLAlchemy 2.0 + Alembic, database `clients`)** — `instances`, `clinics` and their 1:1/1:N children (`clinic_location_details`, `clinic_voice_agent_configuration` and the other voice-agent tables, `clinic_worklist_taxonomy`, `instance_pms_config` + `pms_clinic_locations`, `google_ads_campaigns` / `invoca_campaigns` / `jotform_forms` + `jotform_form_locations`, `clinic_admins`). Schema at alembic head `0032`.
+
+BigQuery holds analytics and PHI — **read** for `ClinicData.*` / `Blueprint_PHI.*` / `CounselEar_PHI.*` (usually via the `PMS_Unified.*` views), and **written** for exactly five tables: `ClinicData.webforms`, `ClinicData.call_outcome_overrides`, `ClinicData.faq_embeddings`, `Users.voice_agent_tickets` and the `Users.phi_access_log` audit trail. The dashboard's `/v2` readers use a second Cloud SQL database, `marts`. Firebase handles authentication.
+
+(Historical note: the config store was migrated off BigQuery to Cloud SQL in 2026-05. Ignore older "BigQuery is the only data store" phrasing anywhere in `resources/`.)
 
 ## Commands
 
 ```bash
-uvicorn api:app --reload                              # Dev server (port 8000)
-python -m pytest test_api.py -v                      # Run all tests
-python -m pytest test_api.py::ClassName::method -v -s # Run single test
+venv/bin/uvicorn api:app --reload --port 8000    # Dev server — needs Cloud SQL IAM auth (root ../dev.sh auth)
+venv/bin/python -m pytest tests -q               # Run all tests (33 modules, ~670 tests, ~35s)
+venv/bin/python -m pytest tests/test_v2_auth.py::test_new_external_user_gets_viewer -v -s
+alembic upgrade head                             # Migrate Cloud SQL (online only — see alembic/env.py)
+./dev.sh                                         # ⚠️ DEPLOY: build + push + `gcloud run services update` — not a dev helper
+python configure_jotform.py --discover|--with-utm|--locations [--apply]  # Jotform registry drift / hidden UTM fields / location map
+python configure_promo_numbers.py                # Sync Invoca promo numbers → invoca_promo_numbers
 ```
+
+The venv here is `venv/` (no dot). The ETL repo's is `.venv/` — they differ.
+
+### Running tests without live ADC
+
+`api/core/secrets.py` builds its client at import time and `deps.py` fetches the Firebase SA at import time, so `pytest` needs working ADC (`gcloud auth application-default login`) and hits Secret Manager on every run. **No stub is checked in** — there is no `conftest.py` and no pytest config file in this repo, so the fix below has to be written locally when you need it. When ADC is stale, a pytest plugin that replaces `secretmanager.SecretManagerServiceClient` in `pytest_configure` (plugins load before collection) unblocks the suite — the fake must return a service account whose `private_key` is a real generated RSA key, or `credentials.Certificate(...)` rejects it.
 
 ## Stack
 
 - FastAPI, Python 3.12, Pydantic v2
-- Google BigQuery (sole data store — all reads/writes go through BQ)
+- **Cloud SQL (MySQL 8.4)** — the account/config store. SQLAlchemy 2.0 ORM (`api/core/orm.py`), engine + IAM-auth connector in `api/core/db.py` (instance `project-demo-2-482101:us-central1:cortex-accounts`, database `clients`), schema managed by Alembic (`alembic/versions/`, 32 migrations, head `0032`).
+- **Google BigQuery** — analytics and PHI reads plus the five application writes listed above.
 - Firebase Admin SDK (token verification + custom claims for roles)
+- VAPI (`vapi_server_sdk`) for the voice agent; Twilio for staff SMS alerts; Anthropic Claude for report narrative.
 
 ## Project Layout
 
 ```
 api/
-  __init__.py         # FastAPI app, CORS middleware, router registration
-  models.py           # All Pydantic request/response models
-  deps.py             # Shared dependencies: BQ client, auth helpers, bq_insert/update/delete
-  routers/
-    instance.py       # Instance provisioning and lookup
-    clinics.py        # Clinic CRUD
-    staff.py          # Staff CRUD
-    services.py       # Service CRUD
-    insurance.py      # Insurance CRUD
-    users.py          # Instance user management
-    appointment_types.py
-    review_snapshots.py   # GBP review snapshot ingestion
-    websites.py           # STUB — not implemented, remove from __init__.py (see 2-E)
-    blueprint.py          # STUB — not imported yet, do not use
+  __init__.py         # FastAPI app, CORS, logging; router registration — ORDER MATTERS
+                      #   (v2 first, then voice_agent, worklists, account, intelligence,
+                      #    webforms, datafeed; see the comment in the file)
+  deps.py             # bq_client, bq_table, verify_token, require_read/write_access
+  models.py           # Pydantic request bodies (config / provisioning / webform shapes)
+  audit.py            # PHI access audit log -> Users.phi_access_log
+  intelligence.py     # /intelligence/* dashboard payloads + the payload cache (21 routes)
+  worklists.py        # /clinics/{id}/worklists/* reactivation cohorts, CSV export,
+                      #   Customer.io sync (12 routes)
+  webforms.py         # POST /webforms (JSON relay from our own sites), GET /webforms/coverage.
+                      #   Jotform forms are ingested by the ETL's jotform-ingest job, not here.
+  datafeed.py         # GET /datafeed/v1/{instance_id}/* — external client data feed
+  core/
+    db.py             # Cloud SQL engine/session (connector + IAM auth)
+    orm.py            # SQLAlchemy models — every Cloud SQL table (24)
+    secrets.py        # Secret Manager get_secret() (lru_cache'd)
+    grouping.py       # is_multi_location() — the derived multi-location rule
+  account/            # instances, clinics, campaigns, pms_config, customerio_config,
+                      #   worklist_taxonomy, readiness  (+ provisioning.py, not a router)
+  v2/                 # auth (set-claims), admin_users, provision, intelligence; marts.py (query module)
+  voice_agent/        # voice_agent.py + blueprint.py routers; factory / roles / vapi /
+                      #   twilio / capabilities / faq_retrieval / appointment_decision services;
+                      #   pms/ (PMSAdapter + adapters); protocols/ (14 registered)
+  services/           # customerio.py (Track API), notify.py (staff SMS/email on tickets)
+intelligence_report/  # BigQuery readers + payload builders (queries, payloads,
+                      #   group_aggregate, group_queries [unused], active_leads,
+                      #   clinic_hours, report, transcripts, load_geo_targets, prewarm)
+scripts/              # prewarm_payloads, parity_harness, copy_pms_secrets_to_instance,
+                      #   resync_acna_assistant, …
+alembic/versions/     # 32 migrations, head 0032
+tests/                # 33 pytest modules
 ```
 
-## Active Routers (registered in `__init__.py`)
+## Cloud SQL tables (`api/core/orm.py`, database `clients`)
 
-| Router | Base path |
+| Group | Tables |
 |---|---|
-| instance | `/provision_account/`, `/instance/{uid}` |
-| clinics | `/clinics/{instance_id}`, `/clinics/{clinic_id}` |
-| staff | `/staff/{instance_id}`, `/staff/{instance_id}/{clinic_id}/{name}` |
-| services | `/services/{instance_id}`, `/services/{service_id}` |
-| insurance | `/insurance/{instance_id}`, `/insurance/{insurance_id}` |
-| users | `/users/{instance_id}`, `/users/{uid}` |
-| appointment_types | `/appointment_types/{instance_id}`, `/appointment_types/{appointment_type_id}` |
-| review_snapshots | `/review_snapshots/{instance_id}` |
-| pms_config (`api/account/pms_config.py`) | **Two scopes.** Per clinic: `GET/POST/DELETE /clinics/{clinic_id}/pms` (→ `clinic_blueprint_config` + `clinic_{clinic_id}_blueprint_*` secrets). Per **account**, for one PMS login serving several locations: `GET/POST/DELETE /instances/{instance_id}/pms` (→ `instance_pms_config` + `pms_clinic_locations` + `instance_{instance_id}_blueprint_*`). See PMS config scopes below. |
-| worklist_taxonomy (`api/account/worklist_taxonomy.py`) | `GET/PUT /clinics/{clinic_id}/worklist-taxonomy` — per-clinic reactivation cohort config (JSON on `clinic_worklist_taxonomy`, validated by `WorklistTaxonomyConfig`). Consumed by `api/worklists.py`: `/worklists/cohorts`, `/worklists/cohort/{key}`, `/worklists/cohort/{key}/export.csv` (contact CSV, super_admin+admin, PHI-audit-logged), `/worklists/pms-taxonomy` (discovery). |
+| Account | `instances`, `clinics`, `clinic_location_details` (1:1, holds the seven `hours_<weekday>` strings + `time_zone`), `clinic_admins` (uid × instance grants — **no clinic_id**) |
+| PMS | `instance_pms_config` (account credentials-config + `primary_clinic_id`, keyed `(instance_id, pms_type)`), `pms_clinic_locations` (vendor location → clinic, `prompt_for_location`, `booking_user_id`), `clinic_blueprint_config` / `clinic_counselear_config` (**deprecated by 0030, read by nothing**) |
+| Voice agent | `clinic_voice_agent_configuration`, `clinic_voice_agent_script`, `..._persona`, `..._caller_bucket`, `..._qualifying_question`, `..._faq`, `clinic_protocols` (source of truth), `voice_agent_capabilities` (legacy, dual-written for rollback), `clinic_blueprint_entity_note` |
+| Campaigns / leads | `google_ads_campaigns`, `invoca_campaigns`, `invoca_promo_numbers`, `jotform_forms`, `jotform_form_locations` (0032) |
+| Worklists | `clinic_worklist_taxonomy`, `customerio_enrollments` |
 
-`websites.router` is imported and registered but the router is empty — remove it (see Pending Work 2-E).
+Schema is Alembic-managed: `alembic/versions/`, 32 migrations, head `0032`. Migrations run **online only** against the live instance with IAM auth (`alembic upgrade head`); offline mode is refused in `alembic/env.py`. `./dev.sh` ships the image only — migrate separately.
+
+`clinics.deleted_at` is a soft delete: **every** query must filter `deleted_at IS NULL`. `clinics.pms_type` is `Enum("blueprint", "counselear", "audit_data", "none")`.
+
+## Routers (126 application routes)
+
+Registration order in `api/__init__.py` is load-bearing: `/v2` first (all-literal prefix), then voice-agent and worklists (literal segments), then account (whose `GET /clinics/{instance_id}/{clinic_id}` wildcard would otherwise swallow them).
+
+| Router (module) | Paths |
+|---|---|
+| v2.auth | `POST /v2/auth/set-claims` |
+| v2.admin_users | `GET/POST /v2/admin/users`, `PATCH /v2/admin/users/{uid}/role`, `PUT /v2/admin/users/{uid}/instances`, `DELETE /v2/admin/users/{uid}` |
+| v2.provision | `POST /v2/admin/provision` |
+| v2.intelligence | `GET /v2/intelligence/{clinic_id}/overview` — mart-backed (Cloud SQL `marts.*` via `api/v2/marts.py`), additive to v1 |
+| voice_agent.voice_agent | `GET/POST/DELETE /clinics/{clinic_id}/voice_agent` + `/activate`, `/assistant`, `/verify_caller_id`, `/tickets`, `/capabilities[/{id}]`, `/script`, `/persona`, `/caller_buckets[/{id}]`, `/qualifying_questions[/{id}]`, `/faqs[/{id}]`, `/faqs/import`, `/faq/search` |
+| voice_agent.blueprint | `/blueprint/{clinic_id}/…` — clinic-config, patient lookup/match/journal, appointment-types, availability(+find/search), appointments book/confirm/cancel/reschedule/locate, appointment-decision, locations, notes, placeholder/* (19 routes) |
+| worklists | `GET /clinics/{clinic_id}/worklists/{cohorts,cohort/{key},cohort/{key}/export.csv,pms-taxonomy,callscoring-categories,fitting-no-purchase,lapsed-patients,qualified-leads,recall-due,upgrade-candidates,warranty-expiring}`, `POST /clinics/{clinic_id}/worklists/cohort/{key}/customerio-sync` |
+| account.instances | `POST /provision_account/`, `GET/DELETE /instance/{uid}`, `PATCH /instance/{instance_id}`, `GET /instances`, `GET /instances/{instance_id}` |
+| account.readiness | `GET /instances/{instance_id}/readiness` |
+| account.pms_config | `GET/POST/DELETE /instances/{id}/pms`, `GET /instances/{id}/pms/discover`, `POST /instances/{id}/pms/locations/import`, `GET /clinics/{clinic_id}/pms` (read-only) |
+| account.customerio_config | `GET/POST/DELETE /clinics/{clinic_id}/customerio` |
+| account.worklist_taxonomy | `GET/PUT /clinics/{clinic_id}/worklist-taxonomy` |
+| account.clinics | `GET/POST /clinics/{instance_id}`, `GET /clinics/{instance_id}/{clinic_id}`, `PATCH/DELETE /clinics/{clinic_id}`, `GET /clinics/{clinic_id}/etl_status`, `GET /clinics/{clinic_id}/instance` |
+| account.campaigns | `GET /campaigns/{instance_id}[/{clinic_id}]`, `POST /campaigns/{clinic_id}`, `DELETE /campaigns/{campaign_type}/{campaign_id}`, `GET /campaigns_catalog/{campaign_type}/{instance_id}`, `GET /campaigns/{instance_id}/jotform/locations`, `GET/PUT /campaigns/jotform/{form_id}/locations` |
+| intelligence | `GET /intelligence/{clinic_id}/{overview,biweekly,calls,active-leads,pipeline-revenue,leak-calls}`, `PUT /intelligence/{clinic_id}/calls/{call_id}/outcome`, `GET /intelligence/{clinic_id}/calls/{call_id}/transcript`, `POST /intelligence/{clinic_id}/patients/search`, `GET /intelligence/{clinic_id}/patients/{patient_key}/journey`, four `*.html` drill-downs + `report.html`, and `GET /intelligence/group/{instance_id}/{overview,calls,active-leads,pipeline-revenue}` |
+| webforms | `POST /webforms`, `GET /webforms/coverage` (the Jotform webhook relay was retired 2026-09-04) |
+| datafeed | `GET /datafeed/v1/{instance_id}/{dictionary,google-ads/campaigns,google-ads/ad-groups,google-ads/clicks,invoca/transactions,invoca/callscoring}` |
+
+The `staff`, `services`, `insurance`, `users`, `appointment_types`, `review_snapshots` and `websites` routers were deleted along with their tables.
 
 ## `deps.py` — Shared Utilities
 
-All routers import from `deps.py`. Do not instantiate a BigQuery client anywhere else.
+All routers import auth helpers from `deps.py`. Do not instantiate a BigQuery client anywhere else.
 
 ```python
-bq_client          # Single BigQuery client instance
-bq_table(table)    # Returns backtick-quoted `PROJECT.DATASET.table`
-bq_insert(table, rows)           # Parameterized INSERT
-bq_update(table, where, updates) # Parameterized UPDATE, raises 409 on streaming buffer
-bq_delete(table, where)          # Parameterized DELETE, raises 409 on streaming buffer
-get_instance_id_or_404(...)      # Lookup helper with 404
+PROJECT = "project-demo-2-482101"
+DATASET = "Users"
+bq_client          # the single BigQuery client (ADC)
+bq_table(table)    # backtick-quoted `PROJECT.Users.table` — Users dataset ONLY;
+                   #   ClinicData / Blueprint_PHI callers build their own refs
 verify_token(token)              # Firebase ID token verification (FastAPI dependency)
 require_read_access(instance_id, caller)
 require_write_access(instance_id, caller)
-get_instance_id_for_uid(uid)
+get_instance_id_for_uid(uid)     # reads Cloud SQL
 ```
 
-**Planned addition (3-C):** `bq_select(table, where) -> list[dict]` — eliminates the identical 6-line SELECT pattern repeated across all routers.
+There are no `bq_insert` / `bq_update` / `bq_delete` helpers — config CRUD is SQLAlchemy against Cloud SQL (`api/core/db.py::get_session`, `api/core/orm.py`). The handful of BigQuery writes each build their own statement: `insert_rows_json` in `api/webforms.py` and `api/audit.py`, DML in `api/voice_agent/voice_agent.py` (tickets), `intelligence_report/queries.py::set_call_outcome_override` (the append-only override INSERT behind `PUT /intelligence/{clinic_id}/calls/{call_id}/outcome`), and `api/voice_agent/faq_retrieval.py` (a MERGE — DML deliberately, so the streaming buffer never blocks a rewrite).
 
 ## Auth & Roles
 
@@ -118,9 +175,23 @@ The SPA surfaces all of this at `/admin/users` (`cortex-spa/src/routes/AdminUser
 reachable from a super-admin-only button on `/`. The client-side role check is
 convenience; every call is gated server-side.
 
+`set_custom_user_claims` REPLACES the whole custom-claims object, so `role` must
+remain the only custom claim; adding a second without merging silently drops it.
+
+A claim change only takes effect when the user's **ID token refreshes** (≤1h, or
+immediately on sign-out/in) — role changes are not instant.
+
+> **KNOWN GAP.** The `@zoolstra.com` → `super_admin` rule reads `email` without
+> checking `email_verified`, and the project has `disabledUserSignup: false` with
+> no blocking functions. Anyone can self-register an unowned `@zoolstra.com`
+> address and be granted super_admin over every instance and all PHI. Requiring
+> `email_verified` is NOT a safe unilateral fix: 3 of the 4 current Zoolstra
+> accounts are unverified `password` accounts and would drop to `viewer`. Close
+> it by disabling self-signup, or verify those 3 accounts first.
+
 ### Provisioning (`api/v2/provision.py`)
 
-Re-homed from the Next app's `/api/admin/provision` server route, which needed
+Re-homed from the deleted Next app's `/api/admin/provision` server route, which needed
 the Firebase Admin SDK and so could not move to a static SPA — provisioning was
 simply missing from cortex-spa until this landed.
 
@@ -168,7 +239,7 @@ radius** — which is the organising principle, not a detail:
 
 | Scope | Route | Holds |
 |---|---|---|
-| Business | `/settings/instance/$instanceId` (`InstanceSettingsShell.tsx`) | Overview (config status + the location list), Details (`instance_name`, `google_ads_customer_id`, `invoca_profile_id`; Group Intelligence shown read-only since it is derived), PMS (account config + location map) |
+| Business | `/settings/instance/$instanceId` (`InstanceSettingsShell.tsx`) | Overview (config status + the location list), Details (`instance_name`, `google_ads_customer_id`, `invoca_profile_id`; Group Intelligence shown read-only since it is derived), PMS (account config + location map), Lead forms (Jotform location map) |
 | Location | `/settings/$clinicId` (`ClinicSettingsShell.tsx`) | Overview (cards, read-only PMS summary, ETL status), Details (`clinic_name` / address / phone / time zone / **hours**), Customer.io, Campaigns, Worklists, Voice Agent |
 
 The business fields used to be a panel on the *clinic* Details page, which meant
@@ -181,16 +252,14 @@ backwards.
 `instance_name` and `clinic_name` are mutable — neither was in its update model
 originally, so a typo from an onboarding call could only be fixed in Cloud SQL.
 Renaming is safe: **nothing joins on a name.** Scope, FKs, mart keys
-and the PMS secrets (`instance_{instance_id}_{pms}_{key}` — id-keyed, not
-the name-derived layout the root CLAUDE.md documented) all key on ids, and
-every other reader treats the name as a display label. Two spots are *not*
-retroactive: the live VAPI assistant keeps the old name in its prompt until
+and the PMS secrets (`instance_{instance_id}_{pms}_{key}` — id-keyed) all key on
+ids, and every other reader treats the name as a display label. Two spots are
+*not* retroactive: the live VAPI assistant keeps the old name in its prompt until
 republished, and `ClinicData.webforms` rows already written keep the name they
-were stamped with (a point-in-time record, not a stale copy). Neither had
-any home in the SPA before — the ids were Cloud-SQL-only, and the clinic fields
-were write-once at provisioning. Note `_reject_empty_string` on `ClinicUpdate` /
-the None-drop in `update_instance`: a value can be corrected but not blanked,
-which is why the UI only ever sends fields that actually changed.
+were stamped with (a point-in-time record, not a stale copy). Note
+`_reject_empty_string` on `ClinicUpdate` / the None-drop in `update_instance`: a
+value can be corrected but not blanked, which is why the UI only ever sends
+fields that actually changed.
 
 > **Clinic hours are load-bearing — do not "simplify" them out of the model.**
 > `clinic_location_details.hours_<weekday>` has three live consumers:
@@ -201,30 +270,13 @@ which is why the UI only ever sends fields that actually changed.
 > now" gate on active leads (`active_leads.py`). The KPI is inside the
 > methodology parity freeze (dashboard-rework-plan §1.2).
 
-### Running tests without live ADC
+### Onboarding readiness (`api/account/readiness.py`)
 
-`api/core/secrets.py` builds its client at import time and `deps.py` fetches the
-Firebase SA at import time, so `pytest` normally needs working ADC
-(`gcloud auth application-default login`) and hits Secret Manager on every run.
-When ADC is stale, a pytest plugin that replaces
-`secretmanager.SecretManagerServiceClient` in `pytest_configure` (plugins load
-before collection) unblocks the suite — the fake must return a service account
-whose `private_key` is a real generated RSA key, or
-`credentials.Certificate(...)` rejects it.
+`GET /instances/{instance_id}/readiness` composes the checks that must pass for a business to actually ingest, in the order they must pass, and says what breaks when each does not. Every field can be individually valid while the business as a whole ingests nothing — onboarding one four-location client produced five failures of exactly that shape (locations unmapped, ETL off, a rollup gated on a flag nobody flipped, a sync never re-run after a mapping change, an account's config wiped by a blank save).
 
-`set_custom_user_claims` REPLACES the whole custom-claims object, so `role` must
-remain the only custom claim; adding a second without merging silently drops it.
+It is deliberately a **reader**: every rule it reports already exists somewhere that enforces it (`core.grouping` for the rollup, the PMS validators for the map, the sync's unassigned counting for attribution). Restating a rule here would create a second definition of healthy that could drift from the one the pipeline applies.
 
-A claim change only takes effect when the user's **ID token refreshes** (≤1h, or
-immediately on sign-out/in) — role changes are not instant.
-
-> **KNOWN GAP.** The `@zoolstra.com` → `super_admin` rule reads `email` without
-> checking `email_verified`, and the project has `disabledUserSignup: false` with
-> no blocking functions. Anyone can self-register an unowned `@zoolstra.com`
-> address and be granted super_admin over every instance and all PHI. Requiring
-> `email_verified` is NOT a safe unilateral fix: 3 of the 4 current Zoolstra
-> accounts are unverified `password` accounts and would drop to `viewer`. Close
-> it by disabling self-signup, or verify those 3 accounts first.
+Statuses: `ok` | `warn` (works, but something downstream will be wrong or invisible) | `blocked` (nothing flows) | `unknown` (BigQuery unreachable — never a silent pass) | `skipped`.
 
 ## PMS configuration — account-level, for every vendor
 
@@ -285,7 +337,7 @@ reader would act on), a clinic from another instance, a catch-all beside real
 keys, a retired catch-all. It also sets `pms_type` on each mapped clinic —
 the ETL scopes an account to clinics of the matching PMS, so a mapping to a
 `pms_type='none'` clinic stores fine and ingests nothing. It deliberately does
-**not** touch `etl_enabled` (that gates Google Ads and Invoca too) and reports
+**not** touch `etl_enabled` (that gates the analyses and marts too) and reports
 `mapped_not_etl_enabled` instead.
 
 `locations` replaces the whole map when present and is left alone when omitted,
@@ -335,9 +387,11 @@ location the PMS does not report.
 
 `clinic_blueprint_config` and `clinic_counselear_config` are read by nothing and
 carry a table COMMENT saying so. Their rows are kept as 0030's rollback path and
-are dropped in a follow-up. **Do not add readers.** `configure_blueprint.py` was
-removed with them — it wrapped the deleted per-clinic endpoint, and the dashboard
-does the job.
+are dropped in a follow-up. **Do not add readers.** (The ETL's
+`count_legacy_pms_config` compares their row counts to the new tables purely to
+tell "nothing configured" from "migration not run yet".) `configure_blueprint.py`
+was removed with them — it wrapped the deleted per-clinic endpoint, and the
+dashboard does the job.
 
 Frontend: `cortex-spa/src/components/manage/InstancePmsSection.tsx` on
 `/settings/instance/$instanceId/pms`. The map lists the locations
@@ -349,16 +403,27 @@ editor.
 
 ## Jotform lead forms — one form, many clinics
 
-A Jotform webhook URL carries exactly one `clinic_id` in its path, so
-`jotform_forms` maps a form to one clinic. That is wrong for a group running
+> **Ingestion lives in the ETL (since 2026-09-04).** `cortex-data-ingestion/app/jotform/`
+> polls the Jotform API every 15 min (`jotform-ingest`) and owns the schema of
+> record for `ClinicData.webforms`; `api/webforms.py::WEBFORMS_SCHEMA` is a
+> mirror pinned to `tests/fixtures/webforms_schema.json` (byte-identical copy in
+> the ETL repo — `tests/test_webforms.py` checks both). Rows carry
+> `submission_id` / `ingest_source` / `ingested_at`. The webhook relay, its parser
+> and the location resolver were deleted from this repo; their ETL versions are
+> `jotform/parse.py` and `jotform/locations.py`. **This repo owns the registry,
+> the location map and their routes; the ETL owns the rows.** History:
+> `resources/jotform-api-polling-plan.md`.
+
+A `jotform_forms` row names exactly one clinic (historically because the
+webhook URL carried one `clinic_id`; now simply the form's DEFAULT clinic). That is wrong for a group running
 every site off a single lead form: Sense of Hearing's appointment-request form
 (262174010008038) serves all 14 Ontario locations, and of its first 78
 submissions only 11 chose Burlington — wiring it to the group's one existing
 clinic would have misattributed 86% of the leads.
 
 `jotform_form_locations` (alembic 0032) maps each "choose your location" answer
-to a clinic; `api/webforms.py::_resolve_location_clinic` applies it and the path
-clinic becomes the fallback. Three things about it are deliberate:
+to a clinic; the ETL's `jotform/locations.py::resolve_clinic` applies it and the
+registry's default clinic becomes the fallback. Three things about it are deliberate:
 
 - **The answer is matched verbatim, not parsed.** Option strings are marketing
   copy maintained in the Jotform builder and already disagree with our clinic
@@ -376,13 +441,14 @@ clinic becomes the fallback. Three things about it are deliberate:
   recording the option with no clinic is what makes that gap visible. Such a
   submission falls back to the form's clinic and the resolver logs it.
 
-Maintain the map with `configure_jotform_webhooks.py --locations` (dry-run by
+Maintain the map with `configure_jotform.py --locations` (dry-run by
 default; `--apply` records unmapped options with no clinic, `--link-by-name`
 also links options whose leading label is exactly a clinic name of the same
 instance) or through `GET`/`PUT /campaigns/jotform/{form_id}/locations`.
 
-Wire a group's webhook only after its map exists — the leads that arrive in
-between all land on the default clinic.
+Register a group's form only after its map exists — the leads that arrive in
+between all land on the default clinic (recoverable: the verbatim answer is in
+`raw_fields`).
 
 **In the dashboard.** *Business settings → Lead forms* (`/settings/instance/{id}/lead-forms`,
 `InstanceJotformSection.tsx`) is the editor; the per-clinic *Campaigns* tab keeps
@@ -392,7 +458,31 @@ a flag can never disagree with the rows that actually route. The clinic holding 
 group form's webhook sees it badged business-wide with the fallback explained;
 the other clinics get a read-only "Lead forms shared with this clinic" panel
 naming the exact answers that route to them — without which 13 of a 14-site
-group look like they have no lead form at all.
+group look like they have no lead form at all. (Copy in these components used to
+say "the clinic the webhook names"; it now says "the clinic the form is
+registered under".)
+
+## Intelligence payloads (`api/intelligence.py`) — the v1 read path
+
+The dashboard's read path: 21 routes, 16 per-clinic and 5 group. Per clinic: `overview`, `biweekly`, `calls`, `webform-submissions` (the Web forms tab's per-submission list — every submission in the window with PMS-or-form name, email, clinic-local time, derived medium/source + raw UTM, and the first appointment created on/after it; `queries.webform_submission_detail`, same reconciliation CTEs as the `webforms` tiles; admin-only, audited as `webform_submissions`), `active-leads`, `pipeline-revenue`, `leak-calls`, `PUT calls/{call_id}/outcome` (manual relabel → append-only `ClinicData.call_outcome_overrides` via `intelligence_report/queries.py::set_call_outcome_override`, then a JSON-cache clear), `GET calls/{call_id}/transcript`, `POST patients/search`, `GET patients/{patient_key}/journey`, `report.html` and four `*.html` drill-downs. Group: `overview`, `calls`, `webform-submissions`, `active-leads`, `pipeline-revenue`, each gated on `is_multi_location` and 404 (not 403) for a single-location instance.
+
+Heavy readers live in `intelligence_report/` (`queries.py` ≈ 7.9k lines for BigQuery, `payloads.py` for assembly, `group_aggregate.py` for the rollup, `active_leads.py`, `clinic_hours.py`). **`_call_tagging_cte` is the single shared per-call tagging CTE** — per-reader copies of tagging logic drift, which is why every funnel/table consumer composes this one. `MIN_WINDOW_DATE` and **`CALL_BOOKING_MATCH_DAYS = 10`** (widened from 3 in 2026-08 — bookings were being entered days after the call) are duplicated into `api/v2/marts.py` and `api/datafeed.py` (`_MATCH_DAYS`) rather than imported (importing pulls the BigQuery client into a SQLAlchemy-only layer); `tests/test_group_intelligence.py` pins the three together.
+
+**Cache keys.** Cached payloads key on `(clinic scope, window, pms_type, data_version, _METHODOLOGY_VERSION)`. `_data_version(clinic_id)` is the PMS snapshot date; `_group_data_version(clinic_ids)` is the `|`-joined composite, so a rollup invalidates when ANY member's data lands. `pms_type` is in the key because connecting a PMS rotates no data version and the disclosure would otherwise persist for the life of the entry. A GCS-backed shared layer (`PAYLOAD_SHARED_CACHE=0` to disable) exists because Cloud Run runs `--workers 1` and scales to zero.
+
+**Not cached:** `/calls`, `/webform-submissions` and every `*.html` route. Adding a cache tier to them is the prerequisite for warming them, not adding them to `scripts/prewarm_payloads.py`.
+
+When changing a metric definition, change it here **and** in `cortex-data-ingestion/app/marts/` — `resources/methodology-contract.md` governs parity and `scripts/parity_harness.py` proves it.
+
+### `/v2/intelligence` — the mart-backed reader
+
+`GET /v2/intelligence/{clinic_id}/overview` returns the v1 overview shape with named sections served from the **Cloud SQL `marts` database** instead of BigQuery; `_mart_backed` in the response says which sections came from the marts (`MART_SECTIONS = ("call_funnel", "call_outcomes_monthly", "call_funnel.matthew_split")`), and everything else falls through to v1. Additive by construction, so the SPA can move one reader at a time with `scripts/parity_harness.py` proving each swap. It is the only `/v2` intelligence route today.
+
+`api/v2/marts.py` holds the SQL. No second SQLAlchemy engine — the existing `clients` connection is reused and mart tables are schema-qualified (`marts.call_facts`), so the SA needs SELECT on `marts.*` (`cortex-data-ingestion/app/marts/README_GRANTS.sql`). Two invariants carried from the methodology contract: booking credit is window-relative and post-override, ranked per appointment `event_id`; and that rank is a SEMI-join, never a LEFT JOIN (a join fans out and inflates every count — this bug corrupted an impact report once). The `/v2` funnel does **not** implement `unconfirmed_booking`; it computes `qualified_not_booked` instead.
+
+The marts themselves are built by the ETL (`marts-build` / `marts-rc-build`) and pushed to Cloud SQL by `marts-sync-cloudsql` — a BigQuery build is invisible to `/v2` until that sync runs. The hypervisor is SELECT-only on `marts.*`; the dual-write of `call_outcome_overrides_current` that `README_GRANTS.sql` grants for was never built, so a relabel reaches `/v2` at the next nightly sync.
+
+**Registered FIRST** in `api/__init__.py`. The all-literal `/v2` prefix cannot swallow anything, and putting it ahead of the wildcard routers stops any future `/v2/...` path being captured by a root-level `GET /{clinic_id}/...` pattern.
 
 ## Group Intelligence (multi-location rollup)
 
@@ -403,12 +493,21 @@ same `OverviewView` and every clinic-page section exists on the group page by
 construction. Gated on the instance having **two or more clinics** — 404 (not
 403) for a single location, so the section is invisible rather than empty.
 
-**Derived, not a setting** (alembic 0031, `api/core/grouping.py`). It was a stored
-`instances.multi_location_group` flag a super_admin toggled, which restated what
-the data already said and could disagree with it: an instance provisioned with
-four locations kept 404ing its rollup because nobody flipped the switch. The rule
-now lives in one place because there are six readers (four rollup gates, two
-payload fields) and a derivation copied six times will eventually differ in one.
+**Derived, not a setting** (alembic 0031, `api/core/grouping.py::is_multi_location`, threshold `>= 2`). It was a stored `instances.multi_location_group` flag a super_admin toggled, which restated what the data already said and could disagree with it: an instance provisioned with four locations kept 404ing its rollup because nobody flipped the switch.
+
+Ten readers now use the derived rule — four rollup gates plus one payload field in `api/intelligence.py`, one in `api/v2/intelligence.py`, two in `api/account/readiness.py`, one in `api/account/clinics.py`, two in `api/account/instances.py`.
+
+> ⚠️ **The stored column has two readers left, and they are wrong.**
+> `scripts/prewarm_payloads.py` and `scripts/parity_harness.py` still
+> select group instances with `Instance.multi_location_group.is_(True)`.
+> Today three instances are multi-location by the derived rule (Calgary 4
+> clinics, Virsono 7, Sense of Hearing 14) but only Virsono carries the flag,
+> so **prewarm warms one group scope out of three** — Calgary's and Sense of
+> Hearing's rollup pages stay permanently cold, exactly the failure this file
+> describes below. Fix both call sites to use `is_multi_location` /
+> `is_multi_location_for_count`. (`cortex-data-ingestion/app/db.py::get_matthew_clinics`
+> reads the raw column on purpose — it scopes the Matthew transcript analysis,
+> not the rollup. Clearing the flag would silently stop that analysis.)
 
 Deleted clinics don't count. `etl_enabled` deliberately does **not** enter into
 it — whether a business *has* several locations is a different question from
@@ -479,75 +578,88 @@ otherwise narrate the zeros as a revenue collapse.
 what the report may claim, and connecting a clinic's PMS rotates no data version,
 so without it the disclosure would persist for the life of the cache entry.
 
-Frontend: `components/intelligence/PmsCoverage.tsx` (both apps) — a page-level
+Frontend: `cortex-spa/src/components/intelligence/PmsCoverage.tsx` — a page-level
 banner plus the inline replacements used wherever a suppressed figure sat. The
 funnel stops at "connected", ROAS/revenue columns are dropped rather than
 dashed, and the qualified-no-conversion leak is restated as an unverified
 follow-up list (nothing can confirm those callers didn't book later).
 
+## Client data feed (`api/datafeed.py`)
+
+Read-only REST feed of one instance's own Google Ads and Invoca data for external clients, mounted at `GET /datafeed/v1/{instance_id}/…`: `dictionary`, `google-ads/{campaigns,ad-groups,clicks}`, `invoca/{transactions,callscoring}`.
+
+**Auth is not Firebase.** A per-instance API key in `X-API-Key`, checked against the Secret Manager secret `datafeed-api-key-<instance_id>` — creating the secret IS enabling the feed, and rotating it needs a service restart (secrets are cached at import). Every query is additionally WHERE-scoped to the instance's `google_ads_customer_id` / `invoca_profile_id`, so a leaked key still cannot cross tenants. Anyone changing `verify_token` or CORS must remember this second, header-keyed auth path exists.
+
+`/invoca/callscoring` is the settled compute-on layer (classification + override-applied `verified_outcome` + PMS-reconciled `booked_verified`, same 10-day rule as `_call_tagging_cte`); the google-ads and transactions endpoints are the operational mirror. Transactions are deduped to one row per `complete_call_id` (the table is event-grained). `SCHEMA_VERSION = "1.4"` (bumped when the booking window widened 3 → 10). `calling_phone_number` is withheld unless the BAA gate secret `datafeed-caller-number-enabled-<instance_id>` exists. Client-facing docs: `resources/datafeed-api.md`. First consumer: Virsono Hearing Centres.
+
+## Customer.io — database-reactivation outbound
+
+`GET/POST/DELETE /clinics/{clinic_id}/customerio` (write-only config; status shows configured / not, DELETE disables the sync) and `POST /clinics/{clinic_id}/worklists/cohort/{cohort_key}/customerio-sync`.
+
+**One Customer.io workspace per clinic**, so credentials are per-clinic secrets — `customerio-site-id-<clinic_id>`, `customerio-track-api-key-<clinic_id>`, optional `customerio-region-<clinic_id>` (`eu`). Creating the pair IS enabling the sync; a clinic without them 409s before any patient is touched. Workspace-per-clinic also gives hard tenant isolation on the Customer.io side.
+
+CORTEX owns the audience, Customer.io owns the campaign: per enrolled patient the client (`api/services/customerio.py`) does exactly two things — `identify` (person id `{clinic_id}:{client_id}`, contact attributes + per-channel consent flags) and `track` (the enrollment event, default `tested_not_sold_lead`). `consent_blocks_send` is the authoritative gate: a patient opted out of every channel is never identified or evented at all.
+
+Sync is **dry-run by default**; live sends need `dry_run=false`. Send-once idempotency lives in Cloud SQL `customerio_enrollments` (alembic 0022). Cloud Scheduler authenticates with the shared `customerio-sync-secret` in an `X-CIO-Sync-Secret` header; human admins use their Firebase token.
+
+## Worklists (`api/worklists.py`, `api/account/worklist_taxonomy.py`)
+
+Per-clinic reactivation cohorts (tested-not-sold, fitted-not-sold, no-show, …) configured in the dashboard as validated JSON on `clinic_worklist_taxonomy` (alembic 0015; `WorklistTaxonomyConfig`). A clinic with no config row gets the single built-in default cohort (`_DEFAULT_TAXONOMY`). Read from the `PMS_Unified` views. Contact CSV export (`…/cohort/{key}/export.csv`) is super_admin/admin only and PHI-audit-logged. `/worklists/pms-taxonomy` is discovery (which appointment types / statuses the clinic's PMS actually uses).
+
+## PHI access audit log (`api/audit.py`)
+
+HIPAA §164.312(b) requires record-level audit controls. GCP Cloud Audit Logs capture table-level access; this records application-level intent — who looked up which patient record, for which clinic, and what happened.
+
+`log_phi_access(clinic_id=…, action=…, actor=…, patient_id=…, outcome=…, detail=…)` appends to `Users.phi_access_log` (partitioned by `DATE(accessed_at)`, created lazily on first use). The row carries **no direct PHI** — only the opaque PMS `client_id`, the clinic, action, actor, outcome and a small non-PHI note.
+
+Writes are best-effort: an audit failure must never break a live patient call, so insert errors are logged and swallowed. **Call it from every route that reads patient records** — the voice-agent Blueprint proxy (patient match / journal / appointment locate) and the worklist contact CSV export already do. PHI isolation is regression-tested by `tests/test_phi_isolation.py`.
+
 ## BigQuery Tables
 
-Managed by this service (in the `Users` dataset):
-- `instances`, `clinics`, `staff`, `services`, `insurance`, `users`, `appointment_types`, `review_snapshots`
+Config lives in Cloud SQL, **not** BigQuery. What this service touches in BigQuery:
 
-Read-only from this service (written by ETL):
-- `ClinicData.transactions`, `ClinicData.ad_clicks_v2`, `Blueprint.*`
+Written by this service:
+- `Users.voice_agent_tickets` — after-hours "take a message" tickets (DML INSERT, `api/voice_agent/voice_agent.py::submit_ticket`). Carries caller name, callback number, free-text summary, `blueprint_patient_id` — PHI, no retention policy.
+- `Users.phi_access_log` — PHI access audit trail, table created lazily (`api/audit.py`)
+- `ClinicData.webforms` — lead-form submissions from our own site backends, streamed (`api/webforms.py`, `POST /webforms`, `ingest_source = json_relay`). The ETL's `jotform-ingest` is the other writer and owns the schema.
+- `ClinicData.call_outcome_overrides` — manual call relabels, append-only (`api/intelligence.py` route → `intelligence_report/queries.py::set_call_outcome_override`). **The table must pre-exist or every call query returns blank.**
+- `ClinicData.faq_embeddings` — voice-agent FAQ serving layer, MERGE on approval (`api/voice_agent/faq_retrieval.py`); searched with `VECTOR_SEARCH` mid-call by the `faq_lookup` protocol
 
-## Data Models (`models.py`)
+Read-only (written by the ETL in `cortex-data-ingestion/`):
+- `ClinicData.{transactions, ad_clicks_v2, ad_groups, callscoring, matthew_calls, faq, geo_targets, google_ads_campaigns_catalog, invoca_campaigns_catalog}` (`geo_targets` is loaded by this repo's one-off `intelligence_report/load_geo_targets.py`, which since 2026-09-04 also attaches GeoNames `latitude`/`longitude` to city-level targets for the Ads tab's paid-call map — `queries.paid_click_breakdown` reads those columns, so the table must be reloaded with the current loader before that section can place anything)
+- `Blueprint_PHI.*` and `CounselEar_PHI.*`, normally reached through the `PMS_Unified.*` views (`intelligence_report/queries.py::_BP`, `api/datafeed.py::_PMS_UNIFIED`)
+- Cloud SQL `marts.*` (not BigQuery) is the `/v2` serving layer — see above
 
-Key models:
-- `InstanceCreate` / `Instance` / `InstanceUpdate`
-- `ClinicCreate` / `Clinic` / `ClinicUpdate`
-- `StaffUpdate`, `ServiceUpdate`, `InsuranceUpdate`
-- `AppointmentType` / `AppointmentTypeUpdate`
-- `ProvisionRequest` — full instance + clinics + staff + services + insurance in one call
-- `ReviewSnapshot`
-- `PatientCreate`, `AppointmentCreate`, `InvoiceCreate`, `PhysicianReferralCreate` — Phase 3 stubs, not yet wired to routes
+## Data Models (`api/models.py`)
 
-### Clinic model — fields being added
+Request bodies only — responses are plain dicts assembled from the ORM. The 14 models:
 
-```python
-# Voice agent (opt-in per clinic)
-voice_agent_status: Literal["inactive", "provisioning", "active", "error"] = "inactive"
-twilio_phone_number: str | None = None   # E.164 format
-twilio_phone_sid: str | None = None
-twilio_verified_caller_id: bool = False
-vapi_assistant_id: str | None = None
-vapi_phone_number_id: str | None = None
+- `InstanceCreate` / `InstanceUpdate` — `instance_name`, `primary_contact_{name,email}`, `google_ads_customer_id`, `invoca_profile_id`. `InstanceUpdate` drops `None` so a field can be corrected but not blanked.
+- `ClinicCreate` / `ClinicUpdate` — name, address, place_id, seven `hours_<weekday>` strings, phone, time_zone, country, plus `gbp_location_id`, `etl_enabled`, `tier` on update. `_reject_empty_string` on `ClinicUpdate`.
+- `ProvisionRequest` — v1 `/provision_account/` body (`uid` + instance + clinics). The v2 shape is `ProvisionRequestV2` in `api/v2/provision.py`, which also carries the PMS account and defaults `clinics` to empty.
+- `ClinicCampaignCreate` — `campaign_type ∈ {google_ads, invoca, jotform}`.
+- `InstancePmsConfigSet`, `PmsLocationEntry`, `PmsLocationImport(Entry)` — account-level PMS config and its location map.
+- `JotformLocationEntry`, `JotformLocationMapSet` — the shared-form location map.
+- `CustomerIOConfigSet` — `site_id` / `track_api_key` / `region`.
+- `WebformSubmission` — the JSON relay body for `POST /webforms`. (`_store_submission` also takes a keyword-only `source` → `ingest_source`.)
 
-# Blueprint OMS PMS integration (opt-in per clinic)
-blueprint_server: str | None = None       # e.g. "wp2.bp-solutions.net:8443"
-blueprint_clinic_slug: str | None = None  # [CLINIC] path segment
-blueprint_api_key: str | None = None      # never logged
-blueprint_location_id: int | None = None
-blueprint_user_id: int | None = None      # service account user for API writes
+**Voice-agent and PMS fields are Cloud SQL columns, not Pydantic model fields.** `voice_agent_status` (enum `inactive|provisioning|active|error`), `twilio_phone_number`, `twilio_phone_sid`, `twilio_verified_caller_id`, `vapi_assistant_id`, `vapi_phone_number_id`, `alert_sms_to`, `alert_email_to`, `agent_role` all live on `clinic_voice_agent_configuration`. Blueprint connection details live on `instance_pms_config` + `pms_clinic_locations` (alembic 0030); the API key and AWS credentials are Secret Manager only and never touch the DB.
 
-# PMS type (supports future PMS systems)
-pms_type: Literal["none", "blueprint"] = "none"
-```
+## Voice agent (`api/voice_agent/`)
 
-### Known type bugs (4-B)
-- `Service.duration_minutes` is `str` — should be `int`
-- `Service.cost` is `str` — should be `float`
-- `ReviewSnapshot.validate_required` passes literal `"field"` to `_require_non_empty` — use `info.field_name`
+The deployed VAPI assistant is built here — `factory.py::build_agent_config(db, clinic)` assembles the system prompt (script, persona, caller buckets, qualifying questions, hours from `clinic_location_details`, approved FAQs) and the tool list from the enabled protocols, then `vapi.py` pushes it. `POST /clinics/{clinic_id}/voice_agent/activate` is the destructive re-provision (delete + recreate); `POST …/voice_agent/assistant` is the idempotent rebuild. Twilio number purchase is **out of scope** of activate — numbers are attached in the VAPI dashboard; `twilio.py`'s purchase/verify helpers currently have no callers (the live Twilio path is `api/services/notify.py`'s staff SMS on ticket submit).
 
-## Pending Work
+Protocols (`protocols/`, `PROTOCOL_REGISTRY`, 14 registered, 13 toggleable — `submit_ticket` is always on) each contribute a prompt fragment + VAPI tool definitions; per-clinic toggles and validated `config` JSON live in `clinic_protocols` (alembic 0004/0005). `roles.py` holds single-purpose role compilers (`ROLE_ANNUAL_BOOKING` for ACNA). `pms/` holds the `PMSAdapter` ABC + `adapter_for(clinic)`. Config tables: alembic 0002 (script), 0003 (persona + caller buckets), 0006 (qualifying questions), 0007 (script field rework), 0023 (FAQ). Design record: `resources/protocols-design.md` (shipped). **`voice_agent_builder/` at the repo root is the retired predecessor — do not edit it.**
 
-### Must fix (blockers)
-- **2-C** `instance.py:57–63` — provisioning writes to 5 BigQuery tables with no rollback. Extract to `services/provisioning.py`; add best-effort compensating deletes on failure. Document that BigQuery does not support multi-table transactions.
-- **2-D** `deps.py` — `verify_token` has a broad `except Exception → 401` after the specific Firebase exceptions. Re-raise unexpected exceptions as 500 so real bugs aren't masked.
-- **2-E** `__init__.py` — remove `websites` from imports and `app.include_router(websites.router)`. Add `review_snapshots` router if not already registered.
+⚠️ `cortex-spa/src/lib/voice_agent_capabilities.ts` is a hand-maintained mirror of the registry and is missing three toggleable protocols (`retrieve_patient_context`, `confirm_appointment`, `faq_lookup`), so they cannot be switched on from the dashboard. Adding a protocol on the backend means editing that file too.
 
-### Structural refactoring
-- **3-C** Add `bq_select(table, where) -> list[dict]` to `deps.py`. Replace the identical 6-line SELECT boilerplate in `clinics.py`, `staff.py`, `services.py`, `insurance.py`, `users.py`.
+## Known residue
 
-### New routers planned
-
-| Router file | Purpose |
-|---|---|
-| `voice_agent.py` | `POST /clinics/{clinic_id}/voice_agent/activate`, `DELETE`, `POST .../verify_caller_id` |
-| `scripts.py` | Call scripts per clinic per call type |
-| `campaigns.py` | Multi-campaign ID management per clinic (new table, old column kept) |
+- `clinic_blueprint_config` / `clinic_counselear_config` still exist as 0030's rollback path, marked deprecated by table COMMENT. Drop in a follow-up; do not add readers.
+- `intelligence_report/group_queries.py` has no production consumer.
+- `instances.multi_location_group` is deprecated but still read by `scripts/prewarm_payloads.py` and `scripts/parity_harness.py` — see Group Intelligence.
+- `api/voice_agent/twilio.py` has no callers.
+- `ringcentral_numbers` (the RingCentral clinic-attribution table the ETL expects) has no migration and no ORM model; `_CAMPAIGN_TYPES` has no `ringcentral` member.
 
 ## Cloud Run Jobs (production)
 
@@ -557,7 +669,7 @@ no second image to keep in sync.
 
 | Job | Command | Schedule (PT) | Purpose |
 |---|---|---|---|
-| `payload-prewarm` | `python scripts/prewarm_payloads.py` | hourly, as the **last step of the `etl-hourly-chain` workflow** (no longer its own `payload-prewarm-hourly` cron) | Warm the intelligence JSON payload cache so the first real visitor after a data-version rotation never pays the cold cost. Covers every **cached** endpoint the SPA requests — `overview`, `pipeline-revenue` and `active-leads` per scope × 4 windows, plus per-clinic `biweekly`: 14 scopes × 4 × 3 + 13 = **181 requests**, run 4 at a time (`--concurrency`). The group requests are the expensive ones — each fans the per-clinic readers across every clinic in the instance (see Group Intelligence below), so they cost roughly N clinic pages apiece rather than one. Warming them matters more than it used to: a cold group page is minutes. |
+| `payload-prewarm` | `python scripts/prewarm_payloads.py` | hourly, as the **last step of the `etl-hourly-chain` workflow** (no longer its own `payload-prewarm-hourly` cron) | Warm the intelligence JSON payload cache so the first real visitor after a data-version rotation never pays the cold cost. Covers every **cached** endpoint the SPA requests — `overview`, `pipeline-revenue` and `active-leads` per scope × 4 windows, plus per-clinic `biweekly`. The count scales with the tenant list: **(clinics + group instances) × 4 × 3 + clinics**, run 4 at a time (`--concurrency`). At 31 clinics that is ~415 requests; run `scripts/prewarm_payloads.py --dry-run` for the current plan rather than trusting a number written here. (The 365d preset clamps to `MIN_DATE` and dedupes into the default window, which is why it is 4 windows and not 5.) The group requests are the expensive ones — each fans the per-clinic readers across every clinic in the instance, so they cost roughly N clinic pages apiece. |
 
 **Coverage is defined by what the SPA fetches AND what the backend caches** —
 both halves, or the job silently warms nothing useful. `scripts/prewarm_payloads.py`
@@ -582,7 +694,9 @@ carries the page-by-page table; the rules that keep it honest:
 Anything cached that the SPA requests but this job skips shows up as a page that
 is permanently cold — `pipeline-revenue` (fired by the landing Dashboard on both
 the clinic and the rollup) and `active-leads` (the Leads tab) were exactly that
-until 2026-08-21.
+until 2026-08-21. **Today the group scopes for Calgary and Sense of Hearing are
+in that state** because the job selects on the deprecated flag (see Group
+Intelligence).
 
 Why **hourly** and not pinned to `blueprint-sync`: the cache key rotates on the
 PMS snapshot date (see `_data_version` in `api/intelligence.py`), and an hourly
@@ -591,7 +705,7 @@ landed or retried, and a warm run is a cheap no-op because the job hits the same
 data-versioned keys the SPA does.
 
 It now runs as the tail of `etl-hourly-chain` (defined in
-`big-query-ingestion/deploy/etl-hourly-chain.yaml`) so it warms the cache
+`cortex-data-ingestion/deploy/etl-hourly-chain.yaml`) so it warms the cache
 *after* the hour's ingest has landed rather than racing it. It sits deliberately
 outside that workflow's fail-fast section: if an upstream ingest breaks, the
 cache is still warmed, because otherwise every dashboard visitor would pay the
@@ -615,7 +729,7 @@ gcloud run jobs deploy payload-prewarm \
 # the old payload-prewarm-hourly schedule showed ENABLED with a fresh
 # lastAttemptTime while no Cloud Run execution was ever created. Now that it is
 # chained, a missing grant instead surfaces as a failed workflow execution.
-# `deploy_docker_image.sh chain` re-applies this idempotently.
+# `deploy_docker_image.sh chain` (in cortex-data-ingestion) re-applies this idempotently.
 gcloud run jobs add-iam-policy-binding payload-prewarm --region=us-central1 \
   --member="serviceAccount:cortex-accounts-cloudsql-sa@$PROJECT_ID.iam.gserviceaccount.com" \
   --role="roles/run.invoker"
@@ -627,12 +741,15 @@ gcloud run jobs execute payload-prewarm --region=us-central1   # run now
 cache-key logic changed — the job pins an image digest, so `./dev.sh` alone
 leaves it on the old build.
 
-## Environment Variables (`.env`)
+## Environment Variables
 
-```
-GCP_PROJECT=
-BQ_DATASET=
-GCS_SERVICE_ACCOUNT=     # JSON string of GCS service account
-FIREBASE_ADMIN_SERVICE_ACCOUNT=  # JSON string of Firebase admin service account
-ALLOWED_ORIGINS=         # Comma-separated, e.g. "https://app.example.com,http://localhost:3000"
-```
+No `.env` is required — project id and dataset are hardcoded (`api/deps.py`, `api/core/secrets.py`) and every secret comes from Secret Manager via ADC. The repo's `.env` holds only an ngrok token for local voice-agent tunnelling. The six vars the code actually reads, all optional:
+
+| Var | Default | Effect |
+|---|---|---|
+| `ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated CORS origins (`api/__init__.py`). The SPA proxies same-origin, so this rarely matters. |
+| `LOG_LEVEL` | `INFO` | Root log level; logs go to stdout |
+| `CLOUD_SQL_IAM_USER` | resolved from ADC / gcloud config | Override the IAM DB username (`api/core/db.py`) |
+| `CLOUD_SQL_USE_PRIVATE_IP` | unset (public IP) | Use the private-IP connector path |
+| `PAYLOAD_SHARED_CACHE` | `1` | Set `0` to disable the GCS-backed payload cache (`api/intelligence.py`) |
+| `CORTEX_API_BASE_URL` | `http://localhost:8000` | Base URL baked into VAPI tool definitions — prepend the ngrok URL per run, don't export it (`api/voice_agent/protocols/*.py`) |

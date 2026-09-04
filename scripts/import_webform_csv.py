@@ -9,7 +9,7 @@ tab, ``webform_drivers``, and (via cross-channel first touch) Revenue attributed
 
 THIS IS A BACKFILL, NOT THE FIX. The durable fix is registering the form in
 Cloud SQL ``jotform_forms`` and provisioning its webhook (see
-``configure_jotform_webhooks.py`` and resources/jotform-webform-setup.md), so new
+``configure_jotform.py`` and resources/jotform-webform-setup.md), so new
 submissions arrive on their own. Run this once for the history, then wire the
 webhook, or the two will overlap on whatever the export covers.
 

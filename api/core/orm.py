@@ -913,17 +913,21 @@ class InvocaPromoNumber(Base):
 # ──────────────────── jotform_forms (N) ────────────────────
 
 class JotformForm(Base):
-    """Registry for the Jotform → webhook → BigQuery lead pipeline.
+    """Registry for the Jotform → BigQuery lead pipeline — and its wiring.
 
-    A row here means the form SHOULD be delivering submissions to
-    ``POST /webforms/jotform/{clinic_id}`` — it is what lets us distinguish
-    "not set up" from "set up but broken/quiet". ``configure_jotform_webhooks.py``
-    reads this table to provision webhooks; ``GET /webforms/coverage`` joins it
-    against ``ClinicData.webforms`` to surface clinics that have gone silent.
+    A row here (``active=1``, clinic not soft-deleted) means the ETL job
+    ``jotform-ingest`` polls this form's submissions from the Jotform API every
+    15 minutes into ``ClinicData.webforms`` (``cortex-data-ingestion/app/jotform/``,
+    reader ``db.get_jotform_forms``). Registering IS enabling; nothing has to be
+    configured on the Jotform side (the webhook relay was retired 2026-09-04).
+    ``GET /webforms/coverage`` joins the registry against what has landed to
+    surface a registered-but-silent form; ``configure_jotform.py`` maintains the
+    hidden UTM fields and the location map.
 
-    ``jotform_form_id`` is UNIQUE globally (not per clinic): each form's webhook
-    URL targets exactly one clinic_id, so mapping a form to two clinics would
-    double-ingest every submission.
+    ``jotform_form_id`` is UNIQUE globally (not per clinic): the poller writes each
+    submission once, to this DEFAULT clinic unless ``jotform_form_locations``
+    re-points it, so mapping a form to two clinics would double-ingest every
+    submission.
     """
     __tablename__ = "jotform_forms"
     __table_args__ = (

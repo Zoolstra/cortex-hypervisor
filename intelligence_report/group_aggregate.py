@@ -171,6 +171,38 @@ _AD_CLICK_COUNTS = (
 )
 
 
+def _merge_paid_click_breakdown(per_clinic: list[dict]) -> dict | None:
+    """Sum queries.paid_click_breakdown across clinics.
+
+    Every figure here is additive — a call belongs to one clinic, and the
+    reader returns complete lists rather than a top-N, so merging place rows on
+    the geo criterion id and keyword rows on the keyword text is exact. Hidden
+    (None) when no clinic had a Paid call, matching the clinic payload.
+    """
+    if not per_clinic:
+        return None
+    places = _merge_by_key(
+        [(b.get("geo") or {}).get("places") or [] for b in per_clinic],
+        "id", int_fields=("calls",), carry=("name", "region", "country", "lat", "lon"))
+    keywords = _merge_by_key(
+        [(b.get("keywords") or {}).get("keywords") or [] for b in per_clinic],
+        "keyword", int_fields=("calls",), carry=("match_type",))
+    out = {
+        "paid_calls": _sum_ints(per_clinic, "paid_calls"),
+        "with_click_data": _sum_ints(per_clinic, "with_click_data"),
+        "no_click_data": _sum_ints(per_clinic, "no_click_data"),
+        "geo": {
+            "places": sorted(places, key=lambda p: (-p["calls"], p.get("name") or "")),
+            "unknown": sum(int((b.get("geo") or {}).get("unknown") or 0) for b in per_clinic),
+        },
+        "keywords": {
+            "keywords": sorted(keywords, key=lambda k: (-k["calls"], k["keyword"])),
+            "unknown": sum(int((b.get("keywords") or {}).get("unknown") or 0) for b in per_clinic),
+        },
+    }
+    return out if out["paid_calls"] else None
+
+
 # `qualified_not_booked_callers` is a DISTINCT-caller count per clinic, so summing
 # it counts a person who rang two locations twice. That is the same compromise
 # `form_submissions.patients` makes: there is no cross-clinic key on the funnel
@@ -483,6 +515,7 @@ def build_group_aggregate(
             q.google_ads_roi(cid, ga, iv, window=window),
             q.webform_campaign_attribution(cid, ga, window=window, invoca_campaign_ids=iv))
         tasks[f"ad_clicks|{cid}"] = lambda cid=cid, iv=iv, ga=ga: q.ad_click_attribution(cid, iv, ga, window=window)
+        tasks[f"click_breakdown|{cid}"] = lambda cid=cid, iv=iv, ga=ga: q.paid_click_breakdown(cid, iv, ga, window=window)
         # Web-form leg of ad-attributed revenue. Fanned per clinic rather than
         # given a group-scoped reader because the INCREMENTAL exclusion is
         # inherently per-clinic: it must subtract that clinic's own paid callers,
@@ -569,13 +602,19 @@ def build_group_aggregate(
             k: _sum_ints(ad_clicks, k) for k in _AD_CLICK_COUNTS}
         # The nested per-campaign rows merge on campaign_id like the main
         # cascade; concatenating would list a shared campaign once per clinic.
+        # Keyed on google_ads_campaign_id — the field paid_campaign_drivers
+        # actually emits. This was "campaign_id", which no row carries, so
+        # every clinic's campaigns collapsed into one row keyed None.
         ad_click_attribution["campaigns"] = sorted(
             _merge_by_key([a.get("campaigns") or [] for a in ad_clicks],
-                          "campaign_id", int_fields=("calls", "clicks"),
+                          "google_ads_campaign_id", int_fields=("calls",),
                           carry=("campaign_name",)),
             key=lambda r: -r["calls"])
         if not ad_click_attribution.get("paid_calls"):
             ad_click_attribution = None
+
+    paid_click_breakdown = _merge_paid_click_breakdown(
+        [b for b in per_clinic("click_breakdown") if b])
 
     webforms = res.get("g_webforms")
     if webforms and not webforms.get("submissions"):
@@ -705,6 +744,7 @@ def build_group_aggregate(
         # clinics; grouping on campaign_id sums them rather than emitting the
         # campaign twice. `unattributed` is carried, not summed — it is a label.
         "ad_click_attribution": ad_click_attribution,
+        "paid_click_breakdown": paid_click_breakdown,
         "placeholders": ["cortex_intercept", "review_velocity"],
         "recommendations": [],
     }

@@ -264,6 +264,11 @@ def build_overview(
             invoca_campaign_ids=invoca_campaign_ids),
         "ad_click_attribution": lambda: q.ad_click_attribution(
             clinic_id, invoca_campaign_ids, ga_campaign_ids, window=w),
+        # Geography + keyword behind each Paid call's click row, with the share
+        # of Paid calls that have no such row. Same population and match rule
+        # as ad_click_attribution, so the two reconcile.
+        "paid_click_breakdown": lambda: q.paid_click_breakdown(
+            clinic_id, invoca_campaign_ids, ga_campaign_ids, window=w),
     }
     for a in anchors:
         mw = _month_window(a)
@@ -392,6 +397,10 @@ def build_overview(
         "ad_click_attribution": (
             lambda a: a if a and a.get("paid_calls") else None
         )(sections.get("ad_click_attribution")),
+        # Same hide rule: no Paid calls, no breakdown to show.
+        "paid_click_breakdown": (
+            lambda a: a if a and a.get("paid_calls") else None
+        )(sections.get("paid_click_breakdown")),
         "placeholders": ["cortex_intercept", "review_velocity"],
     }
 
