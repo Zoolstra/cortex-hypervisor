@@ -626,7 +626,7 @@ Written by this service:
 - `ClinicData.faq_embeddings` — voice-agent FAQ serving layer, MERGE on approval (`api/voice_agent/faq_retrieval.py`); searched with `VECTOR_SEARCH` mid-call by the `faq_lookup` protocol
 
 Read-only (written by the ETL in `cortex-data-ingestion/`):
-- `ClinicData.{transactions, ad_clicks_v2, ad_groups, callscoring, matthew_calls, faq, geo_targets, google_ads_campaigns_catalog, invoca_campaigns_catalog}` (`geo_targets` is loaded by this repo's one-off `intelligence_report/load_geo_targets.py`, which since 2026-09-04 also attaches GeoNames `latitude`/`longitude` to city-level targets for the Ads tab's paid-call map — `queries.paid_click_breakdown` reads those columns, so the table must be reloaded with the current loader before that section can place anything)
+- `ClinicData.{transactions, ad_clicks_v2, ad_groups, callscoring, matthew_calls, faq, geo_targets, google_ads_campaigns_catalog, invoca_campaigns_catalog}` (`geo_targets` is loaded by this repo's one-off `intelligence_report/load_geo_targets.py`, which since 2026-09-04 also attaches GeoNames `latitude`/`longitude` to city-level targets; `queries.paid_click_breakdown` selects those columns, so the table must carry them. The SPA's map that used them was removed 2026-09-08 — the coordinates ride along in the payload unused)
 - `Blueprint_PHI.*` and `CounselEar_PHI.*`, normally reached through the `PMS_Unified.*` views (`intelligence_report/queries.py::_BP`, `api/datafeed.py::_PMS_UNIFIED`)
 - Cloud SQL `marts.*` (not BigQuery) is the `/v2` serving layer — see above
 
