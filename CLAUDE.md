@@ -578,11 +578,12 @@ otherwise narrate the zeros as a revenue collapse.
 what the report may claim, and connecting a clinic's PMS rotates no data version,
 so without it the disclosure would persist for the life of the cache entry.
 
-Frontend: `cortex-spa/src/components/intelligence/PmsCoverage.tsx` — a page-level
-banner plus the inline replacements used wherever a suppressed figure sat. The
-funnel stops at "connected", ROAS/revenue columns are dropped rather than
-dashed, and the qualified-no-conversion leak is restated as an unverified
-follow-up list (nothing can confirm those callers didn't book later).
+Frontend: `cortex-spa/src/components/intelligence/PmsCoverage.tsx` — inline
+"No PMS data" labels wherever a suppressed figure sat, and a page-level banner
+ONLY for a partial rollup (naming the locations without a feed). Since
+2026-09-08 the copy is the bare label with no explanation, and a clinic or group
+with no PMS at all gets no banner. The funnel stops at "connected" and
+ROAS/revenue columns are dropped rather than dashed.
 
 ## Client data feed (`api/datafeed.py`)
 
