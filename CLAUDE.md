@@ -85,7 +85,7 @@ tests/                # 33 pytest modules
 
 Schema is Alembic-managed: `alembic/versions/`, 32 migrations, head `0032`. Migrations run **online only** against the live instance with IAM auth (`alembic upgrade head`); offline mode is refused in `alembic/env.py`. `./dev.sh` ships the image only — migrate separately.
 
-`clinics.deleted_at` is a soft delete: **every** query must filter `deleted_at IS NULL`. `clinics.pms_type` is `Enum("blueprint", "counselear", "audit_data", "none")`.
+`clinics.deleted_at` is a soft delete: **every** query must filter `deleted_at IS NULL`. `DELETE /clinics/{clinic_id}` sets it (and clears `etl_enabled`) rather than removing the row, and returns 409 while the clinic still has a live VAPI assistant — deactivate the voice agent first. The dashboard button is the danger panel at the foot of *Location settings → Details*. `clinics.pms_type` is `Enum("blueprint", "counselear", "audit_data", "none")`.
 
 ## Routers (126 application routes)
 

@@ -9,6 +9,8 @@ A clinic spans three tables:
 GETs assemble a flat dict from clinics + clinic_location_details. PATCH
 dispatches each field to the appropriate table based on a hard-coded mapping.
 """
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -343,7 +345,20 @@ def delete_clinic(
     clinic = _get_clinic_or_404(db, clinic_id)
     require_write_access(clinic.instance_id, caller)
 
-    # Hard delete — child config tables CASCADE. If we want to preserve history
-    # later, switch to setting deleted_at instead.
-    db.delete(clinic)
-    return {"status": "success"}
+    # A live assistant keeps answering the clinic's phone number whatever we do
+    # to the row, and the VAPI id would vanish with the config. Deactivate first
+    # (DELETE /clinics/{id}/voice_agent) so the assistant is torn down cleanly.
+    va = clinic.voice_agent
+    if va is not None and va.vapi_assistant_id:
+        raise HTTPException(
+            status_code=409,
+            detail="This clinic has a live voice agent. Deactivate it before deleting the clinic.",
+        )
+
+    # Soft delete. `deleted_at` is the convention every reader already filters on
+    # (hypervisor + ETL), and BigQuery rows stamped with this clinic_id
+    # (webforms, marts, PHI snapshots) keep a row to resolve against. A hard
+    # delete would cascade the config tables and orphan all of that.
+    clinic.deleted_at = datetime.now(timezone.utc)
+    clinic.etl_enabled = False
+    return {"status": "success", "clinic_id": clinic_id, "deleted_at": clinic.deleted_at.isoformat()}
