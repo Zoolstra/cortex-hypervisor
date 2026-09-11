@@ -3,9 +3,15 @@ Multi-campaign ID management per clinic — backed by Cloud SQL.
 
 The legacy `clinic_campaigns` BQ table (single table, `campaign_type`
 discriminator) has been split into typed tables:
-    google_ads_campaigns  → (id, clinic_id, google_ads_campaign_id, active)
-    invoca_campaigns      → (id, clinic_id, invoca_campaign_id, active)
-    jotform_forms         → (id, clinic_id, jotform_form_id, form_title, active)
+    google_ads_campaigns          → (id, clinic_id, google_ads_campaign_id, active)
+    invoca_campaigns              → (id, clinic_id, invoca_campaign_id, active)
+    jotform_forms                 → (id, clinic_id, jotform_form_id, form_title, active)
+    google_analytics_properties   → (id, clinic_id, ga4_property_id, property_name, active)
+
+`google_analytics` rows register a GA4 property for the ETL job ``ga4-ingest``
+(``ClinicData.ga4_*``). Like Jotform, a property maps to exactly ONE clinic
+(UNIQUE on ga4_property_id): a group usually runs one property for one website,
+so it is registered on a DEFAULT clinic and readers dedupe by property.
 
 `jotform` rows register a clinic on the Jotform → webhook → BigQuery lead
 pipeline (see api/webforms.py). Unlike the other two types a form maps to
@@ -40,8 +46,8 @@ from api.deps import bq_client, require_read_access, require_write_access, verif
 from api.models import ClinicCampaignCreate, JotformLocationMapSet
 from api.core.db import get_session
 from api.core.orm import (
-    Clinic, GoogleAdsCampaign, Instance, InvocaCampaign, JotformForm,
-    JotformFormLocation,
+    Clinic, GoogleAdsCampaign, GoogleAnalyticsProperty, Instance, InvocaCampaign,
+    JotformForm, JotformFormLocation,
 )
 from api.core.secrets import get_secret
 
@@ -49,7 +55,7 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_CAMPAIGN_TYPES = ("google_ads", "invoca", "jotform")
+_CAMPAIGN_TYPES = ("google_ads", "invoca", "jotform", "google_analytics")
 
 
 # ── Catalog (BigQuery-backed) ────────────────────────────────────────────────
@@ -134,6 +140,10 @@ def get_campaigns_catalog(
         instance's ``invoca_profile_id``.
       - jotform → live Jotform API listing of the shared agency account
         (super_admin only — see ``_jotform_catalog``).
+      - google_analytics → BQ ``ClinicData.ga4_properties_catalog`` (written by
+        the ETL from the GA Admin API) filtered by the instance's
+        ``ga4_account_id``; already_linked spans ALL clinics because a property
+        is globally unique.
 
     Returns an empty list if the instance has no upstream account configured
     or the catalog has no matching rows yet.
@@ -151,6 +161,8 @@ def get_campaigns_catalog(
 
     if campaign_type == "jotform":
         return _jotform_catalog(caller, db)
+    if campaign_type == "google_analytics":
+        return _ga4_catalog(instance, db)
 
     # Existing linkages (per-clinic) — used to mark already-linked entries.
     if campaign_type == "google_ads":
@@ -227,6 +239,71 @@ def get_campaigns_catalog(
     return out
 
 
+def _ga4_catalog(instance: Instance, db: Session) -> list[dict]:
+    """GA4 properties under the instance's GA account, from the ETL-built catalog.
+
+    ``ClinicData.ga4_properties_catalog`` is WRITE_TRUNCATEd by ``ga4-ingest`` from
+    the GA Admin API's accountSummaries (every account the impersonated agency
+    identity can see). It is filtered here by ``instances.ga4_account_id``; an
+    instance without one gets [] and the admin UI falls back to manual-ID entry.
+    ``already_linked`` spans ALL clinics — a property is globally unique, so one
+    linked to another instance's clinic shows as taken.
+    """
+    if not instance.ga4_account_id:
+        return []
+
+    linked_rows = db.execute(
+        select(GoogleAnalyticsProperty.ga4_property_id, Clinic.clinic_name)
+        .join(Clinic, Clinic.clinic_id == GoogleAnalyticsProperty.clinic_id)
+        .where(Clinic.deleted_at.is_(None))
+    ).all()
+    linked: dict[str, list[str]] = {}
+    for prop_id, clinic_name in linked_rows:
+        linked.setdefault(str(prop_id), []).append(clinic_name)
+
+    sql = f"""
+        SELECT
+          CAST(property_id AS STRING) AS external_campaign_id,
+          property_name AS name,
+          account_name,
+          time_zone,
+          currency_code,
+          primary_hostname
+        FROM `{_CLINIC_DATA_DATASET}.ga4_properties_catalog`
+        WHERE CAST(account_id AS STRING) = @account_id
+        ORDER BY property_name
+    """
+    from google.cloud import bigquery as _bq
+    try:
+        rows = list(bq_client.query(
+            sql,
+            job_config=_bq.QueryJobConfig(query_parameters=[
+                _bq.ScalarQueryParameter("account_id", "STRING", str(instance.ga4_account_id)),
+            ]),
+        ).result())
+    except Exception as exc:  # catalog not built yet — a convenience, not a dependency
+        log.warning("GA4 catalog read failed: %s", exc)
+        return []
+
+    out: list[dict] = []
+    for row in rows:
+        ext_id = row["external_campaign_id"]
+        # Same row shape as the other catalog branches (the SPA's CampaignBlock
+        # is generic) plus three optional GA4 extras. GA4 has no status concept
+        # for a property, so it is always "active".
+        out.append({
+            "external_campaign_id": ext_id,
+            "name":                 row["name"],
+            "status":               "active",
+            "already_linked":       ext_id in linked,
+            "linked_clinic_names":  linked.get(ext_id, []),
+            "account_name":         row["account_name"],
+            "primary_hostname":     row["primary_hostname"],
+            "time_zone":            row["time_zone"],
+        })
+    return out
+
+
 def _gads_dict(c: GoogleAdsCampaign) -> dict:
     return {
         "id": c.id,
@@ -257,6 +334,21 @@ def _invoca_dict(c: InvocaCampaign) -> dict:
             }
             for p in c.promo_numbers
         ],
+    }
+
+
+def _ga4_dict(c: GoogleAnalyticsProperty) -> dict:
+    # ``name`` rides along (like jotform) so the UI can label the numeric
+    # property id even when the instance has no ga4_account_id for the catalog.
+    return {
+        "id": c.id,
+        "clinic_id": c.clinic_id,
+        "campaign_type": "google_analytics",
+        "external_campaign_id": c.ga4_property_id,
+        "name": c.property_name,
+        "property_name": c.property_name,
+        "active": bool(c.active),
+        "created_at": c.created_at.isoformat() if c.created_at else None,
     }
 
 
@@ -297,10 +389,16 @@ def list_campaigns_for_instance(
         .join(Clinic, Clinic.clinic_id == JotformForm.clinic_id)
         .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
     ).all()
+    ga4 = db.scalars(
+        select(GoogleAnalyticsProperty)
+        .join(Clinic, Clinic.clinic_id == GoogleAnalyticsProperty.clinic_id)
+        .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
+    ).all()
 
     return ([_gads_dict(c) for c in gads]
             + [_invoca_dict(c) for c in invoca]
-            + [_jotform_dict(c) for c in jotform])
+            + [_jotform_dict(c) for c in jotform]
+            + [_ga4_dict(c) for c in ga4])
 
 
 @router.get("/campaigns/{instance_id}/{clinic_id}")
@@ -326,10 +424,14 @@ def list_campaigns_for_clinic(
     jotform = db.scalars(
         select(JotformForm).where(JotformForm.clinic_id == clinic_id)
     ).all()
+    ga4 = db.scalars(
+        select(GoogleAnalyticsProperty).where(GoogleAnalyticsProperty.clinic_id == clinic_id)
+    ).all()
 
     return ([_gads_dict(c) for c in gads]
             + [_invoca_dict(c) for c in invoca]
-            + [_jotform_dict(c) for c in jotform])
+            + [_jotform_dict(c) for c in jotform]
+            + [_ga4_dict(c) for c in ga4])
 
 
 @router.post("/campaigns/{clinic_id}")
@@ -357,11 +459,26 @@ def add_campaign(
             invoca_campaign_id=body.external_campaign_id,
             active=body.active,
         )
-    else:  # jotform
+    elif body.campaign_type == "jotform":
         row = JotformForm(
             clinic_id=clinic_id,
             jotform_form_id=body.external_campaign_id,
             active=body.active,
+        )
+    elif body.campaign_type == "google_analytics":
+        row = GoogleAnalyticsProperty(
+            clinic_id=clinic_id,
+            ga4_property_id=body.external_campaign_id,
+            active=body.active,
+        )
+    else:
+        # The Pydantic Literal normally catches this as a 422. The explicit guard
+        # is here because the previous bare `else` silently wrote a jotform_forms
+        # row for any type the Literal admitted but this chain did not know.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported campaign_type {body.campaign_type!r}; "
+                   f"must be one of {', '.join(_CAMPAIGN_TYPES)}",
         )
 
     db.add(row)
@@ -369,13 +486,15 @@ def add_campaign(
         db.flush()
     except IntegrityError:
         # google_ads/invoca: UNIQUE(clinic_id, external_id) — already linked here.
-        # jotform: UNIQUE(jotform_form_id) — the form is mapped to SOME clinic
-        # (possibly another one); a second mapping would double-ingest.
-        detail = (
-            "Jotform form already mapped to a clinic (a form can feed only one clinic)"
-            if body.campaign_type == "jotform"
-            else "Campaign already associated with this clinic"
-        )
+        # jotform / google_analytics: UNIQUE(external_id) — mapped to SOME clinic
+        # (possibly another one); a second mapping would double-ingest / double-count.
+        if body.campaign_type == "jotform":
+            detail = "Jotform form already mapped to a clinic (a form can feed only one clinic)"
+        elif body.campaign_type == "google_analytics":
+            detail = ("GA4 property already mapped to a clinic "
+                      "(a property feeds one default clinic)")
+        else:
+            detail = "Campaign already associated with this clinic"
         raise HTTPException(status_code=409, detail=detail)
 
     return {"status": "success", "id": row.id, "campaign_type": body.campaign_type}
@@ -395,6 +514,8 @@ def remove_campaign(
         row = db.get(InvocaCampaign, campaign_id)
     elif campaign_type == "jotform":
         row = db.get(JotformForm, campaign_id)
+    elif campaign_type == "google_analytics":
+        row = db.get(GoogleAnalyticsProperty, campaign_id)
     else:
         raise HTTPException(
             status_code=400,

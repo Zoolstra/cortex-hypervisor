@@ -19,7 +19,8 @@ from sqlalchemy.orm import Session
 from api.audit import log_phi_access
 from api.core.db import get_session
 from api.core.grouping import is_multi_location
-from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, Instance, InvocaCampaign
+from api.core.orm import (Clinic, ClinicLocationDetails, GoogleAdsCampaign,
+                          GoogleAnalyticsProperty, Instance, InvocaCampaign)
 from api.deps import require_read_access, require_write_access, verify_token
 
 log = logging.getLogger(__name__)
@@ -758,6 +759,152 @@ def get_group_overview(
     )
     if not skip_llm:
         _cache_store(key, instance_id, payload, use_cache=use_cache)
+    return payload
+
+
+# ── Website (GA4) ────────────────────────────────────────────────────────────
+#
+# Reads the ClinicData.ga4_* tables landed by the ETL job `ga4-ingest` through
+# `intelligence_report/ga4_queries.py`. Not PHI (aggregate web traffic), so no
+# audit path. Scope comes from the `google_analytics_properties` registry: a
+# property is registered against ONE default clinic (Jotform semantics), so the
+# clinic page shows that clinic's properties and the group page shows every
+# property registered under any of the instance's clinics, deduped by id.
+
+def _ga4_properties_for_clinic(db: Session, clinic_id: str) -> list[GoogleAnalyticsProperty]:
+    return list(db.scalars(
+        select(GoogleAnalyticsProperty).where(
+            GoogleAnalyticsProperty.clinic_id == clinic_id,
+            GoogleAnalyticsProperty.active.is_(True))))
+
+
+def _ga4_properties_for_instance(db: Session, instance_id: str) -> list[GoogleAnalyticsProperty]:
+    rows = db.scalars(
+        select(GoogleAnalyticsProperty)
+        .join(Clinic, Clinic.clinic_id == GoogleAnalyticsProperty.clinic_id)
+        .where(Clinic.instance_id == instance_id,
+               Clinic.deleted_at.is_(None),
+               GoogleAnalyticsProperty.active.is_(True))
+    ).all()
+    seen: set[str] = set()
+    out = []
+    for p in rows:
+        if p.ga4_property_id in seen:
+            continue
+        seen.add(p.ga4_property_id)
+        out.append(p)
+    return out
+
+
+def _website_payload(*, scope: str, clinic_id: str, instance_id: str,
+                     business_wide: bool, props: list[GoogleAnalyticsProperty],
+                     window) -> dict:
+    """Assemble the website payload: registry rows → catalog metadata (hostname,
+    time zone) → the BigQuery reader. With no registered property the reader is
+    skipped entirely and the empty body is returned (200)."""
+    from intelligence_report import ga4_queries as gq
+
+    pids = sorted({str(p.ga4_property_id) for p in props})
+    meta = gq.catalog_meta(pids) if pids else {}
+    properties = [{
+        "ga4_property_id": str(p.ga4_property_id),
+        "property_name": (meta.get(str(p.ga4_property_id), {}).get("property_name")
+                          or p.property_name),
+        "primary_hostname": meta.get(str(p.ga4_property_id), {}).get("primary_hostname"),
+        "time_zone": meta.get(str(p.ga4_property_id), {}).get("time_zone"),
+        "registered_clinic_id": p.clinic_id,
+        "business_wide": business_wide,
+    } for p in sorted(props, key=lambda p: str(p.ga4_property_id))]
+    hostnames = {pid: meta.get(pid, {}).get("primary_hostname") for pid in pids}
+
+    body = gq.ga4_website(pids, hostnames, window) if pids else gq.empty_sections(window)
+    return {
+        "clinic_id": clinic_id,
+        "instance_id": instance_id,
+        "scope": scope,
+        "properties": properties,
+        **body,
+    }
+
+
+@router.get("/intelligence/{clinic_id}/website")
+def get_website(
+    clinic_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 90,
+    nocache: bool = False,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """GA4 website traffic for the properties registered against this clinic,
+    over the global date range. Returns an empty body (``properties: []``,
+    zero totals) rather than 404 when nothing is registered, so the SPA can
+    render its empty state. Cached like the overview payload — the key carries
+    the property set, so registering a property rotates it immediately."""
+    clinic = db.get(Clinic, clinic_id)
+    if not clinic or clinic.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+    require_read_access(clinic.instance_id, caller)
+
+    window = _resolve_window(start, end, days)
+    props = _ga4_properties_for_clinic(db, clinic_id)
+    pids = sorted({str(p.ga4_property_id) for p in props})
+    business_wide = is_multi_location(db, clinic.instance_id)
+
+    key = ("website", clinic_id, window.start_date, window.end_date_excl,
+           "|".join(pids), _data_version(clinic_id), _METHODOLOGY_VERSION)
+    use_cache = not nocache and bool(pids)
+    cached = _cache_lookup(key, clinic_id, use_cache=use_cache)
+    if cached is not None:
+        return cached
+
+    payload = _website_payload(scope="clinic", clinic_id=clinic_id,
+                               instance_id=clinic.instance_id,
+                               business_wide=business_wide, props=props, window=window)
+    _cache_store(key, clinic_id, payload, use_cache=use_cache)
+    return payload
+
+
+@router.get("/intelligence/group/{instance_id}/website")
+def get_group_website(
+    instance_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 90,
+    nocache: bool = False,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Group Intelligence website traffic: every GA4 property registered under
+    any of the instance's live clinics, deduped by property. Gated on
+    ``is_multi_location`` like the other group routes (404, not 403, for a
+    single-location instance). ``clinic_id`` in the payload is the instance id
+    for shape parity with the clinic route."""
+    instance = db.get(Instance, instance_id)
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    require_read_access(instance_id, caller)
+    if not is_multi_location(db, instance_id):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    window = _resolve_window(start, end, days)
+    props = _ga4_properties_for_instance(db, instance_id)
+    pids = sorted({str(p.ga4_property_id) for p in props})
+    clinic_ids = sorted({p.clinic_id for p in props})
+
+    key = ("group-website", instance_id, window.start_date, window.end_date_excl,
+           "|".join(pids), _group_data_version(clinic_ids) if clinic_ids else "none",
+           _METHODOLOGY_VERSION)
+    use_cache = not nocache and bool(pids)
+    cached = _cache_lookup(key, instance_id, use_cache=use_cache)
+    if cached is not None:
+        return cached
+
+    payload = _website_payload(scope="group", clinic_id=instance_id,
+                               instance_id=instance_id, business_wide=True,
+                               props=props, window=window)
+    _cache_store(key, instance_id, payload, use_cache=use_cache)
     return payload
 
 

@@ -68,6 +68,7 @@ class ProvisionInstanceFields(BaseModel):
     # tab edits them later via PATCH /instance/{instance_id}.
     google_ads_customer_id: str | None = None
     invoca_profile_id: str | None = None
+    ga4_account_id: str | None = None
 
 
 class ProvisionPmsFields(BaseModel):
@@ -170,6 +171,8 @@ def provision(body: ProvisionRequestV2,
                 (body.instance.google_ads_customer_id or "").strip() or None,
             "invoca_profile_id":
                 (body.instance.invoca_profile_id or "").strip() or None,
+            "ga4_account_id":
+                (body.instance.ga4_account_id or "").strip() or None,
         },
         clinics_create=[c.model_dump() for c in body.clinics],
         primary_contact_uid=user.uid,

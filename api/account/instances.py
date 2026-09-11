@@ -42,6 +42,7 @@ def _instance_dict(i: Instance, *, clinic_count: int | None = None,
         "primary_contact_uid": i.primary_contact_uid,
         "google_ads_customer_id": i.google_ads_customer_id,
         "invoca_profile_id": i.invoca_profile_id,
+        "ga4_account_id": i.ga4_account_id,
         "multi_location_group": is_group,
     }
 

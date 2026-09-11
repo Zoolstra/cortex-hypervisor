@@ -19,7 +19,10 @@ from api.deps import bq_client, require_read_access, require_write_access, verif
 from api.models import ClinicCreate, ClinicUpdate
 from api.core.db import get_session
 from api.core.grouping import is_multi_location
-from api.core.orm import Clinic, ClinicLocationDetails, GoogleAdsCampaign, Instance, InvocaCampaign
+from api.core.orm import (
+    Clinic, ClinicLocationDetails, GoogleAdsCampaign, GoogleAnalyticsProperty, Instance,
+    InvocaCampaign,
+)
 from api.account.provisioning import provision_clinic
 
 
@@ -139,11 +142,18 @@ def get_etl_status(
             GoogleAdsCampaign.active.is_(True),
         )
     )]
+    ga4_ids = [str(c) for c in db.scalars(
+        select(GoogleAnalyticsProperty.ga4_property_id).where(
+            GoogleAnalyticsProperty.clinic_id == clinic_id,
+            GoogleAnalyticsProperty.active.is_(True),
+        )
+    )]
 
     out: dict = {
         "etl_enabled":            bool(clinic.etl_enabled),
         "google_ads_campaign_ids": ga_ids,
         "invoca_campaign_ids":     invoca_ids,
+        "ga4_property_ids":        ga4_ids,
         "ad_clicks":    {"last_24h": 0, "last_7d": 0, "max_timestamp": None},
         "transactions": {"last_24h": 0, "last_7d": 0, "max_timestamp": None},
         "transcripts": {

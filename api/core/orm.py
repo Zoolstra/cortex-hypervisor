@@ -51,6 +51,9 @@ class Instance(Base):
     primary_contact_uid: Mapped[str | None] = mapped_column(String(128))
     google_ads_customer_id: Mapped[str | None] = mapped_column(String(32))
     invoca_profile_id: Mapped[str | None] = mapped_column(String(32))
+    # GA account handle (alembic 0033). Filters the GA4 property picker to this
+    # client's account; NULL means the admin UI falls back to manual entry.
+    ga4_account_id: Mapped[str | None] = mapped_column(String(32))
     # DEPRECATED by alembic 0031 — read by nothing. Group Intelligence is derived
     # from the clinic count (api/core/grouping.py, >= 2), because a stored flag
     # restating what the data already says can disagree with it: an instance that
@@ -159,6 +162,9 @@ class Clinic(Base):
         back_populates="clinic", cascade="all, delete-orphan"
     )
     jotform_forms: Mapped[list["JotformForm"]] = relationship(
+        back_populates="clinic", cascade="all, delete-orphan"
+    )
+    google_analytics_properties: Mapped[list["GoogleAnalyticsProperty"]] = relationship(
         back_populates="clinic", cascade="all, delete-orphan"
     )
     # Locations of a shared PMS account that resolve to this clinic. Distinct
@@ -957,6 +963,49 @@ class JotformForm(Base):
     locations: Mapped[list["JotformFormLocation"]] = relationship(
         back_populates="form", cascade="all, delete-orphan",
     )
+
+
+# ──────────────────── google_analytics_properties (N) ────────────────────
+
+class GoogleAnalyticsProperty(Base):
+    """Registry for the GA4 → BigQuery web-traffic pipeline (alembic 0033).
+
+    A row here (``active=1``, clinic not soft-deleted) means the ETL job
+    ``ga4-ingest`` pulls this property's daily GA4 Data API reports into
+    ``ClinicData.ga4_*`` (``cortex-data-ingestion/app/ga4/``, reader
+    ``db.get_ga4_properties``). Registering IS enabling.
+
+    ``ga4_property_id`` is UNIQUE globally (Jotform semantics, not Google Ads):
+    a multi-location business usually runs one property for one website, so the
+    property is registered against a DEFAULT clinic and readers dedupe by
+    property at the group level. Linking it to every clinic would count each
+    session once per clinic. Plan: ``resources/google-analytics-integration-plan.md``.
+    """
+    __tablename__ = "google_analytics_properties"
+    __table_args__ = (
+        UniqueConstraint("ga4_property_id", name="uq_ga4_property"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    clinic_id: Mapped[str] = mapped_column(
+        CHAR(36),
+        ForeignKey("clinics.clinic_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    ga4_property_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    property_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False,
+        server_default=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
+    )
+
+    clinic: Mapped["Clinic"] = relationship(back_populates="google_analytics_properties")
 
 
 # ──────────────────── jotform_form_locations (N) ────────────────────

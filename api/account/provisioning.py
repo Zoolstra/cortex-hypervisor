@@ -32,6 +32,7 @@ def provision_instance(
     primary_contact_uid: str,
     google_ads_customer_id: str | None = None,
     invoca_profile_id: str | None = None,
+    ga4_account_id: str | None = None,
 ) -> Instance:
     """Create + add an Instance to the session. Returns the ORM object.
 
@@ -50,6 +51,7 @@ def provision_instance(
         primary_contact_uid=primary_contact_uid,
         google_ads_customer_id=google_ads_customer_id or None,
         invoca_profile_id=invoca_profile_id or None,
+        ga4_account_id=ga4_account_id or None,
     )
     db.add(instance)
     return instance
@@ -135,6 +137,7 @@ def provision_full_account(
         # carries neither key, keeps working unchanged.
         google_ads_customer_id=instance_create.get("google_ads_customer_id"),
         invoca_profile_id=instance_create.get("invoca_profile_id"),
+        ga4_account_id=instance_create.get("ga4_account_id"),
     )
 
     clinic_id_map: dict[str, str] = {}

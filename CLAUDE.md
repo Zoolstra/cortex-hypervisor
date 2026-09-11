@@ -4,7 +4,7 @@
 
 REST API for clinic and user management, the intelligence-report engine, the voice-agent lifecycle, and the external data feed.
 
-Account/config data lives in **Cloud SQL (MySQL 8.4, SQLAlchemy 2.0 + Alembic, database `clients`)** — `instances`, `clinics` and their 1:1/1:N children (`clinic_location_details`, `clinic_voice_agent_configuration` and the other voice-agent tables, `clinic_worklist_taxonomy`, `instance_pms_config` + `pms_clinic_locations`, `google_ads_campaigns` / `invoca_campaigns` / `jotform_forms` + `jotform_form_locations`, `clinic_admins`). Schema at alembic head `0032`.
+Account/config data lives in **Cloud SQL (MySQL 8.4, SQLAlchemy 2.0 + Alembic, database `clients`)** — `instances`, `clinics` and their 1:1/1:N children (`clinic_location_details`, `clinic_voice_agent_configuration` and the other voice-agent tables, `clinic_worklist_taxonomy`, `instance_pms_config` + `pms_clinic_locations`, `google_ads_campaigns` / `invoca_campaigns` / `jotform_forms` + `jotform_form_locations` / `google_analytics_properties`, `clinic_admins`). Schema at alembic head `0033`.
 
 BigQuery holds analytics and PHI — **read** for `ClinicData.*` / `Blueprint_PHI.*` / `CounselEar_PHI.*` (usually via the `PMS_Unified.*` views), and **written** for exactly five tables: `ClinicData.webforms`, `ClinicData.call_outcome_overrides`, `ClinicData.faq_embeddings`, `Users.voice_agent_tickets` and the `Users.phi_access_log` audit trail. The dashboard's `/v2` readers use a second Cloud SQL database, `marts`. Firebase handles authentication.
 
@@ -20,6 +20,7 @@ alembic upgrade head                             # Migrate Cloud SQL (online onl
 ./dev.sh                                         # ⚠️ DEPLOY: build + push + `gcloud run services update` — not a dev helper
 python configure_jotform.py --discover|--with-utm|--locations [--apply]  # Jotform registry drift / hidden UTM fields / location map
 python configure_promo_numbers.py                # Sync Invoca promo numbers → invoca_promo_numbers
+python configure_ga4.py --discover [--apply]     # GA4 registry ↔ ClinicData.ga4_properties_catalog drift (--apply deactivates gone properties)
 ```
 
 The venv here is `venv/` (no dot). The ETL repo's is `.venv/` — they differ.
@@ -31,7 +32,7 @@ The venv here is `venv/` (no dot). The ETL repo's is `.venv/` — they differ.
 ## Stack
 
 - FastAPI, Python 3.12, Pydantic v2
-- **Cloud SQL (MySQL 8.4)** — the account/config store. SQLAlchemy 2.0 ORM (`api/core/orm.py`), engine + IAM-auth connector in `api/core/db.py` (instance `project-demo-2-482101:us-central1:cortex-accounts`, database `clients`), schema managed by Alembic (`alembic/versions/`, 32 migrations, head `0032`).
+- **Cloud SQL (MySQL 8.4)** — the account/config store. SQLAlchemy 2.0 ORM (`api/core/orm.py`), engine + IAM-auth connector in `api/core/db.py` (instance `project-demo-2-482101:us-central1:cortex-accounts`, database `clients`), schema managed by Alembic (`alembic/versions/`, 33 migrations, head `0033`).
 - **Google BigQuery** — analytics and PHI reads plus the five application writes listed above.
 - Firebase Admin SDK (token verification + custom claims for roles)
 - VAPI (`vapi_server_sdk`) for the voice agent; Twilio for staff SMS alerts; Anthropic Claude for report narrative.
@@ -46,7 +47,7 @@ api/
   deps.py             # bq_client, bq_table, verify_token, require_read/write_access
   models.py           # Pydantic request bodies (config / provisioning / webform shapes)
   audit.py            # PHI access audit log -> Users.phi_access_log
-  intelligence.py     # /intelligence/* dashboard payloads + the payload cache (21 routes)
+  intelligence.py     # /intelligence/* dashboard payloads + the payload cache (23 routes)
   worklists.py        # /clinics/{id}/worklists/* reactivation cohorts, CSV export,
                       #   Customer.io sync (12 routes)
   webforms.py         # POST /webforms (JSON relay from our own sites), GET /webforms/coverage.
@@ -54,7 +55,7 @@ api/
   datafeed.py         # GET /datafeed/v1/{instance_id}/* — external client data feed
   core/
     db.py             # Cloud SQL engine/session (connector + IAM auth)
-    orm.py            # SQLAlchemy models — every Cloud SQL table (24)
+    orm.py            # SQLAlchemy models — every Cloud SQL table (25)
     secrets.py        # Secret Manager get_secret() (lru_cache'd)
     grouping.py       # is_multi_location() — the derived multi-location rule
   account/            # instances, clinics, campaigns, pms_config, customerio_config,
@@ -69,7 +70,7 @@ intelligence_report/  # BigQuery readers + payload builders (queries, payloads,
                       #   clinic_hours, report, transcripts, load_geo_targets, prewarm)
 scripts/              # prewarm_payloads, parity_harness, copy_pms_secrets_to_instance,
                       #   resync_acna_assistant, …
-alembic/versions/     # 32 migrations, head 0032
+alembic/versions/     # 33 migrations, head 0033
 tests/                # 33 pytest modules
 ```
 
@@ -80,10 +81,10 @@ tests/                # 33 pytest modules
 | Account | `instances`, `clinics`, `clinic_location_details` (1:1, holds the seven `hours_<weekday>` strings + `time_zone`), `clinic_admins` (uid × instance grants — **no clinic_id**) |
 | PMS | `instance_pms_config` (account credentials-config + `primary_clinic_id`, keyed `(instance_id, pms_type)`), `pms_clinic_locations` (vendor location → clinic, `prompt_for_location`, `booking_user_id`), `clinic_blueprint_config` / `clinic_counselear_config` (**deprecated by 0030, read by nothing**) |
 | Voice agent | `clinic_voice_agent_configuration`, `clinic_voice_agent_script`, `..._persona`, `..._caller_bucket`, `..._qualifying_question`, `..._faq`, `clinic_protocols` (source of truth), `voice_agent_capabilities` (legacy, dual-written for rollback), `clinic_blueprint_entity_note` |
-| Campaigns / leads | `google_ads_campaigns`, `invoca_campaigns`, `invoca_promo_numbers`, `jotform_forms`, `jotform_form_locations` (0032) |
+| Campaigns / leads | `google_ads_campaigns`, `invoca_campaigns`, `invoca_promo_numbers`, `jotform_forms`, `jotform_form_locations` (0032), `google_analytics_properties` (0033 — GA4 property → default clinic, UNIQUE on property id; plus `instances.ga4_account_id`) |
 | Worklists | `clinic_worklist_taxonomy`, `customerio_enrollments` |
 
-Schema is Alembic-managed: `alembic/versions/`, 32 migrations, head `0032`. Migrations run **online only** against the live instance with IAM auth (`alembic upgrade head`); offline mode is refused in `alembic/env.py`. `./dev.sh` ships the image only — migrate separately.
+Schema is Alembic-managed: `alembic/versions/`, 33 migrations, head `0033`. Migrations run **online only** against the live instance with IAM auth (`alembic upgrade head`); offline mode is refused in `alembic/env.py`. `./dev.sh` ships the image only — migrate separately.
 
 `clinics.deleted_at` is a soft delete: **every** query must filter `deleted_at IS NULL`. `DELETE /clinics/{clinic_id}` sets it (and clears `etl_enabled`) rather than removing the row, and returns 409 while the clinic still has a live VAPI assistant — deactivate the voice agent first. The dashboard button is the danger panel at the foot of *Location settings → Details*. `clinics.pms_type` is `Enum("blueprint", "counselear", "audit_data", "none")`.
 
@@ -464,9 +465,9 @@ registered under".)
 
 ## Intelligence payloads (`api/intelligence.py`) — the v1 read path
 
-The dashboard's read path: 21 routes, 16 per-clinic and 5 group. Per clinic: `overview`, `biweekly`, `calls`, `webform-submissions` (the Web forms tab's per-submission list — every submission in the window with PMS-or-form name, email, clinic-local time, derived medium/source + raw UTM, and the first appointment created on/after it; `queries.webform_submission_detail`, same reconciliation CTEs as the `webforms` tiles; admin-only, audited as `webform_submissions`), `active-leads`, `pipeline-revenue`, `leak-calls`, `PUT calls/{call_id}/outcome` (manual relabel → append-only `ClinicData.call_outcome_overrides` via `intelligence_report/queries.py::set_call_outcome_override`, then a JSON-cache clear), `GET calls/{call_id}/transcript`, `POST patients/search`, `GET patients/{patient_key}/journey`, `report.html` and four `*.html` drill-downs. Group: `overview`, `calls`, `webform-submissions`, `active-leads`, `pipeline-revenue`, each gated on `is_multi_location` and 404 (not 403) for a single-location instance.
+The dashboard's read path: 23 routes, 17 per-clinic and 6 group. Per clinic: `overview`, `biweekly`, `website` (GA4 traffic for the clinic's registered properties — `intelligence_report/ga4_queries.py`; not PHI; 200 with an empty body when nothing is registered), `calls`, `webform-submissions` (the Web forms tab's per-submission list — every submission in the window with PMS-or-form name, email, clinic-local time, derived medium/source + raw UTM, and the first appointment created on/after it; `queries.webform_submission_detail`, same reconciliation CTEs as the `webforms` tiles; admin-only, audited as `webform_submissions`), `active-leads`, `pipeline-revenue`, `leak-calls`, `PUT calls/{call_id}/outcome` (manual relabel → append-only `ClinicData.call_outcome_overrides` via `intelligence_report/queries.py::set_call_outcome_override`, then a JSON-cache clear), `GET calls/{call_id}/transcript`, `POST patients/search`, `GET patients/{patient_key}/journey`, `report.html` and four `*.html` drill-downs. Group: `overview`, `website` (every property registered under the instance's live clinics, deduped by property), `calls`, `webform-submissions`, `active-leads`, `pipeline-revenue`, each gated on `is_multi_location` and 404 (not 403) for a single-location instance. Headline totals come from `ga4_sessions_daily`, or from `ga4_sessions_monthly` when the window is whole calendar months (`users_basis` = `monthly_unique` / `monthly_sum` / `daily_sum`) — GA4's daily rows do not sum to its monthly row, and Agency Analytics shows the monthly row.
 
-Heavy readers live in `intelligence_report/` (`queries.py` ≈ 7.9k lines for BigQuery, `payloads.py` for assembly, `group_aggregate.py` for the rollup, `active_leads.py`, `clinic_hours.py`). **`_call_tagging_cte` is the single shared per-call tagging CTE** — per-reader copies of tagging logic drift, which is why every funnel/table consumer composes this one. `MIN_WINDOW_DATE` and **`CALL_BOOKING_MATCH_DAYS = 10`** (widened from 3 in 2026-08 — bookings were being entered days after the call) are duplicated into `api/v2/marts.py` and `api/datafeed.py` (`_MATCH_DAYS`) rather than imported (importing pulls the BigQuery client into a SQLAlchemy-only layer); `tests/test_group_intelligence.py` pins the three together.
+Heavy readers live in `intelligence_report/` (`queries.py` ≈ 7.9k lines for BigQuery, `payloads.py` for assembly, `group_aggregate.py` for the rollup, `active_leads.py`, `clinic_hours.py`, and `ga4_queries.py` — the GA4 `ClinicData.ga4_*` readers behind `/website`, kept separate so `queries.py` stops growing. Totals read the dimension-free `ga4_sessions_daily` (GA4 inflates a session sum with every dimension: CHAA Aug-2026 is 3,555 with none, 3,629 with hostName) and, for whole-calendar-month windows, users from `ga4_sessions_monthly` (`users_basis: monthly_unique`); breakdowns read `ga4_traffic_daily` unfiltered and may sum a little past the totals; only the page tables are filtered to `primary_hostname` from `ga4_properties_catalog`; key events are never host-filtered — click-to-call events carry no host. Falls back to the traffic table while the two dimension-free tables are absent.) **`_call_tagging_cte` is the single shared per-call tagging CTE** — per-reader copies of tagging logic drift, which is why every funnel/table consumer composes this one. `MIN_WINDOW_DATE` and **`CALL_BOOKING_MATCH_DAYS = 10`** (widened from 3 in 2026-08 — bookings were being entered days after the call) are duplicated into `api/v2/marts.py` and `api/datafeed.py` (`_MATCH_DAYS`) rather than imported (importing pulls the BigQuery client into a SQLAlchemy-only layer); `tests/test_group_intelligence.py` pins the three together.
 
 **Cache keys.** Cached payloads key on `(clinic scope, window, pms_type, data_version, _METHODOLOGY_VERSION)`. `_data_version(clinic_id)` is the PMS snapshot date; `_group_data_version(clinic_ids)` is the `|`-joined composite, so a rollup invalidates when ANY member's data lands. `pms_type` is in the key because connecting a PMS rotates no data version and the disclosure would otherwise persist for the life of the entry. A GCS-backed shared layer (`PAYLOAD_SHARED_CACHE=0` to disable) exists because Cloud Run runs `--workers 1` and scales to zero.
 
@@ -638,7 +639,7 @@ Request bodies only — responses are plain dicts assembled from the ORM. The 14
 - `InstanceCreate` / `InstanceUpdate` — `instance_name`, `primary_contact_{name,email}`, `google_ads_customer_id`, `invoca_profile_id`. `InstanceUpdate` drops `None` so a field can be corrected but not blanked.
 - `ClinicCreate` / `ClinicUpdate` — name, address, place_id, seven `hours_<weekday>` strings, phone, time_zone, country, plus `gbp_location_id`, `etl_enabled`, `tier` on update. `_reject_empty_string` on `ClinicUpdate`.
 - `ProvisionRequest` — v1 `/provision_account/` body (`uid` + instance + clinics). The v2 shape is `ProvisionRequestV2` in `api/v2/provision.py`, which also carries the PMS account and defaults `clinics` to empty.
-- `ClinicCampaignCreate` — `campaign_type ∈ {google_ads, invoca, jotform}`.
+- `ClinicCampaignCreate` — `campaign_type ∈ {google_ads, invoca, jotform, google_analytics}`. `google_analytics` = a GA4 property id (`google_analytics_properties`, alembic 0033), Jotform-style uniqueness (one property → one default clinic). Catalog reads BQ `ClinicData.ga4_properties_catalog` filtered by `instances.ga4_account_id`; plan in `resources/google-analytics-integration-plan.md`.
 - `InstancePmsConfigSet`, `PmsLocationEntry`, `PmsLocationImport(Entry)` — account-level PMS config and its location map.
 - `JotformLocationEntry`, `JotformLocationMapSet` — the shared-form location map.
 - `CustomerIOConfigSet` — `site_id` / `track_api_key` / `region`.
@@ -660,7 +661,7 @@ Protocols (`protocols/`, `PROTOCOL_REGISTRY`, 14 registered, 13 toggleable — `
 - `intelligence_report/group_queries.py` has no production consumer.
 - `instances.multi_location_group` is deprecated but still read by `scripts/prewarm_payloads.py` and `scripts/parity_harness.py` — see Group Intelligence.
 - `api/voice_agent/twilio.py` has no callers.
-- `ringcentral_numbers` (the RingCentral clinic-attribution table the ETL expects) has no migration and no ORM model; `_CAMPAIGN_TYPES` has no `ringcentral` member.
+- `ringcentral_numbers` (the RingCentral clinic-attribution table the ETL expects) has no migration and no ORM model; `_CAMPAIGN_TYPES` has no `ringcentral` member (it gained `google_analytics` in 0033, 2026-09-10).
 
 ## Cloud Run Jobs (production)
 

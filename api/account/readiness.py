@@ -334,6 +334,9 @@ def get_instance_readiness(
                 "sync_fresh", "Feed sync", "ok", f"Last sync {snap}."))
 
     # ── 7. Campaigns, per clinic ──────────────────────────────────────────────
+    # Google Ads and Invoca only. Jotform and google_analytics deliberately do
+    # not count: this check is about call/ad-spend attribution, which neither
+    # lead forms nor web-traffic properties provide.
     ga = {c for c in db.scalars(select(GoogleAdsCampaign.clinic_id).where(
         GoogleAdsCampaign.clinic_id.in_(by_id or [""]),
         GoogleAdsCampaign.active.is_(True)))}

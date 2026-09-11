@@ -89,6 +89,7 @@ class InstanceUpdate(BaseModel):
     primary_contact_email: Optional[str] = None
     google_ads_customer_id: Optional[str] = None
     invoca_profile_id: Optional[str] = None
+    ga4_account_id: Optional[str] = None
     # multi_location_group was here. It is now derived from the clinic count
     # (api/core/grouping.py) rather than stored, because a flag restating what the
     # data already says can disagree with it — and did: an instance that grew to
@@ -101,6 +102,18 @@ class InstanceUpdate(BaseModel):
     @classmethod
     def _v(cls, v):
         return _reject_empty_string(v)
+
+    @field_validator("ga4_account_id")
+    @classmethod
+    def _v_ga4(cls, v):
+        # The SPA form sends "" when the field is left blank. Blank normalises
+        # to None (= "not provided", so the PATCH leaves the column alone)
+        # rather than 422ing the whole update, mirroring the blank→NULL rule
+        # provisioning applies to the other two upstream ids.
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
 
 class ClinicUpdate(BaseModel):
@@ -152,7 +165,7 @@ class ProvisionRequest(BaseModel):
 # ── Campaigns ─────────────────────────────────────────────────────────────────
 
 class ClinicCampaignCreate(BaseModel):
-    campaign_type: Literal["google_ads", "invoca", "jotform"]
+    campaign_type: Literal["google_ads", "invoca", "jotform", "google_analytics"]
     external_campaign_id: str
     active: bool = True
 
